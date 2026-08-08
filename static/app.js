@@ -59,39 +59,67 @@ window.jarvis.onEvent("wake", () => {
 
 // ---- press-and-hold mic → /mic WebSocket -------------------------------
 let micWS = null, micStream = null, micNode = null, analyser = null;
+let micAborting = false;
+
+// Shared, null-safe teardown. Does NOT close micWS if it has already been
+// nulled by the caller (graceful stop hands the socket off to a delayed close).
+function teardownMic() {
+  if (micStream) micStream.getTracks().forEach((t) => t.stop());
+  if (micNode) micNode.disconnect();
+  if (micWS) micWS.close();
+  micWS = null;
+  micStream = null;
+  micNode = null;
+  analyser = null;
+  $("#ptt").classList.remove("live");
+}
 
 async function startTalking() {
   if (micWS) return;
-  window.jarvis.playChime("listen");
-  $("#ptt").classList.add("live");
-  micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  const ctx = window.jarvis.audioCtx();
-  await ctx.audioWorklet.addModule("/static/worklet.js");
-  const src = ctx.createMediaStreamSource(micStream);
-  analyser = ctx.createAnalyser();
-  src.connect(analyser);
-  micNode = new AudioWorkletNode(ctx, "mic-processor");
-  src.connect(micNode);
-  micWS = new WebSocket(`ws://${location.host}/mic`);
-  micWS.binaryType = "arraybuffer";
-  micWS.onopen = () => {
-    micWS.send(JSON.stringify({ type: "start", encoding: "linear16",
-      sample_rate: 16000, channels: 1, t_hold: Date.now() }));
-    micNode.port.onmessage = (e) => {
-      if (micWS && micWS.readyState === 1) micWS.send(e.data);
+  micAborting = false;
+  try {
+    window.jarvis.playChime("listen");
+    $("#ptt").classList.add("live");
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    if (micAborting) { teardownMic(); return; } // released during setup
+    const ctx = window.jarvis.audioCtx();
+    await ctx.audioWorklet.addModule("/static/worklet.js");
+    if (micAborting) { teardownMic(); return; } // released during setup
+    const src = ctx.createMediaStreamSource(micStream);
+    analyser = ctx.createAnalyser();
+    src.connect(analyser);
+    micNode = new AudioWorkletNode(ctx, "mic-processor");
+    src.connect(micNode);
+    micWS = new WebSocket(`ws://${location.host}/mic`);
+    micWS.binaryType = "arraybuffer";
+    micWS.onopen = () => {
+      micWS.send(JSON.stringify({ type: "start", encoding: "linear16",
+        sample_rate: 16000, channels: 1, t_hold: Date.now() }));
+      micNode.port.onmessage = (e) => {
+        if (micWS && micWS.readyState === 1) micWS.send(e.data);
+      };
     };
-  };
-  drawWave();
+    drawWave();
+  } catch (err) {
+    teardownMic();
+    window.jarvis.setStatus("mic error — " + err.message);
+    return;
+  }
 }
 
 function stopTalking() {
-  if (!micWS) return;
-  $("#ptt").classList.remove("live");
+  if (!micWS) {
+    // Setup still in flight (or already torn down): signal the abort AND stop
+    // whatever the in-flight setup may have already opened, so the mic can't
+    // be left hot.
+    micAborting = true;
+    teardownMic();
+    return;
+  }
   if (micWS.readyState === 1)
     micWS.send(JSON.stringify({ type: "stop", t_release: Date.now() }));
-  micStream.getTracks().forEach((t) => t.stop());
-  micNode.disconnect();
-  const ws = micWS; micWS = null;
+  const ws = micWS; micWS = null; // null first so teardownMic won't close it
+  teardownMic();                  // stops tracks, disconnects node, clears .live
   setTimeout(() => ws.close(), 3000); // give server time to flush finals
   window.jarvis.setStatus("thinking…");
 }

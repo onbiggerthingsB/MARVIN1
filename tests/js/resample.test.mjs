@@ -24,3 +24,15 @@ test("clipping is clamped", () => {
   assert.equal(out[0], 32767);
   assert.equal(out[1], -32768);
 });
+
+test("44.1k → 16k exercises fractional interpolation", () => {
+  const input = new Float32Array(4410);          // 100ms at 44.1k
+  for (let i = 0; i < input.length; i++) input[i] = Math.sin(i / 7) * 0.5;
+  const out = downsampleTo16k(input, 44100);
+  assert.equal(out.length, 1600);                 // floor(4410 / (44100/16000))
+  assert.ok(out instanceof Int16Array);
+  // interpolated samples stay within the source amplitude envelope
+  assert.ok(Math.max(...out) <= 16384 && Math.min(...out) >= -16384);
+  // not all zero — real signal came through
+  assert.ok(out.some((v) => v !== 0));
+});
