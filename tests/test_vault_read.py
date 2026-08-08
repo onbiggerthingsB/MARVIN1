@@ -63,6 +63,23 @@ def test_read_rejects_path_escape(tmp_path):
         vault_read("../../etc/hosts", tmp_path)
 
 
+def test_read_rejects_md_escape_outside_vault(tmp_path):
+    seed(tmp_path)
+    with pytest.raises(PermissionError):
+        vault_read("../../etc/hosts.md", tmp_path)  # .md suffix: only containment can reject
+
+
+def test_read_rejects_sibling_prefix_vault(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    seed(vault)
+    evil = tmp_path / "vault-evil"
+    evil.mkdir()
+    (evil / "note.md").write_text("secret", encoding="utf-8")
+    with pytest.raises(PermissionError):
+        vault_read("../vault-evil/note.md", vault)
+
+
 def test_read_missing_file(tmp_path):
     seed(tmp_path)
     with pytest.raises(FileNotFoundError):

@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 MAX_BYTES = 200_000
 SEARCH_TIMEOUT = 8.0
@@ -19,6 +22,12 @@ def _safe_note(rel_path: str, vault_root: Path) -> Path:
 
 
 def vault_read(rel_path: str, vault_root: Path) -> str:
+    """Return at most MAX_BYTES of the note, decoded as UTF-8 with replacement.
+
+    Output is TRUNCATED SILENTLY at the byte cap: there is no marker and no
+    signal to the caller, so a long note comes back cut off mid-line. Callers
+    that need the whole file must read it themselves.
+    """
     p = _safe_note(rel_path, vault_root)
     if not p.is_file():
         raise FileNotFoundError(rel_path)
@@ -38,25 +47,55 @@ def _first_match_snippet(path: Path, query: str) -> str:
 
 
 async def vault_search(query: str, vault_root: Path, limit: int = 5) -> list[dict]:
+    """Case-insensitive LITERAL search over the vault's .md files.
+
+    The query is matched as a FIXED STRING, not a regex (rg runs with -F), so
+    regex metacharacters like `(`, `?` or `*` match themselves and an unbalanced
+    paren is a normal query rather than a syntax error. The same literal rule is
+    what `_first_match_snippet` re-applies, so a hit always yields a snippet.
+
+    Because matching is literal, a multi-word natural-language question ("what
+    did the chant study find?") is searched as one long phrase and will usually
+    return NOTHING. Callers should pass keywords, not sentences.
+
+    Returns at most `limit` results; further matches are dropped silently.
+    """
     root = Path(vault_root).resolve()
     if not query.strip():
         return []
     try:
         proc = await asyncio.create_subprocess_exec(
-            "rg", "-i", "-l", "--glob", "*.md", "--", query,
+            # -F: literal/fixed-string match, so the snippet matcher agrees with rg
+            # --no-ignore: parts of the vault are gitignored but still searchable
+            "rg", "-F", "--no-ignore", "-i", "-l", "--glob", "*.md", "--", query,
             cwd=str(root),
             # DEVNULL, not inherit: rg searches stdin instead of cwd when fd 0 is a regular file
             stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=SEARCH_TIMEOUT)
-    except (FileNotFoundError, asyncio.TimeoutError):
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    except FileNotFoundError:
+        log.warning("vault_search: ripgrep (rg) not installed")
+        return []
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=SEARCH_TIMEOUT)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        log.warning("vault_search: rg timed out after %ss", SEARCH_TIMEOUT)
+        return []
+    # rg exit codes: 0 = matches, 1 = no matches, 2+ = real error
+    if proc.returncode not in (0, 1):
+        log.warning("vault_search: rg failed (exit %s): %s",
+                    proc.returncode, err.decode("utf-8", "replace")[:200])
         return []
     files = [f for f in out.decode("utf-8", "replace").splitlines() if f][:limit]
     results = []
     for rel in files:
         p = root / rel
-        results.append({"title": Path(rel).stem, "path": rel,
-                        "snippet": _first_match_snippet(p, query)})
+        # to_thread: an iCloud-evicted file can block on read for seconds
+        snippet = await asyncio.to_thread(_first_match_snippet, p, query)
+        results.append({"title": Path(rel).stem, "path": rel, "snippet": snippet})
     return results
 
 
