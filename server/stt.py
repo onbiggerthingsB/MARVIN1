@@ -56,6 +56,8 @@ class SttRelay:
                             return
             except websockets.ConnectionClosed:
                 pass
+            except Exception:
+                publish("stt.error", {"reason": "relay error"})
 
         async def pump_down():
             try:
@@ -77,8 +79,11 @@ class SttRelay:
                                                   "t_utterance": time.time()})
                         finals.clear()
             except websockets.ConnectionClosed as e:
-                if e.code not in (1000,):
+                close_code = getattr(e, "rcvd", None) and e.rcvd.code
+                if close_code not in (1000,):
                     publish("stt.error", {"reason": "deepgram disconnected"})
+            except Exception:
+                publish("stt.error", {"reason": "relay error"})
 
         up = asyncio.create_task(pump_up())
         down = asyncio.create_task(pump_down())
