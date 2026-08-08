@@ -22,7 +22,7 @@ def log_target(vault_root: Path) -> Path:
 
 
 def _resolve(p: Path) -> Path:
-    # strict=False so a not-yet-created target still resolves its parent symlinks
+    # realpath is non-strict by default: a not-yet-created target still resolves its parent symlinks
     return Path(os.path.realpath(p))
 
 

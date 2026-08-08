@@ -1,4 +1,3 @@
-import os
 from datetime import datetime
 from pathlib import Path
 
@@ -39,6 +38,16 @@ def test_append_rejects_any_other_path(tmp_path):
                 tmp_path / "Daily" / "2026-08-09.md"]:  # wrong day
         with pytest.raises(PermissionError):
             assert_append_allowed(bad, tmp_path, NOW)
+
+
+def test_is_within_rejects_sibling_prefix_collision(tmp_path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    evil = tmp_path / "vault-evil"
+    evil.mkdir()
+    assert is_within(root / "Daily" / "note.md", root) is True
+    assert is_within(root, root) is True
+    assert is_within(evil / "note.md", root) is False   # string-prefix bug would pass this
 
 
 def test_append_rejects_symlink_escape(tmp_path):
