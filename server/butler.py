@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
+import os
 from pathlib import Path
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
@@ -100,7 +102,22 @@ SYSTEM_PROMPT = (
 )
 
 
-def build_options(vault_root, mcp_server, resume_session_id=None) -> ClaudeAgentOptions:
+def build_options(vault_root, mcp_server, resume_session_id=None, *,
+                  use_api_key: bool = False) -> ClaudeAgentOptions:
+    # Opt-in paid path: `--bare` forces the CLI to authenticate with
+    # ANTHROPIC_API_KEY only (OAuth/keychain never read), which sidesteps the
+    # subscription 403 on headless requests. The SDK renders a None-valued
+    # extra_args entry as a bare flag, and MERGES options.env over the
+    # inherited os.environ (subprocess_cli.py), so passing just the key is
+    # enough -- and avoids re-injecting CLAUDECODE, which the SDK deliberately
+    # strips from the child env. Everything else (the closed tool surface
+    # above all) stays byte-identical to the free path.
+    api_key_kwargs = {}
+    if use_api_key:
+        api_key_kwargs = dict(
+            extra_args={"bare": None},
+            env={"ANTHROPIC_API_KEY": os.environ["ANTHROPIC_API_KEY"]},
+        )
     return ClaudeAgentOptions(
         cwd=str(vault_root),
         system_prompt=SYSTEM_PROMPT,
@@ -121,6 +138,7 @@ def build_options(vault_root, mcp_server, resume_session_id=None) -> ClaudeAgent
         setting_sources=[],
         permission_mode="default",
         resume=resume_session_id,
+        **api_key_kwargs,
     )
 
 
@@ -162,14 +180,47 @@ def _best_parse(messages: list[str]) -> dict:
             or parse_butler_output(last or joined))
 
 
+def _accepts_use_api_key(builder) -> bool:
+    """Whether options_builder takes the `use_api_key` keyword.
+
+    Decided ONCE by signature inspection rather than per-call try/except
+    TypeError: the except would also swallow a TypeError raised INSIDE a
+    two-argument builder's body (e.g. a bad kwarg into ClaudeAgentOptions)
+    and silently re-call it single-argument -- a confusing double invocation
+    of a function that may not be idempotent. Builders whose signature cannot
+    be introspected are treated as legacy single-argument.
+    """
+    try:
+        params = inspect.signature(builder).parameters
+    except (TypeError, ValueError):
+        return False
+    return "use_api_key" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 class Butler:
     def __init__(self, options_builder, state_path, client_factory=ClaudeSDKClient):
         self._build = options_builder          # callable(resume_session_id) -> options
+        self._build_accepts_mode = _accepts_use_api_key(options_builder)
         self._state_path = Path(state_path)
         self._client_factory = client_factory
         self._client = None
         self._session_id = self._load_session_id()
+        # Whether the CURRENT client was built in API-key (--bare, paid) mode.
+        # False on every fresh client so a fixed subscription is always tried
+        # first; flipped by ask()'s auth-fallback retry only.
+        self._api_key_mode = False
         self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _api_key_available() -> bool:
+        return bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+    @property
+    def using_api_key(self) -> bool:
+        """True while the live client authenticates with ANTHROPIC_API_KEY,
+        i.e. while turns bill per token. Read-only, for console indicators."""
+        return self._api_key_mode
 
     def _load_session_id(self):
         try:
@@ -191,10 +242,15 @@ class Butler:
         except Exception:  # noqa: BLE001 — a read-only state dir must not break recovery
             pass
 
+    def _build_options(self, resume):
+        if self._build_accepts_mode:
+            return self._build(resume, use_api_key=self._api_key_mode)
+        return self._build(resume)             # legacy single-argument builder
+
     async def _ensure_client(self):
         if self._client is None:
             resume = self._session_id
-            client = self._client_factory(self._build(resume))
+            client = self._client_factory(self._build_options(resume))
             # connect() FIRST, publish second. A stale `resume` id (e.g. a cleared
             # CLI session store) makes connect() raise on the first turn of a boot;
             # assigning self._client before that would leave a never-connected
@@ -218,99 +274,129 @@ class Butler:
 
     async def ask(self, text: str) -> dict:
         async with self._lock:
+            # The mode the FIRST attempt runs under, captured before _ask_once's
+            # failure path resets it: a turn that already failed on the paid
+            # path must propagate, never retry onto the same dead end.
+            first_mode = self._api_key_mode
             try:
-                client = await self._ensure_client()
-                await client.query(text)
-                # Per-MESSAGE texts, not one flat list of blocks: a turn with tool
-                # calls emits a preamble message ("Let me search the vault for
-                # Tibet...") before the real reply, and _best_parse needs them
-                # separable to prefer the last one. See _best_parse.
-                messages, session_id, failure = [], None, None
-                async for msg in client.receive_response():
-                    parts = []
-                    for block in getattr(msg, "content", None) or []:
-                        t = getattr(block, "text", None)
-                        if t:
-                            parts.append(t)
-                    if parts:
-                        messages.append("".join(parts))
-                    # Keyed on the CLASS NAME, not the old `subtype is not None`
-                    # probe: SystemMessage carries a subtype too ('init',
-                    # 'api_retry'), and current SDKs put a session_id on
-                    # AssistantMessage, so no single attribute is distinctive.
-                    # The name check is exact against the real SDK, keeps the
-                    # test fakes light (isinstance would force constructing the
-                    # full SDK dataclass), and a SystemMessage -- whatever
-                    # fields a future SDK gives it -- can never overwrite the
-                    # saved id.
-                    if type(msg).__name__ == "ResultMessage":
-                        # Authoritative failure signals, read defensively (SDK
-                        # fields move). `subtype` is NOT one of them: the live
-                        # auth failure arrived with subtype='success'. And the
-                        # message TEXT is never used for detection -- Keke
-                        # asking about an error recorded in a vault note must
-                        # not trip this.
-                        status = getattr(msg, "api_error_status", None)
-                        status = str(status) if status not in (None, "") else None
-                        if (getattr(msg, "is_error", None) or status is not None
-                                or getattr(msg, "terminal_reason", None) == "api_error"):
-                            # A failed turn's id is not a resumable session:
-                            # do NOT capture it. Raise only after the loop has
-                            # finished draining the response.
-                            detail = (str(getattr(msg, "result", None) or "").strip()
-                                      or (messages[-1] if messages else ""))
-                            failure = ButlerUnavailable(
-                                _failure_reason(status, detail), detail, status)
-                        else:
-                            session_id = getattr(msg, "session_id", None)
-                if failure is not None:
-                    # Flows through the except below: an auth-failed client is
-                    # dead, so it is dropped and reaped like any other failure.
-                    raise failure
-                if session_id and session_id != self._session_id:
-                    # In-memory FIRST: the running session keeps continuity even
-                    # if the disk save below fails.
-                    self._session_id = session_id
-                    try:
-                        # Best-effort: a full or read-only state dir must not
-                        # discard the answer we already computed (the generic
-                        # handler would drop the client and speak the fallback
-                        # line on EVERY turn, forever). to_thread because the
-                        # write is blocking I/O on a loop carrying live audio.
-                        await asyncio.to_thread(self._save_session_id, session_id)
-                    except OSError as e:
-                        log.warning("could not persist session id: %s", e)
-                return _best_parse(messages)
-            except (Exception, asyncio.CancelledError):
-                # Any failure can leave the transport half-dead; drop the client so
-                # the next turn builds and connects a fresh one instead of retrying
-                # query() against a corpse.
-                #
-                # CancelledError is spelled out because it derives from
-                # BaseException, not Exception: app_brain wraps ask() in
-                # asyncio.wait_for, and a timeout CANCELS this coroutine mid
-                # `async for`. Without this the client would stay cached with a
-                # half-consumed response stream and the next turn would query()
-                # into the middle of the abandoned one. The lock is released
-                # either way (`async with` unwinds on CancelledError too); this
-                # is about the client, not the lock. Always re-raised -- never
-                # swallow a cancellation.
-                #
-                # The dropped client goes to a DETACHED reaper rather than being
-                # nulled and forgotten: ClaudeSDKClient has no __del__, so an
-                # undisconnected client leaks its `claude` subprocess until
-                # process exit -- and with a 120s ask timeout upstream, timeouts
-                # are an expected event, not a rarity. Never awaited inline: on
-                # the cancellation path an inline await could swallow or delay
-                # the cancellation we are re-raising.
-                old, self._client = self._client, None
-                if old is not None:
-                    task = asyncio.get_running_loop().create_task(_dispose(old))
-                    _REAPERS.add(task)                      # keep a strong ref
-                    task.add_done_callback(_REAPERS.discard)
+                return await self._ask_once(text)
+            except ButlerUnavailable as e:
+                # Free-first, paid only as a fallback: retry ONCE with --bare +
+                # ANTHROPIC_API_KEY, and only for an AUTH-class refusal (the
+                # headless-403 case). Rate limits, 5xx and the rest propagate
+                # untouched. The dead client was already dropped and reaped by
+                # _ask_once; the retry is a genuine second attempt through
+                # _ensure_client, under the same lock hold.
+                if (e.reason == "login expired" and not first_mode
+                        and self._api_key_available()):
+                    log.warning(
+                        "subscription auth refused (%s); falling back to "
+                        "ANTHROPIC_API_KEY -- this bills per token",
+                        e.detail or e.reason)
+                    self._api_key_mode = True
+                    return await self._ask_once(text)
                 raise
+
+    async def _ask_once(self, text: str) -> dict:
+        try:
+            client = await self._ensure_client()
+            await client.query(text)
+            # Per-MESSAGE texts, not one flat list of blocks: a turn with tool
+            # calls emits a preamble message ("Let me search the vault for
+            # Tibet...") before the real reply, and _best_parse needs them
+            # separable to prefer the last one. See _best_parse.
+            messages, session_id, failure = [], None, None
+            async for msg in client.receive_response():
+                parts = []
+                for block in getattr(msg, "content", None) or []:
+                    t = getattr(block, "text", None)
+                    if t:
+                        parts.append(t)
+                if parts:
+                    messages.append("".join(parts))
+                # Keyed on the CLASS NAME, not the old `subtype is not None`
+                # probe: SystemMessage carries a subtype too ('init',
+                # 'api_retry'), and current SDKs put a session_id on
+                # AssistantMessage, so no single attribute is distinctive.
+                # The name check is exact against the real SDK, keeps the
+                # test fakes light (isinstance would force constructing the
+                # full SDK dataclass), and a SystemMessage -- whatever
+                # fields a future SDK gives it -- can never overwrite the
+                # saved id.
+                if type(msg).__name__ == "ResultMessage":
+                    # Authoritative failure signals, read defensively (SDK
+                    # fields move). `subtype` is NOT one of them: the live
+                    # auth failure arrived with subtype='success'. And the
+                    # message TEXT is never used for detection -- Keke
+                    # asking about an error recorded in a vault note must
+                    # not trip this.
+                    status = getattr(msg, "api_error_status", None)
+                    status = str(status) if status not in (None, "") else None
+                    if (getattr(msg, "is_error", None) or status is not None
+                            or getattr(msg, "terminal_reason", None) == "api_error"):
+                        # A failed turn's id is not a resumable session:
+                        # do NOT capture it. Raise only after the loop has
+                        # finished draining the response.
+                        detail = (str(getattr(msg, "result", None) or "").strip()
+                                  or (messages[-1] if messages else ""))
+                        failure = ButlerUnavailable(
+                            _failure_reason(status, detail), detail, status)
+                    else:
+                        session_id = getattr(msg, "session_id", None)
+            if failure is not None:
+                # Flows through the except below: an auth-failed client is
+                # dead, so it is dropped and reaped like any other failure.
+                raise failure
+            if session_id and session_id != self._session_id:
+                # In-memory FIRST: the running session keeps continuity even
+                # if the disk save below fails.
+                self._session_id = session_id
+                try:
+                    # Best-effort: a full or read-only state dir must not
+                    # discard the answer we already computed (the generic
+                    # handler would drop the client and speak the fallback
+                    # line on EVERY turn, forever). to_thread because the
+                    # write is blocking I/O on a loop carrying live audio.
+                    await asyncio.to_thread(self._save_session_id, session_id)
+                except OSError as e:
+                    log.warning("could not persist session id: %s", e)
+            return _best_parse(messages)
+        except (Exception, asyncio.CancelledError):
+            # Any failure can leave the transport half-dead; drop the client so
+            # the next turn builds and connects a fresh one instead of retrying
+            # query() against a corpse.
+            #
+            # CancelledError is spelled out because it derives from
+            # BaseException, not Exception: app_brain wraps ask() in
+            # asyncio.wait_for, and a timeout CANCELS this coroutine mid
+            # `async for`. Without this the client would stay cached with a
+            # half-consumed response stream and the next turn would query()
+            # into the middle of the abandoned one. The lock is released
+            # either way (`async with` unwinds on CancelledError too); this
+            # is about the client, not the lock. Always re-raised -- never
+            # swallow a cancellation.
+            #
+            # The dropped client goes to a DETACHED reaper rather than being
+            # nulled and forgotten: ClaudeSDKClient has no __del__, so an
+            # undisconnected client leaks its `claude` subprocess until
+            # process exit -- and with a 120s ask timeout upstream, timeouts
+            # are an expected event, not a rarity. Never awaited inline: on
+            # the cancellation path an inline await could swallow or delay
+            # the cancellation we are re-raising.
+            old, self._client = self._client, None
+            # Every dropped client resets to the free path: the next fresh
+            # client retries the subscription first, so a fixed 403 stops
+            # billing automatically. ask()'s fallback re-flips this AFTER the
+            # drop when it decides to retry paid, so the order here is safe.
+            self._api_key_mode = False
+            if old is not None:
+                task = asyncio.get_running_loop().create_task(_dispose(old))
+                _REAPERS.add(task)                      # keep a strong ref
+                task.add_done_callback(_REAPERS.discard)
+            raise
 
     async def close(self):
         if self._client is not None:
             await self._client.disconnect()
             self._client = None
+        self._api_key_mode = False                      # fresh client, free path first

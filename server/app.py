@@ -104,7 +104,8 @@ def create_app(base_dir: Path) -> FastAPI:
               f"— enable 'Keep Downloaded' in Finder for reliable answers.")
     vault_server = build_vault_server(vault_root)
     app.state.butler = Butler(
-        options_builder=lambda resume: build_options(vault_root, vault_server, resume),
+        options_builder=lambda resume, use_api_key=False: build_options(
+            vault_root, vault_server, resume, use_api_key=use_api_key),
         state_path=base_dir / "state" / "butler.json")
 
     @app.middleware("http")

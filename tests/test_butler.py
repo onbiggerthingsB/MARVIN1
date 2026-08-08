@@ -477,6 +477,134 @@ async def test_cancelled_turn_also_disposes_the_dropped_client(tmp_path):
     assert disconnected, "cancelled turn leaked its client's subprocess"
 
 
+# --- opt-in API-key fallback: free-first, paid only on an auth-class refusal --
+# The live failure this covers: the Max subscription authenticates, but headless
+# requests 403 ("Request not allowed"). `claude --bare` forces API-key auth and
+# keeps --mcp-config, so a single paid retry rescues the turn -- and the moment
+# the subscription works again, the paid path stops being used.
+
+def _fallback_butler(tmp_path, factory):
+    """A Butler whose options_builder takes the extended (resume, use_api_key)
+    contract and records the mode as a plain marker on the options dict."""
+    return Butler(
+        options_builder=lambda resume, use_api_key=False: {
+            "resume": resume, "use_api_key": use_api_key},
+        state_path=tmp_path / "butler.json",
+        client_factory=factory)
+
+
+class _AuthErrResult:                    # mirrors the live headless-403 evidence
+    subtype = "success"
+    is_error = True
+    api_error_status = "403"
+    terminal_reason = "api_error"
+    session_id = "sess-should-not-be-saved"
+    result = "API Error: 403 Request not allowed"
+
+
+async def test_no_api_key_means_no_retry_and_nothing_billed(tmp_path, monkeypatch):
+    """Default behavior UNCHANGED: without ANTHROPIC_API_KEY an auth failure
+    raises after exactly ONE attempt -- no paid retry can even be considered."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    built = []
+
+    class ResultMessage(_AuthErrResult):
+        pass
+
+    class AlwaysAuthErr(FakeClient):
+        def __init__(self, options):
+            super().__init__(options)
+            built.append(options)
+
+        async def receive_response(self):
+            yield ResultMessage()
+
+    b = _fallback_butler(tmp_path, AlwaysAuthErr)
+    with pytest.raises(ButlerUnavailable) as ei:
+        await b.ask("hi")
+    assert ei.value.reason == "login expired"
+    assert len(built) == 1, "retried without a key -- a second attempt was built"
+    assert b.using_api_key is False
+
+
+async def test_auth_failure_with_key_retries_once_in_api_key_mode(tmp_path, monkeypatch):
+    """Key present + subscription refused: the SAME turn is retried exactly once
+    on a fresh client built in API-key mode, and the answer comes back."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    built = []
+
+    class ResultMessage(_AuthErrResult):
+        pass
+
+    class FailsThenWorks(FakeClient):
+        def __init__(self, options):
+            super().__init__(options)
+            built.append(options)
+
+        async def receive_response(self):
+            if len(built) == 1:          # first client: the subscription 403
+                yield ResultMessage()
+                return
+            async for m in super().receive_response():   # second client: healthy
+                yield m
+
+    b = _fallback_butler(tmp_path, FailsThenWorks)
+    out = await b.ask("where did I leave the tibet study?")
+    assert out["spoken"] == "Session 2."
+    assert len(built) == 2
+    assert built[0]["use_api_key"] is False   # free path tried first
+    assert built[1]["use_api_key"] is True    # retry carried the paid mode
+    assert b.using_api_key is True            # visible to a console indicator
+
+
+async def test_healthy_subscription_never_falls_back_even_with_key(tmp_path, monkeypatch):
+    """The anti-billing regression: a key in the environment must be inert
+    while the free subscription path works."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    built = []
+
+    class Healthy(FakeClient):
+        def __init__(self, options):
+            super().__init__(options)
+            built.append(options)
+
+    b = _fallback_butler(tmp_path, Healthy)
+    out = await b.ask("hi")
+    assert out["spoken"] == "Session 2."
+    assert len(built) == 1
+    assert built[0]["use_api_key"] is False
+    assert b.using_api_key is False
+
+
+def test_build_options_api_key_mode_is_additive_only(tmp_path, monkeypatch):
+    """use_api_key=True adds EXACTLY --bare + the key; use_api_key=False (the
+    default) adds neither. In both modes the closed tool surface is identical:
+    bare mode must not widen what the butler can touch."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-probe")
+    from server.butler import build_options
+    from server.vault_mcp import build_vault_server, VAULT_TOOL_NAMES
+
+    server = build_vault_server(tmp_path)
+    free = build_options(tmp_path, server, None)
+    paid = build_options(tmp_path, server, None, use_api_key=True)
+
+    # paid mode: the bare flag (None value == valueless flag) and the key
+    assert paid.extra_args == {"bare": None}
+    assert paid.env.get("ANTHROPIC_API_KEY") == "sk-probe"
+    # free mode: NEITHER -- nothing bills by default
+    assert not free.extra_args
+    assert "ANTHROPIC_API_KEY" not in (free.env or {})
+
+    # identical closed surface in BOTH modes
+    for opts in (free, paid):
+        assert opts.tools == [] and opts.tools is not None
+        assert opts.allowed_tools == list(VAULT_TOOL_NAMES)
+        assert opts.setting_sources == []
+        assert opts.strict_mcp_config is True
+        for native in ("Bash", "Edit", "Write", "Read", "Grep", "Glob"):
+            assert native in opts.disallowed_tools
+
+
 async def test_read_tool_materializes_and_runs_off_the_event_loop(tmp_path, monkeypatch):
     import threading
     import server.vault_mcp as vm
