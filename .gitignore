@@ -1,0 +1,7 @@
+__pycache__/
+.venv/
+.env
+state/
+static/clips/
+static/chimes/
+config/jarvis.json
