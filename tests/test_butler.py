@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 
@@ -132,6 +133,51 @@ async def test_failed_connect_does_not_wedge_the_butler(tmp_path):
     out = await b.ask("second turn")
     assert out["spoken"] == "Session 2."
     assert len(attempts) == 2 and attempts[0] is not attempts[1]
+
+
+async def test_cancelled_turn_leaves_butler_usable(tmp_path):
+    """A timed-out turn is a CANCELLED turn, and cancellation must reset the client.
+
+    app_brain wraps ask() in asyncio.wait_for, which cancels the inner coroutine
+    on timeout. CancelledError is a BaseException, so a bare `except Exception`
+    in ask() would not fire: the persistent client would stay cached with a
+    half-consumed response stream, and the next turn would query() into the
+    middle of the abandoned one. The fake models exactly that -- a client
+    cancelled mid-stream refuses further queries -- so this test fails if the
+    handler stops covering cancellation.
+    """
+    class HangingThenOkClient(FakeClient):
+        calls = 0
+        poisoned = False
+
+        async def query(self, text, session_id="default"):
+            if self.poisoned:
+                raise RuntimeError("query() into a half-consumed response stream")
+            await super().query(text, session_id)
+
+        async def receive_response(self):
+            HangingThenOkClient.calls += 1
+            if HangingThenOkClient.calls == 1:
+                try:
+                    await asyncio.sleep(60)      # will be cancelled
+                except asyncio.CancelledError:
+                    self.poisoned = True         # stream abandoned mid-flight
+                    raise
+            async for m in super().receive_response():
+                yield m
+
+    b = Butler(options_builder=lambda r: {"resume": r},
+               state_path=tmp_path / "butler.json",
+               client_factory=HangingThenOkClient)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(b.ask("first"), 0.05)
+    assert b._client is None, "a client cancelled mid-stream was left cached"
+    assert not b._lock.locked(), "the lock was not released on cancellation"
+
+    out = await b.ask("second")              # must work, not deadlock
+    assert out["spoken"] == "Session 2."
+    assert HangingThenOkClient.calls == 2
 
 
 def test_build_options_closes_the_tool_surface(tmp_path):

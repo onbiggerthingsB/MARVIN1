@@ -116,10 +116,20 @@ class Butler:
                 if session_id and session_id != self._session_id:
                     self._save_session_id(session_id)
                 return parse_butler_output("".join(chunks))
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 # Any failure can leave the transport half-dead; drop the client so
                 # the next turn builds and connects a fresh one instead of retrying
                 # query() against a corpse.
+                #
+                # CancelledError is spelled out because it derives from
+                # BaseException, not Exception: app_brain wraps ask() in
+                # asyncio.wait_for, and a timeout CANCELS this coroutine mid
+                # `async for`. Without this the client would stay cached with a
+                # half-consumed response stream and the next turn would query()
+                # into the middle of the abandoned one. The lock is released
+                # either way (`async with` unwinds on CancelledError too); this
+                # is about the client, not the lock. Always re-raised -- never
+                # swallow a cancellation.
                 self._client = None
                 raise
 

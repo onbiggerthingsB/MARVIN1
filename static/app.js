@@ -180,6 +180,11 @@ window.jarvis.onEvent("butler.answer", (d) => {
   window.jarvis.setStatus("online — hold to talk");
 });
 window.jarvis.onEvent("butler.error", (d) => {
+  // Clear the previous turn's answer AND its citation chips. Leaving them up
+  // under an error line reads as if the stale answer belongs to the question
+  // that just failed.
+  $("#answer").textContent = "";
+  $("#citations").textContent = "";
   window.jarvis.setStatus("brain error — " + (d.reason || "unavailable"));
 });
 

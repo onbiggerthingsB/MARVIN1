@@ -93,7 +93,10 @@ def test_speakable_never_reads_raw_json_or_nothing_aloud():
 
 
 def test_speakable_strips_carriage_returns():
-    assert speakable("one.\r\ntwo.") == "one. \ntwo."
+    # CRLF collapses to a bare newline (a naive .replace("\r", " ") would leave
+    # a stray trailing space); a lone CR still becomes a space.
+    assert speakable("one.\r\ntwo.") == "one.\ntwo."
+    assert speakable("one.\rtwo.") == "one. two."
 
 
 async def test_json_shaped_spoken_still_publishes_display(tmp_path):
@@ -130,3 +133,122 @@ async def test_hung_ask_times_out_instead_of_wedging_the_loop(tmp_path, monkeypa
     assert err["data"]["reason"] == "timed out"
     assert speaker.spoke == [FALLBACK_LINE]
     task.cancel()
+
+
+# --- guards added after the M2 Task 6 review --------------------------------
+# Every await and every callback inside the loop must be guarded: an unguarded
+# raise ends run_butler_brain, the lifespan never restarts it, and JARVIS goes
+# deaf until the process restarts -- silently.
+
+async def test_failed_preconnect_does_not_kill_the_brain(tmp_path):
+    class BadSpeaker(FakeSpeaker):
+        async def preconnect(self): raise RuntimeError("no network")
+
+    bus = EventBus()
+    butler, speaker, turnlog = FakeButler(), BadSpeaker(), FakeTurnLog()
+    task = asyncio.create_task(run_butler_brain(bus, butler, speaker, turnlog))
+    await asyncio.sleep(0)
+    err_fut = asyncio.ensure_future(_drain_until(bus, "butler.error"))
+    bus.publish("wake", {})
+    err = await err_fut
+    assert "preconnect failed" in err["data"]["reason"]
+    # the loop must still be alive and still answer
+    answer_fut = asyncio.ensure_future(_drain_until(bus, "butler.answer"))
+    bus.publish("command.received", {"text": "still there?"})
+    answer = await answer_fut
+    assert answer["data"]["display"]
+    assert not task.done()
+    task.cancel()
+
+
+async def test_failed_speak_does_not_kill_the_brain(tmp_path):
+    class MuteSpeaker(FakeSpeaker):
+        async def speak(self, text): raise RuntimeError("tts down")
+
+    bus = EventBus()
+    butler, speaker, turnlog = FakeButler(), MuteSpeaker(), FakeTurnLog()
+    task = asyncio.create_task(run_butler_brain(bus, butler, speaker, turnlog))
+    await asyncio.sleep(0)
+    err_fut = asyncio.ensure_future(_drain_until(bus, "butler.error"))
+    bus.publish("command.received", {"text": "hi"})
+    err = await err_fut
+    assert "speak failed" in err["data"]["reason"]
+    # a dead voice is not a dead brain: the next turn still produces an answer
+    answer_fut = asyncio.ensure_future(_drain_until(bus, "butler.answer"))
+    bus.publish("command.received", {"text": "still there?"})
+    answer = await answer_fut
+    assert answer["data"]["display"]
+    assert not task.done()
+    task.cancel()
+
+
+async def test_failed_turnlog_does_not_kill_the_brain(tmp_path):
+    """record_* take possibly-None timestamps straight off the wire."""
+    class BadTurnLog(FakeTurnLog):
+        def record_utterance(self, t_release, t_utterance):
+            raise TypeError("unsupported operand type(s) for -: 'NoneType' and 'float'")
+        def record_first_audio(self, t_first_audio):
+            raise TypeError("bad timestamp")
+
+    bus = EventBus()
+    butler, speaker, turnlog = FakeButler(), FakeSpeaker(), BadTurnLog()
+    task = asyncio.create_task(run_butler_brain(bus, butler, speaker, turnlog))
+    await asyncio.sleep(0)
+    err_fut = asyncio.ensure_future(_drain_until(bus, "butler.error"))
+    bus.publish("tts.done", {"t_first_audio": None})
+    err = await err_fut
+    assert "turnlog failed" in err["data"]["reason"]
+    # a broken metric must not cost the answer on the same event
+    answer_fut = asyncio.ensure_future(_drain_until(bus, "butler.answer"))
+    bus.publish("stt.utterance", {"text": "still there?", "t_release": None,
+                                  "t_utterance": None})
+    answer = await answer_fut
+    assert answer["data"]["display"]
+    assert not task.done()
+    task.cancel()
+
+
+# --- the lifespan really starts the brain -----------------------------------
+
+def test_lifespan_starts_the_butler_brain(tmp_path):
+    """`app.router.lifespan_context = _lifespan` is load-bearing but invisible.
+
+    If that assignment ever stopped taking effect the server would boot
+    identically -- /health ok, no traceback, the same uvicorn log lines -- and
+    the brain would simply never run. Every other test builds a TestClient
+    WITHOUT a `with` block, so the lifespan never executes under pytest at all.
+    This drives a real turn THROUGH the app's own bus inside the lifespan, so it
+    fails if the brain task is merely created-and-not-running, or never created.
+    """
+    from fastapi.testclient import TestClient
+
+    from server.app import create_app
+
+    class ClosableButler(FakeButler):
+        async def close(self): pass
+
+    app = create_app(base_dir=tmp_path)
+    # Swap in fakes BEFORE the lifespan runs: it captures app.state.butler /
+    # .speaker when it creates the brain task, and the real ones would try to
+    # reach Anthropic and ElevenLabs.
+    app.state.butler = ClosableButler()
+    app.state.speaker = FakeSpeaker()
+
+    with TestClient(app, base_url="http://127.0.0.1:7777") as client:  # `with` runs lifespan
+        assert getattr(app.state, "butler", None) is not None
+
+        async def probe():
+            # Run inside the app's event loop (the bus queues live there).
+            cid, q = app.state.bus.subscribe()
+            try:
+                app.state.bus.publish("command.received", {"text": "still there?"})
+                while True:
+                    ev = await asyncio.wait_for(q.get(), 2.0)
+                    if ev and ev["type"] == "butler.answer":
+                        return ev
+            finally:
+                app.state.bus.unsubscribe(cid)
+
+        answer = client.portal.call(probe)
+        assert answer["data"]["display"]
+        assert app.state.butler.asked == ["still there?"]

@@ -22,8 +22,10 @@ def speakable(spoken) -> str:
     aloud that is a mouthful of braces and quotes, so anything empty or
     JSON-looking is replaced with a short canned line. `\\r` is stripped because
     bulleted replies leave stray carriage returns that some voices verbalize.
+    CRLF is collapsed to a bare newline FIRST -- replacing `\\r` alone would turn
+    every `\\r\\n` into a stray trailing space before the newline.
     """
-    text = (spoken or "").replace("\r", " ").strip()
+    text = (spoken or "").replace("\r\n", "\n").replace("\r", " ").strip()
     if not text or text.startswith("{"):
         return UNCLEAR_LINE
     return text
@@ -41,6 +43,29 @@ async def run_butler_brain(bus, butler, speaker, turnlog):
         except Exception as e:  # noqa: BLE001
             bus.publish("butler.error", {"reason": f"speak failed: {e}"})
 
+    async def _preconnect():
+        # Same reasoning as _speak: a 401, a DNS failure or a dropped network on
+        # the TTS pre-warm would otherwise raise straight out of this loop and
+        # end the task -- JARVIS goes deaf until the process restarts, silently,
+        # because nothing publishes on that path. M1's fire-and-forget
+        # create_task(preconnect()) could not kill the loop either.
+        try:
+            await speaker.preconnect()
+        except Exception as e:  # noqa: BLE001 — a wake must never kill the brain
+            bus.publish("butler.error", {"reason": f"preconnect failed: {e}"})
+
+    def _safe(fn, *args, **kwargs):
+        # Metrics bookkeeping takes possibly-None timestamps straight off the
+        # wire; a TurnLog that trips over one must not take the brain with it.
+        try:
+            fn(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001 — metrics must never kill the brain
+            bus.publish("butler.error", {"reason": f"turnlog failed: {e}"})
+
+    def _record_audio(t_first_audio):
+        turnlog.record_first_audio(t_first_audio)
+        bus.publish("metrics.turn", turnlog.summary())
+
     try:
         while True:
             event = await q.get()
@@ -50,17 +75,16 @@ async def run_butler_brain(bus, butler, speaker, turnlog):
             etype = event["type"]
             data = event.get("data", {})
             if etype == "wake":
-                await speaker.preconnect()
+                await _preconnect()
                 continue
             if etype == "tts.done":
-                turnlog.record_first_audio(data.get("t_first_audio"))
-                bus.publish("metrics.turn", turnlog.summary())
+                _safe(_record_audio, data.get("t_first_audio"))
                 continue
             if etype in ("stt.utterance", "command.received"):
                 if etype == "stt.utterance":
-                    turnlog.record_utterance(
-                        t_release=(data.get("t_release") or 0) / 1000 or None,
-                        t_utterance=data.get("t_utterance"))
+                    _safe(turnlog.record_utterance,
+                          t_release=(data.get("t_release") or 0) / 1000 or None,
+                          t_utterance=data.get("t_utterance"))
                 text = (data.get("text") or "").strip()
                 if not text:
                     continue
