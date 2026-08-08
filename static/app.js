@@ -160,31 +160,58 @@ window.jarvis.onEvent("stt.utterance", (d) => {
 
 // ---- /audio WebSocket → MediaSource playback ---------------------------
 function connectAudio() {
+  // The playback pipeline and the tts.start subscription are wired up exactly
+  // once and persist across WS reconnects (state lives on the function object).
+  // This keeps reconnects from stacking duplicate reset handlers or leaving the
+  // drain bound to a stale, closed connection's buffer.
+  if (!connectAudio.init) {
+    connectAudio.init = true;
+    const S = connectAudio.state = { ms: null, sb: null, el: null, queue: [] };
+
+    // Single drain: append the next queued chunk whenever a buffer exists and is
+    // idle. Driven by the WS onmessage handler, sourceopen, and updateend.
+    const drain = () => {
+      if (!S.sb || S.sb.updating || !S.queue.length) return;
+      try {
+        S.sb.appendBuffer(S.queue.shift());
+      } catch (_) {
+        // A late chunk arriving after the buffer/MediaSource was torn down
+        // throws InvalidStateError — drop it quietly rather than break the stream.
+      }
+    };
+    connectAudio.drain = drain;
+
+    // Each tts.start begins a fresh utterance. Tear the previous playback down
+    // FIRST — pause, revoke its object URL, and null the buffer immediately so no
+    // in-flight chunk appends to the stale SourceBuffer — THEN build the new
+    // MediaSource + Audio.
+    window.jarvis.onEvent("tts.start", () => {
+      if (S.el) { S.el.pause(); URL.revokeObjectURL(S.el.src); }
+      S.sb = null;
+      S.queue = [];
+      S.ms = new MediaSource();
+      S.el = new Audio();
+      S.el.src = URL.createObjectURL(S.ms);
+      S.ms.addEventListener("sourceopen", () => {
+        S.sb = S.ms.addSourceBuffer("audio/mpeg");
+        S.sb.addEventListener("updateend", drain);
+        drain();
+      });
+      S.el.play().catch(() => {});   // AudioContext already unlocked by setup click
+    });
+  }
+
+  const S = connectAudio.state;
   const ws = new WebSocket(`ws://${location.host}/audio`);
   ws.binaryType = "arraybuffer";
-  let ms = null, sb = null, el = null, queue = [];
-
-  const reset = () => {
-    ms = new MediaSource();
-    el = new Audio();
-    el.src = URL.createObjectURL(ms);
-    ms.addEventListener("sourceopen", () => {
-      sb = ms.addSourceBuffer("audio/mpeg");
-      sb.addEventListener("updateend", () => {
-        if (queue.length && !sb.updating) sb.appendBuffer(queue.shift());
-      });
-    });
-    el.play().catch(() => {});   // AudioContext already unlocked by setup click
-  };
-
-  window.jarvis.onEvent("tts.start", () => { queue = []; reset(); });
-  ws.onmessage = (e) => {
-    if (!sb) return;
-    if (sb.updating || queue.length) queue.push(e.data);
-    else sb.appendBuffer(e.data);
-  };
+  // Never drop early chunks (incl. those before the first sourceopen): always
+  // queue, then drain — drain is a no-op until the buffer is ready.
+  ws.onmessage = (e) => { S.queue.push(e.data); connectAudio.drain(); };
   ws.onclose = () => setTimeout(connectAudio, 1000);
-  setInterval(() => ws.readyState === 1 && ws.send("ping"), 10000);
+  // Exactly one ping interval: clear the prior connection's before reconnecting
+  // (clearInterval(undefined) is a safe no-op on the first run).
+  clearInterval(connectAudio.ping);
+  connectAudio.ping = setInterval(() => ws.readyState === 1 && ws.send("ping"), 10000);
 }
 connectAudio();
 window.jarvis.onEvent("tts.done", () => window.jarvis.setStatus("online — hold to talk"));
