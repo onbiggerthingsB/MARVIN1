@@ -12,6 +12,16 @@ UNCLEAR_LINE = "Sorry sir, I didn't get a clean answer that time — it's on scr
 # taking every later utterance with it. Time it out and treat that like any
 # other failure.
 ASK_TIMEOUT_S = 120
+# Same argument, applied to every other await in the loop. The loop is SERIAL:
+# one await that never returns is one JARVIS that never answers again. A TTS
+# socket that connects and then goes quiet, or an ElevenLabs pre-warm against a
+# black-holed network, hangs indefinitely -- try/except catches the raise it
+# never makes. Bound them.
+SPEAK_TIMEOUT_S = 60
+PRECONNECT_TIMEOUT_S = 15
+# Citation validation touches the filesystem (an iCloud-evicted directory can
+# stall), so it is bounded too. A slow validator must cost the chips, not the turn.
+VALIDATE_TIMEOUT_S = 10
 
 
 def _record_utterance(turnlog, data):
@@ -50,17 +60,29 @@ def speakable(spoken) -> str:
     return text
 
 
-async def run_butler_brain(bus, butler, speaker, turnlog):
-    """Subscribe to the bus and drive the butler. Never raises out of the loop."""
+async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=None):
+    """Subscribe to the bus and drive the butler. Never raises out of the loop.
+
+    `validate_citations` is an optional async callable taking the model's list of
+    cited titles and returning the subset that resolves to real vault notes.
+    None (the default) means no validation, which keeps this loop importable and
+    testable without a vault behind it; server/app.py passes the real one.
+    """
     cid, q = bus.subscribe()
+
+    def _reason(e) -> str:
+        # asyncio.TimeoutError stringifies to "", which would publish a blank
+        # reason and read as "speak failed: " on the console.
+        return "timed out" if isinstance(e, asyncio.TimeoutError) else str(e)
 
     async def _speak(text):
         # A TTS failure is not a reason to lose the brain for the rest of the
-        # session; surface it and keep looping.
+        # session; surface it and keep looping. wait_for because a hang is not a
+        # failure this try/except would ever see.
         try:
-            await speaker.speak(text)
+            await asyncio.wait_for(speaker.speak(text), SPEAK_TIMEOUT_S)
         except Exception as e:  # noqa: BLE001
-            bus.publish("butler.error", {"reason": f"speak failed: {e}"})
+            bus.publish("butler.error", {"reason": f"speak failed: {_reason(e)}"})
 
     async def _preconnect():
         # Same reasoning as _speak: a 401, a DNS failure or a dropped network on
@@ -69,9 +91,31 @@ async def run_butler_brain(bus, butler, speaker, turnlog):
         # because nothing publishes on that path. M1's fire-and-forget
         # create_task(preconnect()) could not kill the loop either.
         try:
-            await speaker.preconnect()
+            await asyncio.wait_for(speaker.preconnect(), PRECONNECT_TIMEOUT_S)
         except Exception as e:  # noqa: BLE001 — a wake must never kill the brain
-            bus.publish("butler.error", {"reason": f"preconnect failed: {e}"})
+            bus.publish("butler.error", {"reason": f"preconnect failed: {_reason(e)}"})
+
+    async def _validated(citations):
+        """Keep only citations that name a real note (spec §4). Never raises.
+
+        A hallucinated [[wikilink]] renders as a chip identical to a real one, so
+        an invented source is indistinguishable from a grounded one on screen.
+
+        On validator failure the RAW list is published rather than nothing --
+        losing every chip is worse than showing an unverified one -- and the
+        diagnostic goes to metrics.error, not butler.error, because the console's
+        butler.error handler clears #answer/#citations and this runs immediately
+        before the answer is published.
+        """
+        if validate_citations is None or not citations:
+            return citations
+        try:
+            return list(await asyncio.wait_for(
+                validate_citations(citations), VALIDATE_TIMEOUT_S))
+        except Exception as e:  # noqa: BLE001 — validation must never kill the brain
+            bus.publish("metrics.error",
+                        {"reason": f"citation check failed: {_reason(e)}"})
+            return citations
 
     def _safe(fn, *args, **kwargs):
         # Metrics bookkeeping takes possibly-None (and possibly non-numeric)
@@ -120,9 +164,10 @@ async def run_butler_brain(bus, butler, speaker, turnlog):
                     bus.publish("butler.error", {"reason": reason})
                     await _speak(FALLBACK_LINE)
                     continue
+                citations = await _validated((answer or {}).get("citations", []))
                 bus.publish("butler.answer",
                             {"display": (answer or {}).get("display", ""),
-                             "citations": (answer or {}).get("citations", [])})
+                             "citations": citations})
                 await _speak(speakable((answer or {}).get("spoken")))
     finally:
         bus.unsubscribe(cid)

@@ -27,6 +27,30 @@ OPEN_PATHS = {"/health", "/bootstrap"}
 BEARER_PATHS = {"/wake"}
 
 
+def _existing_note_titles(titles, vault_root: Path) -> set:
+    """Which of `titles` name a real `<title>.md` note somewhere in the vault.
+
+    A FILENAME match is deliberate and sufficient: citations are Obsidian
+    wikilinks, which address notes by basename, and the cheap check is the whole
+    point -- this runs on every answered turn. Blocking `rglob`, so callers must
+    hand it to a thread.
+
+    Matching is on `Path.stem`, never on a glob pattern built from model output:
+    a title containing `[`, `*` or `?` would otherwise be interpreted as glob
+    syntax rather than matched literally.
+    """
+    wanted = {str(t).strip() for t in titles if str(t).strip()}
+    if not wanted:
+        return set()
+    found: set = set()
+    for p in Path(vault_root).rglob("*.md"):
+        if p.stem in wanted:
+            found.add(p.stem)
+            if len(found) == len(wanted):
+                break
+    return found
+
+
 def create_app(base_dir: Path) -> FastAPI:
     app = FastAPI()
     cfg = ensure_config(base_dir / "config" / "jarvis.json")
@@ -219,11 +243,35 @@ def create_app(base_dir: Path) -> FastAPI:
     if static.exists():
         app.mount("/static", StaticFiles(directory=static), name="static")
 
+    async def validate_citations(titles):
+        """Drop cited titles that do not resolve to a real note (spec §4).
+
+        to_thread: the vault is on iCloud and the walk is blocking file I/O that
+        must not sit on the loop carrying live audio.
+        """
+        found = await asyncio.to_thread(_existing_note_titles, titles, vault_root)
+        return [t for t in titles if str(t).strip() in found]
+
     @contextlib.asynccontextmanager
     async def _lifespan(_app):
         task = asyncio.create_task(
             run_butler_brain(app.state.bus, app.state.butler,
-                             app.state.speaker, app.state.turnlog))
+                             app.state.speaker, app.state.turnlog,
+                             validate_citations=validate_citations))
+
+        def _brain_died(t):
+            # Last resort. run_butler_brain guards every await, so reaching here
+            # means something outside those guards ended it -- and a dead brain
+            # is otherwise perfectly silent: /health stays ok and JARVIS simply
+            # never answers again. Cancellation is the normal shutdown path.
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                app.state.bus.publish("butler.error",
+                                      {"reason": f"brain task died: {exc!r}"})
+
+        task.add_done_callback(_brain_died)
         try:
             yield
         finally:

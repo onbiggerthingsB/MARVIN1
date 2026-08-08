@@ -253,6 +253,123 @@ async def test_zero_and_none_t_release_are_still_skipped(tmp_path):
         task.cancel()
 
 
+# --- FIX I2: a HANG is not an exception; try/except never sees it -----------
+
+async def test_hung_speak_times_out_instead_of_wedging_the_loop(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_brain, "SPEAK_TIMEOUT_S", 0.01)
+
+    class HangingSpeaker(FakeSpeaker):
+        async def speak(self, text): await asyncio.sleep(60)
+
+    bus = EventBus()
+    butler, speaker, turnlog = FakeButler(), HangingSpeaker(), FakeTurnLog()
+    task = asyncio.create_task(run_butler_brain(bus, butler, speaker, turnlog))
+    await asyncio.sleep(0)
+    err_fut = asyncio.ensure_future(_drain_until(bus, "butler.error"))
+    bus.publish("command.received", {"text": "hi"})
+    err = await err_fut
+    assert err["data"]["reason"] == "speak failed: timed out"
+    # the loop is serial: a stuck speak would have eaten every later turn
+    answer_fut = asyncio.ensure_future(_drain_until(bus, "butler.answer"))
+    bus.publish("command.received", {"text": "still there?"})
+    assert (await answer_fut)["data"]["display"]
+    assert not task.done()
+    task.cancel()
+
+
+async def test_hung_preconnect_times_out_instead_of_wedging_the_loop(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_brain, "PRECONNECT_TIMEOUT_S", 0.01)
+
+    class HangingSpeaker(FakeSpeaker):
+        async def preconnect(self): await asyncio.sleep(60)
+
+    bus = EventBus()
+    butler, speaker, turnlog = FakeButler(), HangingSpeaker(), FakeTurnLog()
+    task = asyncio.create_task(run_butler_brain(bus, butler, speaker, turnlog))
+    await asyncio.sleep(0)
+    err_fut = asyncio.ensure_future(_drain_until(bus, "butler.error"))
+    bus.publish("wake", {})
+    err = await err_fut
+    assert err["data"]["reason"] == "preconnect failed: timed out"
+    answer_fut = asyncio.ensure_future(_drain_until(bus, "butler.answer"))
+    bus.publish("command.received", {"text": "still there?"})
+    assert (await answer_fut)["data"]["display"]
+    assert not task.done()
+    task.cancel()
+
+
+# --- FIX I3: citations must be validated against real notes (spec §4) -------
+
+class TwoCiteButler(FakeButler):
+    async def ask(self, text):
+        self.asked.append(text)
+        return {"spoken": "Session 2.",
+                "display": "At [[Tibet Session 2]] and [[Invented Note]].",
+                "citations": ["Tibet Session 2", "Invented Note"]}
+
+
+async def test_hallucinated_citation_is_dropped_before_publishing(tmp_path):
+    """A made-up [[wikilink]] renders as a chip identical to a real one."""
+    async def validator(titles):
+        return [t for t in titles if t == "Tibet Session 2"]
+
+    bus = EventBus()
+    speaker, turnlog = FakeSpeaker(), FakeTurnLog()
+    task = asyncio.create_task(run_butler_brain(bus, TwoCiteButler(), speaker, turnlog,
+                                                validate_citations=validator))
+    await asyncio.sleep(0)
+    answer_fut = asyncio.ensure_future(_drain_until(bus, "butler.answer"))
+    bus.publish("command.received", {"text": "hi"})
+    answer = await answer_fut
+    assert answer["data"]["citations"] == ["Tibet Session 2"]   # the real one survives
+    task.cancel()
+
+
+async def test_no_validator_publishes_citations_unchanged(tmp_path):
+    bus = EventBus()
+    speaker, turnlog = FakeSpeaker(), FakeTurnLog()
+    task = asyncio.create_task(run_butler_brain(bus, TwoCiteButler(), speaker, turnlog))
+    await asyncio.sleep(0)
+    answer_fut = asyncio.ensure_future(_drain_until(bus, "butler.answer"))
+    bus.publish("command.received", {"text": "hi"})
+    answer = await answer_fut
+    assert answer["data"]["citations"] == ["Tibet Session 2", "Invented Note"]
+    task.cancel()
+
+
+async def test_broken_validator_does_not_kill_the_brain_or_the_answer(tmp_path):
+    """A validator failure costs verification, not the turn -- and it reports on
+    metrics.error, because butler.error clears #answer/#citations on the console."""
+    async def boom(titles): raise RuntimeError("vault walk failed")
+
+    bus = EventBus()
+    speaker, turnlog = FakeSpeaker(), FakeTurnLog()
+    task = asyncio.create_task(run_butler_brain(bus, TwoCiteButler(), speaker, turnlog,
+                                                validate_citations=boom))
+    await asyncio.sleep(0)
+    err_fut = asyncio.ensure_future(_drain_until(bus, "metrics.error"))
+    answer_fut = asyncio.ensure_future(_drain_until(bus, "butler.answer"))
+    bus.publish("command.received", {"text": "hi"})
+    assert "citation check failed" in (await err_fut)["data"]["reason"]
+    answer = await answer_fut
+    assert answer["data"]["display"]                       # the answer survived
+    assert answer["data"]["citations"] == ["Tibet Session 2", "Invented Note"]
+    assert not task.done()
+    task.cancel()
+
+
+async def test_app_validator_checks_real_files(tmp_path):
+    """server/app.py's validator resolves each cited title to a real .md note."""
+    from server.app import _existing_note_titles
+
+    (tmp_path / "Wiki").mkdir(parents=True)
+    (tmp_path / "Wiki" / "Tibet Session 2.md").write_text("hi", encoding="utf-8")
+    found = _existing_note_titles(["Tibet Session 2", "Invented Note"], tmp_path)
+    assert found == {"Tibet Session 2"}
+    # a title full of glob metacharacters is matched literally, not as a pattern
+    assert _existing_note_titles(["*"], tmp_path) == set()
+
+
 # --- the lifespan really starts the brain -----------------------------------
 
 def test_lifespan_starts_the_butler_brain(tmp_path):

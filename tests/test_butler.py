@@ -135,6 +135,116 @@ async def test_failed_connect_does_not_wedge_the_butler(tmp_path):
     assert len(attempts) == 2 and attempts[0] is not attempts[1]
 
 
+async def test_stale_resume_id_is_cleared_after_connect_failure(tmp_path):
+    """A stale resume id must not brick the butler permanently.
+
+    test_failed_connect_does_not_wedge_the_butler above is a FALSE NEGATIVE on
+    this: its fake succeeds on attempt 2 whatever resume id it was handed, so it
+    passed even when ask() dropped the client and kept the poisoned id. In the
+    real world the id is what connect() rejects, so every later turn rebuilt the
+    same options and failed identically -- forever, with the fallback line as the
+    only symptom and `rm state/butler.json` as the only cure. Assert the SECOND
+    attempt is handed resume=None.
+    """
+    state = tmp_path / "butler.json"
+    state.write_text(json.dumps({"session_id": "stale-999"}))
+    seen_resumes = []
+
+    class FailFirstConnect(FakeClient):
+        attempts = 0
+
+        def __init__(self, options):
+            super().__init__(options)
+            seen_resumes.append(options["resume"])
+
+        async def connect(self):
+            FailFirstConnect.attempts += 1
+            if FailFirstConnect.attempts == 1:
+                raise RuntimeError("no such session")
+            await super().connect()
+
+    b = Butler(options_builder=lambda r: {"resume": r},
+               state_path=state, client_factory=FailFirstConnect)
+    with pytest.raises(RuntimeError):
+        await b.ask("first")
+    out = await b.ask("second")            # must start a FRESH session and work
+    assert out["spoken"]
+    assert seen_resumes == ["stale-999", None]
+
+
+async def test_good_session_id_survives_an_unrelated_turn_failure(tmp_path):
+    """Only a CONNECT failure clears the id, and only when a resume was in play.
+
+    Clearing on every failure would throw away a healthy session -- and the
+    butler's whole value is conversational continuity across turns.
+    """
+    state = tmp_path / "butler.json"
+
+    class QueryBoom(FakeClient):
+        async def query(self, text, session_id="default"):
+            raise RuntimeError("mid-turn transport hiccup")
+
+    b = Butler(options_builder=lambda r: {"resume": r},
+               state_path=state, client_factory=QueryBoom)
+    b._session_id = "good-123"
+    state.write_text(json.dumps({"session_id": "good-123"}))
+    with pytest.raises(RuntimeError):
+        await b.ask("hi")
+    assert b._session_id == "good-123"
+    assert state.exists()
+
+
+async def test_fallback_prefers_the_last_message_not_the_narration(tmp_path):
+    """Without clean JSON the old code spoke the model's pre-tool-call preamble.
+
+    Every assistant message in the turn was concatenated, so "Let me search the
+    vault for Tibet..." ended up at the FRONT of the plain-text fallback and got
+    read aloud as the answer.
+    """
+    class Narrating(FakeClient):
+        async def receive_response(self):
+            yield _Assistant("Let me search the vault for Tibet...")
+            yield _Assistant("Session 2 is where you left it. See [[Tibet Session 2]].")
+            yield _Result("sess-123")
+
+    b = Butler(options_builder=lambda r: {"resume": r},
+               state_path=tmp_path / "butler.json", client_factory=Narrating)
+    out = await b.ask("where did I leave off?")
+    assert "Let me search" not in out["spoken"]
+    assert out["display"].startswith("Session 2 is where you left it.")
+    assert out["citations"] == ["Tibet Session 2"]
+
+
+async def test_json_in_an_earlier_message_is_still_found(tmp_path):
+    """The concatenation fallback stays: a reply followed by a trailing chatty
+    message must not lose the JSON object the model did emit."""
+    class TrailingChatter(FakeClient):
+        async def receive_response(self):
+            yield _Assistant('{"spoken": "Session 2.", "display": "At [[Tibet]].", '
+                             '"citations": ["Tibet"]}')
+            yield _Assistant("Let me know if you want the full note.")
+            yield _Result("sess-123")
+
+    b = Butler(options_builder=lambda r: {"resume": r},
+               state_path=tmp_path / "butler.json", client_factory=TrailingChatter)
+    out = await b.ask("hi")
+    assert out["spoken"] == "Session 2."
+    assert out["citations"] == ["Tibet"]
+
+
+def test_system_prompt_carries_the_vault_map():
+    """setting_sources=[] keeps the vault's own CLAUDE.md out of the session (the
+    right security trade), which leaves the butler with no folder map at all and
+    no directory-listing tool. The prompt has to carry one."""
+    from server.butler import SYSTEM_PROMPT
+    for folder in ("Daily/", "Wiki/", "Sources/", "_Claude/", "Claude Chats/",
+                   "Fieldwork/", "College Prep/", "Soccer/"):
+        assert folder in SYSTEM_PROMPT
+    assert "_Claude/index.md" in SYSTEM_PROMPT
+    # and the model must be told a big total means it is seeing a subset
+    assert "narrow" in SYSTEM_PROMPT.lower()
+
+
 async def test_cancelled_turn_leaves_butler_usable(tmp_path):
     """A timed-out turn is a CANCELLED turn, and cancellation must reset the client.
 

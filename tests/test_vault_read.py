@@ -20,11 +20,13 @@ def seed(vault: Path):
 @pytest.mark.skipif(not HAS_RG, reason="ripgrep not installed")
 async def test_search_finds_seeded_term(tmp_path):
     seed(tmp_path)
-    results = await vault_search("chant", tmp_path, limit=5)
+    out = await vault_search("chant", tmp_path, limit=5)
+    results = out["results"]
     assert any(r["title"] == "Tibet" for r in results)
     hit = next(r for r in results if r["title"] == "Tibet")
     assert hit["path"] == "Wiki/Tibet.md"
     assert "chant" in hit["snippet"].lower()
+    assert out["total"] == 1
 
 
 @pytest.mark.skipif(not HAS_RG, reason="ripgrep not installed")
@@ -38,11 +40,98 @@ async def test_search_ignores_inherited_stdin(tmp_path):
     try:
         with open(decoy, "rb") as f:
             os.dup2(f.fileno(), 0)
-        results = await vault_search("chant", tmp_path, limit=5)
+        out = await vault_search("chant", tmp_path, limit=5)
     finally:
         os.dup2(saved, 0)
         os.close(saved)
-    assert any(r["path"] == "Wiki/Tibet.md" for r in results)
+    assert any(r["path"] == "Wiki/Tibet.md" for r in out["results"])
+
+
+@pytest.mark.skipif(not HAS_RG, reason="ripgrep not installed")
+async def test_search_is_ranked_and_deterministic(tmp_path):
+    """`rg -l` + `[:limit]` returned ripgrep's parallel-walk order.
+
+    Against the real vault "Tibet" matches 164 files and the top 3 CHANGED on
+    three consecutive runs, so the butler saw 5 arbitrary notes out of 164 and
+    never learned the rest existed. Rank by match count, and break every tie
+    deterministically -- with chat transcripts pushed behind Keke's own notes.
+    """
+    (tmp_path / "Wiki").mkdir(parents=True)
+    (tmp_path / "Claude Chats").mkdir(parents=True)
+    (tmp_path / "Wiki" / "Many.md").write_text("chant chant chant\n", encoding="utf-8")
+    (tmp_path / "Wiki" / "One.md").write_text("chant\n", encoding="utf-8")
+    (tmp_path / "Claude Chats" / "Archive.md").write_text(
+        "chant chant chant chant\n", encoding="utf-8")
+    out = await vault_search("chant", tmp_path, limit=5)
+    paths = [r["path"] for r in out["results"]]
+    assert out["total"] == 3
+    assert paths[0] == "Wiki/Many.md"          # highest count among non-archives
+    assert paths[1] == "Wiki/One.md"
+    assert paths[-1] == "Claude Chats/Archive.md"   # archive last despite highest count
+    again = await vault_search("chant", tmp_path, limit=5)
+    assert [r["path"] for r in again["results"]] == paths   # deterministic
+
+
+@pytest.mark.skipif(not HAS_RG, reason="ripgrep not installed")
+async def test_count_outranks_alphabetical_and_depth(tmp_path):
+    """Pins the count key on its own.
+
+    `rg -c` counts matching LINES, not occurrences, so in the test above all
+    three files score 1 and the expected order also falls out of the alphabetical
+    tiebreak -- it would pass with the count key deleted. Here the counts differ
+    for real, and both weaker keys point the other way: 'Zeta' loses on
+    alphabetical order and Deep/ loses on depth.
+    """
+    (tmp_path / "Wiki" / "Deep").mkdir(parents=True)
+    (tmp_path / "Alpha.md").write_text("chant\n", encoding="utf-8")
+    (tmp_path / "Wiki" / "Deep" / "Zeta.md").write_text(
+        "chant\nchant\nchant\n", encoding="utf-8")
+    out = await vault_search("chant", tmp_path, limit=5)
+    assert [r["path"] for r in out["results"]] == ["Wiki/Deep/Zeta.md", "Alpha.md"]
+    assert [r["count"] for r in out["results"]] == [3, 1]
+
+
+@pytest.mark.skipif(not HAS_RG, reason="ripgrep not installed")
+async def test_depth_breaks_a_count_tie(tmp_path):
+    """At equal counts the shallower, curated note wins."""
+    (tmp_path / "Wiki" / "Archive" / "Old").mkdir(parents=True)
+    (tmp_path / "Wiki" / "Zzz.md").write_text("chant\n", encoding="utf-8")
+    (tmp_path / "Wiki" / "Archive" / "Old" / "Aaa.md").write_text(
+        "chant\n", encoding="utf-8")
+    out = await vault_search("chant", tmp_path, limit=5)
+    assert [r["path"] for r in out["results"]] == [
+        "Wiki/Zzz.md", "Wiki/Archive/Old/Aaa.md"]
+
+
+@pytest.mark.skipif(not HAS_RG, reason="ripgrep not installed")
+async def test_chatgpt_archive_is_deprioritized_but_not_excluded(tmp_path):
+    """The other archive prefix, and the "not excluded" half of the rule: a term
+    that lives ONLY in a transcript must still come back."""
+    (tmp_path / "ChatGPT Chats").mkdir(parents=True)
+    (tmp_path / "ChatGPT Chats" / "T.md").write_text("chant\n", encoding="utf-8")
+    out = await vault_search("chant", tmp_path, limit=5)
+    assert [r["path"] for r in out["results"]] == ["ChatGPT Chats/T.md"]
+
+    (tmp_path / "Wiki").mkdir()
+    (tmp_path / "Wiki" / "Note.md").write_text("chant\n", encoding="utf-8")
+    out = await vault_search("chant", tmp_path, limit=5)
+    assert [r["path"] for r in out["results"]] == ["Wiki/Note.md", "ChatGPT Chats/T.md"]
+
+
+@pytest.mark.skipif(not HAS_RG, reason="ripgrep not installed")
+async def test_search_reports_total_beyond_the_limit(tmp_path):
+    """`total` is the whole point of the new shape: the caller must be able to say
+    "164 matched, here are 5" instead of implying five is all there is."""
+    (tmp_path / "Wiki").mkdir(parents=True)
+    for i in range(9):
+        (tmp_path / "Wiki" / f"N{i}.md").write_text("chant\n", encoding="utf-8")
+    out = await vault_search("chant", tmp_path, limit=2)
+    assert out["total"] == 9
+    assert len(out["results"]) == 2
+
+
+async def test_search_empty_query_returns_empty_shape(tmp_path):
+    assert await vault_search("   ", tmp_path) == {"total": 0, "results": []}
 
 
 def test_read_returns_content(tmp_path):

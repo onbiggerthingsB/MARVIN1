@@ -22,23 +22,36 @@ def _text(s: str) -> dict:
 def build_vault_server(vault_root: Path):
     vault_root = Path(vault_root)
 
-    @tool("vault_search", "Search the vault's notes for a query; returns matching notes "
-          "with a snippet. The query is matched as a LITERAL fixed string, not a regex "
+    @tool("vault_search", "Search the vault's notes for a query; returns the notes that "
+          "match most often, with a snippet, plus the TOTAL number of matching notes. "
+          "The query is matched as a LITERAL fixed string, not a regex "
           "and not natural language: pass ONE or TWO keywords (a proper noun, a project "
           "name), never a whole question. Issue several narrow searches instead of one "
-          "long one. Use this to ground answers before replying.",
+          "long one. If the total is far larger than what is shown, you are seeing a "
+          "subset: narrow the query rather than assuming the rest do not exist. "
+          "Use this to ground answers before replying.",
           {"query": str, "limit": int})
     async def _search(args):
         # `or 5` (not a dict default) so an explicit limit:null -- which a model
         # emits routinely -- falls back instead of raising TypeError; clamped to
         # 1..20 so a huge limit cannot drag the whole vault into the context.
         limit = max(1, min(int(args.get("limit") or 5), 20))
-        results = await vault_search(args["query"], vault_root, limit)
+        found = await vault_search(args["query"], vault_root, limit)
+        results, total = found["results"], found["total"]
         if not results:
             return _text("No matching notes. Try a single different keyword before "
                          "concluding the vault has nothing on this.")
-        return _text("\n\n".join(
+        # The total goes FIRST and in plain words. Ranking alone does not stop the
+        # model from treating five hits as the whole truth; it has to be told that
+        # 164 notes matched and it is looking at five of them.
+        parts = [f"Found {total} notes; showing the top {len(results)} by match count."]
+        parts.append("\n\n".join(
             f"[[{r['title']}]]  ({r['path']})\n{r['snippet']}" for r in results))
+        if total > len(results):
+            parts.append(f"{total - len(results)} more notes matched and are NOT shown. "
+                         "Narrow with a more specific keyword, or an adjacent two-word "
+                         "phrase, instead of accepting only the notes above.")
+        return _text("\n\n".join(parts))
 
     @tool("vault_read", "Read one vault note by its path relative to the vault root "
           "(e.g. 'Wiki/Tibet.md'). Markdown notes only.", {"path": str})
