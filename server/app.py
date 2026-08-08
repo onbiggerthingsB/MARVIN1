@@ -5,7 +5,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -116,6 +116,20 @@ def create_app(base_dir: Path) -> FastAPI:
                 app.state.bus.unsubscribe(cid)
 
         return StreamingResponse(stream(), media_type="text/event-stream")
+
+    @app.websocket("/mic")
+    async def mic(ws: WebSocket):
+        # Cookie + origin checks: middleware does not cover WS, so verify here.
+        if not auth.origin_ok(ws.headers.get("origin"), ws.headers.get("host"), cfg.port) \
+           or not auth.verify_session(ws.cookies.get(COOKIE), cfg.session_token_hash):
+            await ws.close(code=4401)
+            return
+        await ws.accept()
+        try:
+            while True:
+                await ws.receive()  # Task 8 replaces this loop with the Deepgram relay
+        except WebSocketDisconnect:
+            pass
 
     static = base_dir / "static"
     if static.exists():
