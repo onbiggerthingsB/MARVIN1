@@ -99,5 +99,47 @@ def test_module_exposes_no_trading_capability():
 
 
 def test_trade_refusal_line_points_at_the_stock_system():
-    assert "buy" not in TRADE_REFUSAL.lower().split()[0]
-    assert len(TRADE_REFUSAL) > 20
+    low = TRADE_REFUSAL.lower()
+    assert "stock system" in low
+    assert "won't" in low or "will not" in low
+    assert "order" in low or "trade" in low or "trading" in low
+
+
+def test_finance_module_contains_no_execution_primitive():
+    # Name-independent guard: a future rebalance()/sync_broker() that writes
+    # would slip past the name scan above; a source scan catches the primitive.
+    import server.finance as f
+    src = Path(f.__file__).read_text(encoding="utf-8")
+    banned = ["subprocess", "urllib.request", "socket", "requests", "httpx",
+              "os.system", "popen", "eval(", "exec(",
+              "write_text", "write_bytes", "open(", ".commit(",
+              "INSERT", "UPDATE", "DELETE", "DROP", "ATTACH"]
+    hits = [b for b in banned if b in src]
+    assert hits == [], f"finance.py must contain no execution/write primitive, found: {hits}"
+
+
+async def test_brief_refuses_a_confirmed_non_finance_project(tmp_path):
+    # FIX 5 by construction: even a confirmed project must be kind == "finance".
+    (tmp_path / "picks.json").write_text(
+        json.dumps([{"symbol": "TSLA", "shares": 3}]), encoding="utf-8")
+    r = Registry()
+    r.merge_candidates([Candidate(path=str(tmp_path), name="soccer", sources=["a"])])
+    r.confirm("soccer", kind="code")
+    project = next(p for p in r.projects if p.name == "soccer")
+    assert project.confirmed is True                 # confirmed, but not finance
+    brief = await portfolio_brief(project)
+    assert brief["available"] is False and brief["rows"] == []
+
+
+async def test_brief_works_from_a_path_containing_a_space(tmp_path):
+    import sqlite3
+    root = tmp_path / "quant agent"          # the real repo's shape
+    root.mkdir()
+    db = root / "signals.sqlite"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE positions (symbol TEXT, shares REAL)")
+    con.execute("INSERT INTO positions VALUES ('NVDA', 10)")
+    con.commit(); con.close()
+    r = finance_registry(str(root))          # reuse the file's existing helper
+    brief = await portfolio_brief(find_finance_project(r))
+    assert brief["available"] is True and brief["rows"][0]["symbol"] == "NVDA"

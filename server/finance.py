@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 MAX_PER_KIND = 5
 MAX_ROWS = 8
@@ -40,16 +42,28 @@ def detect_outputs(root: Path) -> dict:
     buckets = {".sqlite": "sqlite", ".db": "sqlite", ".json": "json",
                ".csv": "csv", ".md": "reports"}
     found: dict[str, list[tuple[float, str]]] = {k: [] for k in out}
-    for p in root.rglob("*"):
-        if any(part.startswith(".") for part in p.parts):
-            continue                       # .venv, .git, .claude and friends
-        kind = buckets.get(p.suffix.lower())
-        if kind is None or not p.is_file():
-            continue
-        try:
-            found[kind].append((p.stat().st_mtime, str(p)))
-        except OSError:
-            continue
+    # os.walk with followlinks=False: rglob on Python < 3.13 follows symlinked
+    # directories, which would let a link inside the repo escape it (or cycle).
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(dirpath)
+        dirnames[:] = [d for d in dirnames
+                       if not d.startswith(".")      # .venv, .git, .claude
+                       and not (base / d).is_symlink()]
+        for name in filenames:
+            p = base / name
+            # Dot check is scoped to the path RELATIVE to the repo root, so a
+            # repo living under a dotted ancestor (~/.finance/...) still scans.
+            if any(part.startswith(".") for part in p.relative_to(root).parts):
+                continue
+            if p.is_symlink():
+                continue                   # never read through a link out of the repo
+            kind = buckets.get(p.suffix.lower())
+            if kind is None or not p.is_file():
+                continue
+            try:
+                found[kind].append((p.stat().st_mtime, str(p)))
+            except OSError:
+                continue
     for kind, items in found.items():
         items.sort(reverse=True)           # newest first
         out[kind] = [path for _, path in items[:MAX_PER_KIND]]
@@ -57,8 +71,13 @@ def detect_outputs(root: Path) -> dict:
 
 
 def _rows_from_sqlite(path: str) -> list[dict]:
+    # Percent-encode the path: SQLite's URI parser treats '#' as a fragment and
+    # '?' as query-string start, so a raw filename could truncate the URI and
+    # silently lose mode=ro (falling back to read-write-and-create). quote()
+    # keeps '/' and encodes the rest; SQLite decodes %XX in URI paths.
+    uri = f"file:{quote(str(path))}?mode=ro"
     try:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        con = sqlite3.connect(uri, uri=True)
     except sqlite3.Error:
         return []
     try:
@@ -79,8 +98,8 @@ def _rows_from_sqlite(path: str) -> list[dict]:
 def _rows_from_json(path: str) -> list[dict]:
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return []                          # a bad file degrades, never crashes the brief
     if isinstance(data, dict):
         for key in ("positions", "holdings", "picks", "rows"):
             if isinstance(data.get(key), list):
@@ -122,7 +141,11 @@ def _collect(project) -> dict:
 
 
 async def portfolio_brief(project, now: datetime | None = None) -> dict:
-    if project is None:
+    # The "never brief an unconfirmed project" guarantee holds by construction
+    # here, not by trusting the caller to have used find_finance_project():
+    # anything that is not a confirmed finance project is treated like None.
+    if project is None or not (getattr(project, "confirmed", False)
+                               and getattr(project, "kind", None) == "finance"):
         return {"available": False, "source": None, "rows": [], "as_of": None,
                 "caveat": CAVEAT,
                 "spoken": "I don't have a confirmed stock system yet, sir."}
