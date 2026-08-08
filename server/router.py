@@ -31,6 +31,35 @@ _TRADE = re.compile(
 _AFFIRM = re.compile(r"^\s*(?:yes|yeah|yep|sure|ok|okay|go ahead|do it|approve[d]?)\b", re.I)
 _DENY = re.compile(r"^\s*(?:no|nope|deny|don'?t|stop|cancel|reject)\b", re.I)
 
+# Words that may appear in a BARE affirmation/denial without addressing
+# anything specific ("yes, go ahead", "no, don't do it now, please").
+# Any other alphabetic token means the utterance names something, and it
+# may then only resolve an approval it actually matches.
+_BARE_FILLER = frozenset({
+    # affirm/deny vocabulary
+    "yes", "yeah", "yep", "sure", "ok", "okay", "go", "ahead", "do", "it",
+    "approve", "approved", "no", "nope", "deny", "denied", "don't", "dont",
+    "stop", "cancel", "reject",
+    # polite filler that addresses nothing
+    "that", "this", "please", "sir", "now", "the", "a", "and", "then",
+})
+
+_WORD = re.compile(r"[a-z']+")
+_TOKEN = re.compile(r"[a-z0-9]+")
+
+
+def _is_addressed(text: str) -> bool:
+    """True when the utterance names something beyond a bare yes/no."""
+    return any(w not in _BARE_FILLER for w in _WORD.findall(text.lower()))
+
+
+def _mentions_tool(tool: str, spoken_tokens: set[str]) -> bool:
+    """Token-overlap tool match: every token of the tool appears in the
+    utterance ("approve soccer npm test" mentions "npm test" but not
+    "rm -rf build"). Case-insensitive, punctuation-insensitive."""
+    tool_tokens = _TOKEN.findall(tool.lower())
+    return bool(tool_tokens) and all(t in spoken_tokens for t in tool_tokens)
+
 
 @dataclass
 class Command:
@@ -113,19 +142,44 @@ class Router:
 
     def resolve_approval(self, spoken: str, now: float) -> tuple[str, Approval | None]:
         text = (spoken or "").strip()
+
+        # FIX 3: affirm/deny FIRST. Unrelated speech is never an approval
+        # answer, and must not leak approval state ("ambiguous"/"expired")
+        # into normal conversation where a caller could hijack it.
+        affirm, deny = bool(_AFFIRM.match(text)), bool(_DENY.match(text))
+        if not (affirm or deny):
+            return ("none", None)
+
         had = bool(self._approvals)
         self._sweep(now)
         if not self._approvals:
             return ("expired", None) if had else ("none", None)
 
-        affirm, deny = bool(_AFFIRM.match(text)), bool(_DENY.match(text))
-        addressed = [a for a in self._approvals
-                     if a.project.lower() in text.lower()]
-        if len(self._approvals) > 1 and len(addressed) != 1:
-            # A bare "yes" with several in flight could approve the wrong command.
-            return ("ambiguous", None)
-        target = addressed[0] if addressed else self._approvals[0]
-        if not (affirm or deny):
-            return ("none", None)
+        lowered = text.lower()
+        matched = [a for a in self._approvals if a.project.lower() in lowered]
+        if len(matched) > 1:
+            # FIX 2: several approvals for one project — narrow by tool text
+            # (token overlap) so "approve soccer npm test" is not a deadlock.
+            spoken_tokens = set(_TOKEN.findall(lowered))
+            narrowed = [a for a in matched if _mentions_tool(a.tool, spoken_tokens)]
+            if len(narrowed) == 1:
+                matched = narrowed
+
+        if _is_addressed(text):
+            # FIX 1: an utterance that names something specific may only
+            # resolve an approval it actually matched — never fall back to
+            # "the" pending one. "approve alethic ..." must not approve soccer.
+            if not matched:
+                return ("none", None)
+            if len(matched) > 1:
+                # Fail closed: still cannot tell which one was meant.
+                return ("ambiguous", None)
+            target = matched[0]
+        else:
+            # A bare "yes"/"no" can only answer a single unambiguous question.
+            if len(self._approvals) > 1:
+                return ("ambiguous", None)
+            target = self._approvals[0]
+
         self._approvals.remove(target)
         return ("denied" if deny else "approved", target)

@@ -119,3 +119,34 @@ def test_each_approval_gets_a_distinct_nonce():
     a = router.open_approval("soccer", "npm test", now=NOW)
     b = router.open_approval("alethic", "npm test", now=NOW)
     assert a.nonce != b.nonce
+
+
+def test_naming_an_unmatched_project_does_not_consume_the_only_pending():
+    router = Router()
+    router.open_approval("soccer", "npm test", now=NOW)
+    state, appr = router.resolve_approval("approve alethic rm -rf build", now=NOW + 5)
+    assert state == "none" and appr is None
+    assert len(router.pending_approvals()) == 1      # soccer's approval untouched
+
+
+def test_two_approvals_for_one_project_are_addressable_by_tool():
+    router = Router()
+    router.open_approval("soccer", "npm test", now=NOW)
+    router.open_approval("soccer", "rm -rf build", now=NOW)
+    state, appr = router.resolve_approval("approve soccer npm test", now=NOW + 5)
+    assert state == "approved" and appr.tool == "npm test"
+    assert [a.tool for a in router.pending_approvals()] == ["rm -rf build"]
+
+
+def test_unrelated_speech_is_not_an_approval_answer():
+    router = Router()
+    router.open_approval("soccer", "npm test", now=NOW)
+    router.open_approval("alethic", "npm test", now=NOW)
+    assert router.resolve_approval("where did I leave the Tibet study?", now=NOW + 5) == ("none", None)
+    assert len(router.pending_approvals()) == 2
+
+
+def test_unrelated_speech_after_expiry_is_not_reported_as_expired():
+    router = Router()
+    router.open_approval("soccer", "npm test", now=NOW)
+    assert router.resolve_approval("what's the weather?", now=NOW + 601) == ("none", None)
