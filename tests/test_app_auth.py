@@ -111,3 +111,32 @@ def test_cross_origin_rejected(tmp_path):
 def test_command_requires_cookie(tmp_path):
     c = make_client(tmp_path)
     assert c.post("/command", json={"text": "hi"}).status_code == 401
+
+
+def test_static_requires_cookie(tmp_path):
+    # make_client uses tmp_path as an isolated base_dir (no repo static/ dir
+    # comes along for free), so seed a chime file the way Task 1's
+    # scripts/gen_chimes.py would have populated it.
+    chimes_dir = tmp_path / "static" / "chimes"
+    chimes_dir.mkdir(parents=True)
+    (chimes_dir / "ack.wav").write_bytes(b"RIFF0000WAVEfmt ")
+    c = make_client(tmp_path)
+    # chimes exist under static/ from Task 1; without a cookie they are gated
+    assert c.get("/static/chimes/ack.wav").status_code == 401
+    bootstrap(c)
+    assert c.get("/static/chimes/ack.wav").status_code == 200
+
+
+def test_malformed_last_event_id_does_not_500(tmp_path):
+    app = create_app(base_dir=tmp_path)
+    port = _free_port()
+    app.state.cfg.port = port  # keep Host-header checks consistent with the bound port
+
+    with _live_server(app, port):
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}") as client:
+            token = app.state.bootstrap_token_plain
+            r = client.get(f"/bootstrap?token={token}", follow_redirects=False)
+            assert r.status_code == 303
+            assert "jarvis_session" in r.cookies
+            with client.stream("GET", "/events", headers={"Last-Event-ID": "not-a-number"}) as r:
+                assert r.status_code == 200

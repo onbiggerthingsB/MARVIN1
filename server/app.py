@@ -45,7 +45,7 @@ def create_app(base_dir: Path) -> FastAPI:
         host = request.headers.get("host")
         if not auth.origin_ok(origin, host, cfg.port):
             return JSONResponse({"error": "forbidden origin"}, status_code=403)
-        if path in OPEN_PATHS or path.startswith("/static"):
+        if path in OPEN_PATHS:
             return await call_next(request)
         if path in BEARER_PATHS:
             if not auth.verify_bearer(request.headers.get("authorization"), cfg.hook_bearer):
@@ -95,7 +95,11 @@ def create_app(base_dir: Path) -> FastAPI:
     @app.get("/events")
     async def events(request: Request):
         last = request.headers.get("last-event-id")
-        cid, q = app.state.bus.subscribe(int(last) if last else None)
+        try:
+            last_seq = int(last) if last else None
+        except ValueError:
+            last_seq = None
+        cid, q = app.state.bus.subscribe(last_seq)
 
         async def stream():
             try:
