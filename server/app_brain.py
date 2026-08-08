@@ -216,29 +216,43 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                 # The affirm vocabulary never overlaps any verb pattern, so no
                 # reading of this tie can ever APPROVE something unintended —
                 # both residual misreadings are refusals, which fail safe.
-                if (router is not None and router.pending_approvals()
-                        and not (command is not None
-                                 and (command.project or command.needs_disambiguation))):
-                    state, approval = "none", None
+                # EVERY router touch below sits inside ONE try: the pending
+                # check, the resolve call, and the dereference of the returned
+                # approval. Two shipped bugs came from expressions evaluated
+                # OUTSIDE the guard meant to protect them (an unguarded
+                # preconnect, then wire arithmetic in an argument list); the
+                # bare pending_approvals() call and the approval.project /
+                # .tool / .nonce reads were the third instance — a router
+                # fault (or a contract-violating ("approved", None) return)
+                # raised straight out of the loop and killed the brain.
+                state, approval = "none", None
+                if router is not None:
                     try:
-                        state, approval = router.resolve_approval(text, time.time())
-                    except Exception as e:  # noqa: BLE001 — approvals must not kill the brain
-                        bus.publish("butler.error", {"reason": f"approval failed: {e}"})
-                    if state in ("approved", "denied"):
-                        bus.publish("approval.resolved", {
-                            "outcome": state, "project": approval.project,
-                            "tool": approval.tool, "nonce": approval.nonce})
-                        await _speak("Approved, sir." if state == "approved"
-                                     else "Denied, sir.")
-                        continue
-                    if state == "ambiguous":
-                        await _speak("More than one approval is pending, sir — "
-                                     "name the project.")
-                        continue
-                    if state == "expired":
-                        await _speak("That approval expired, sir.")
-                        continue
-                    # "none": not an approval answer — fall through.
+                        if (router.pending_approvals()
+                                and not (command is not None
+                                         and (command.project
+                                              or command.needs_disambiguation))):
+                            state, approval = router.resolve_approval(text, time.time())
+                            if state in ("approved", "denied") and approval is not None:
+                                bus.publish("approval.resolved", {
+                                    "outcome": state, "project": approval.project,
+                                    "tool": approval.tool, "nonce": approval.nonce})
+                    except Exception as e:  # noqa: BLE001 — a router fault must never kill the brain
+                        bus.publish("butler.error",
+                                    {"reason": f"approval handling failed: {e}"})
+                        state, approval = "none", None
+                if state in ("approved", "denied"):
+                    await _speak("Approved, sir." if state == "approved"
+                                 else "Denied, sir.")
+                    continue
+                if state == "ambiguous":
+                    await _speak("More than one approval is pending, sir — "
+                                 "name the project.")
+                    continue
+                if state == "expired":
+                    await _speak("That approval expired, sir.")
+                    continue
+                # "none": not an approval answer — fall through.
 
                 if command is not None:
                     bus.publish("router.command", {
@@ -248,14 +262,32 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                     if command.verb == "refuse_trade":
                         await _speak(TRADE_REFUSAL)
                     elif command.needs_disambiguation:
+                        # map(str, ... or []) because this join is an argument
+                        # expression evaluated BEFORE _speak's guard is entered;
+                        # a non-string element would raise out of the loop.
                         await _speak("Which one, sir? "
-                                     + " or ".join(command.needs_disambiguation) + ".")
+                                     + " or ".join(map(str, command.needs_disambiguation or []))
+                                     + ".")
                     elif command.verb == "portfolio":
-                        brief = await portfolio_brief(find_finance_project(registry))
-                        bus.publish("finance.brief", {
-                            "rows": brief["rows"], "source": brief["source"],
-                            "as_of": brief["as_of"], "caveat": brief["caveat"]})
-                        await _speak(brief["spoken"])
+                        # The whole finance path — project lookup, the brief
+                        # await, and every dict read — is guarded: a raise on
+                        # any of it must cost this turn, never the loop. The
+                        # dict reads use .get() so a shape change in the brief
+                        # cannot raise either.
+                        try:
+                            brief = await portfolio_brief(find_finance_project(registry))
+                            brief = brief or {}
+                            bus.publish("finance.brief", {
+                                "rows": brief.get("rows", []),
+                                "source": brief.get("source"),
+                                "as_of": brief.get("as_of"),
+                                "caveat": brief.get("caveat", "")})
+                            spoken = brief.get("spoken") or UNCLEAR_LINE
+                        except Exception as e:  # noqa: BLE001 — a finance fault must never kill the brain
+                            bus.publish("butler.error",
+                                        {"reason": f"portfolio brief failed: {_reason(e)}"})
+                            spoken = "I couldn't read your stock system just now, sir."
+                        await _speak(spoken)
                     else:
                         # Fleet verbs (spawn/steer/stop/pull_up) land in M3 Part 2.
                         await _speak("Understood, sir — I can't run that yet.")

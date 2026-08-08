@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import time
 
 from server.bus import EventBus
@@ -171,3 +172,44 @@ async def test_a_bare_no_denies_the_pending_approval():
     assert router.pending_approvals() == []
     assert butler.asked == []
     task.cancel()
+
+
+# ---- guard coverage: no router or finance fault may kill the loop ----------
+
+async def test_the_brain_survives_a_pending_approvals_explosion():
+    class BoomPending(Router):
+        def pending_approvals(self): raise RuntimeError("pending exploded")
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=BoomPending(), registry=confirmed_registry("soccer")))
+    await asyncio.sleep(0)
+    fut = asyncio.ensure_future(_drain(bus, "butler.answer"))
+    bus.publish("command.received", {"text": "where did I leave the Tibet study?"})
+    await fut                      # falls through to the butler rather than dying
+    assert not task.done()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def test_the_brain_survives_a_portfolio_explosion(monkeypatch):
+    import server.app_brain as ab
+    async def boom(project): raise RuntimeError("finance exploded")
+    monkeypatch.setattr(ab, "portfolio_brief", boom)
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=confirmed_registry("quant agent", kind="finance")))
+    await asyncio.sleep(0)
+    fut = asyncio.ensure_future(_drain(bus, "butler.error"))
+    bus.publish("command.received", {"text": "how are the picks doing?"})
+    ev = await fut
+    assert "portfolio brief failed" in ev["data"]["reason"]
+    assert not task.done()         # the loop survives a finance fault
+    await asyncio.sleep(0.05)
+    assert any("stock system" in s.lower() for s in spk.spoke)
+    assert butler.asked == []      # a routed verb still never reaches the model
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
