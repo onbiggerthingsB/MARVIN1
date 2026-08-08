@@ -1,0 +1,23 @@
+#!/bin/bash
+# JARVIS launcher: start server if down, open the console, send /wake.
+set -euo pipefail
+JARVIS_DIR="$HOME/jarvis"
+cd "$JARVIS_DIR"
+[ -f .env ] && set -a && source .env && set +a
+
+if ! curl -sf http://127.0.0.1:7777/health >/dev/null 2>&1; then
+  nohup uv run uvicorn server.app:app_factory --factory \
+    --host 127.0.0.1 --port 7777 --no-access-log \
+    >> state/server.log 2>&1 &
+  for _ in $(seq 1 50); do
+    curl -sf http://127.0.0.1:7777/health >/dev/null 2>&1 && break
+    sleep 0.2
+  done
+  # fresh server → fresh bootstrap URL (first run or after cookie loss)
+  open -na "Google Chrome" --args --app="$(cat state/bootstrap_url | tr -d '\n')"
+else
+  open -na "Google Chrome" --args --app="http://127.0.0.1:7777/"
+fi
+
+BEARER=$(uv run python -c "from pathlib import Path; from server.config import load_config; print(load_config(Path('config/jarvis.json')).hook_bearer)")
+curl -s -X POST http://127.0.0.1:7777/wake -H "Authorization: Bearer $BEARER" >/dev/null || true

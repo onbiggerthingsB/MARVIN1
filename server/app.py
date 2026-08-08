@@ -121,3 +121,10 @@ def create_app(base_dir: Path) -> FastAPI:
     if static.exists():
         app.mount("/static", StaticFiles(directory=static), name="static")
     return app
+
+
+def app_factory():
+    """Zero-arg entry point for `uvicorn server.app:app_factory --factory`.
+    Uses ~/jarvis as base_dir so the server is launchable without arguments."""
+    from pathlib import Path
+    return create_app(base_dir=Path(__file__).resolve().parent.parent)
