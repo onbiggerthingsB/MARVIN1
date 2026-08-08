@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>JARVIS</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="setup-overlay">
+    <button id="setup-btn">Initialize JARVIS</button>
+    <p id="setup-status">Click once: unlocks microphone + audio. Required by Chrome.</p>
+  </div>
+  <main hidden id="console">
+    <div id="status">standing by</div>
+    <button id="ptt" title="hold to talk (or hold Space)">HOLD TO TALK</button>
+    <canvas id="wave" width="600" height="80"></canvas>
+    <div id="transcript"></div>
+    <footer id="metrics">—</footer>
+  </main>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

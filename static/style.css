@@ -1,0 +1,13 @@
+:root { color-scheme: dark; font-family: ui-monospace, Menlo, monospace; }
+body { margin: 0; background: #0b0f14; color: #cfe3ff; }
+#setup-overlay { position: fixed; inset: 0; display: grid; place-items: center;
+  background: #0b0f14; z-index: 10; text-align: center; }
+#setup-btn { font-size: 1.4rem; padding: 1rem 2rem; cursor: pointer;
+  background: #12324f; color: #cfe3ff; border: 1px solid #2e6da4; border-radius: 8px; }
+main { max-width: 640px; margin: 3rem auto; display: grid; gap: 1rem; }
+#ptt { font-size: 1.1rem; padding: 1rem; border-radius: 8px; border: 1px solid #2e6da4;
+  background: #101820; color: #cfe3ff; }
+#ptt.live { background: #7a1f1f; }
+#transcript { min-height: 8rem; white-space: pre-wrap; }
+#transcript .interim { opacity: 0.5; }
+footer { opacity: 0.6; font-size: 0.8rem; }
