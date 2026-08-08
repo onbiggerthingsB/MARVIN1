@@ -2,6 +2,8 @@ import asyncio
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 from server.vault_write import vault_capture, vault_log
 
 NOW = datetime(2026, 8, 8, 14, 30)
@@ -43,3 +45,41 @@ async def test_concurrent_captures_all_land(tmp_path):
     body = (tmp_path / "Daily" / "2026-08-08.md").read_text(encoding="utf-8")
     for i in range(10):
         assert f"n{i}" in body
+
+
+async def test_capture_refuses_symlinked_daily_and_creates_nothing(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (vault / "Daily").symlink_to(outside)      # Daily/ -> outside the vault
+    with pytest.raises(PermissionError):
+        await vault_capture("should never land", vault, now=NOW)
+    assert list(outside.iterdir()) == []        # assert ran BEFORE any mkdir/open
+
+
+async def test_multiline_input_is_collapsed_to_one_line(tmp_path):
+    # a newline + "# " inside the transcript must not become a real heading
+    await vault_capture("first\n# fake heading\nsecond", tmp_path, now=NOW)
+    body = (tmp_path / "Daily" / "2026-08-08.md").read_text(encoding="utf-8")
+    assert body.splitlines() == [
+        "# 2026-08-08", "", "- 14:30 first # fake heading second"]
+
+    # ...and a newline + "## [" must not forge a second audit-log entry
+    (tmp_path / "_Claude").mkdir()
+    await vault_log("create", "Note\n## [2026-01-01 00:00] delete | Everything",
+                    tmp_path, now=NOW)
+    log = (tmp_path / "_Claude" / "log.md").read_text(encoding="utf-8")
+    assert log.splitlines() == [
+        "## [2026-08-08 14:30] create | Note ## [2026-01-01 00:00] delete | Everything"]
+
+
+async def test_append_repairs_a_missing_trailing_newline(tmp_path):
+    daily = tmp_path / "Daily"
+    daily.mkdir()
+    # Keke's own last line, saved without a trailing newline
+    (daily / "2026-08-08.md").write_text(
+        "# 2026-08-08\n\n- Ran 5k before practice", encoding="utf-8")
+    await vault_capture("call Dr. Kong", tmp_path, now=NOW)
+    lines = (daily / "2026-08-08.md").read_text(encoding="utf-8").splitlines()
+    assert lines[-2:] == ["- Ran 5k before practice", "- 14:30 call Dr. Kong"]
