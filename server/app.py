@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
@@ -41,7 +42,6 @@ def create_app(base_dir: Path) -> FastAPI:
     app.state.bootstrap_token_plain = token_plain  # read by launcher tests only
     app.state.base_dir = base_dir
 
-    import os as _os
     from server.tts import SpeakEngine, ELEVEN_BASE
 
     audio_clients: set = set()
@@ -56,19 +56,18 @@ def create_app(base_dir: Path) -> FastAPI:
         except Exception:
             audio_clients.discard(ws_)
 
-    voice = _os.environ.get("JARVIS_VOICE",
-                            "elevenlabs" if _os.environ.get("ELEVENLABS_API_KEY") else "say")
+    voice = os.environ.get("JARVIS_VOICE",
+                            "elevenlabs" if os.environ.get("ELEVENLABS_API_KEY") else "say")
     app.state.speaker = SpeakEngine(
-        voice_id=_os.environ.get("ELEVENLABS_VOICE_ID", "") if voice == "elevenlabs" else "",
-        api_key=_os.environ.get("ELEVENLABS_API_KEY", "") if voice == "elevenlabs" else "",
-        base_url=_os.environ.get("ELEVENLABS_URL", ELEVEN_BASE),
+        voice_id=os.environ.get("ELEVENLABS_VOICE_ID", "") if voice == "elevenlabs" else "",
+        api_key=os.environ.get("ELEVENLABS_API_KEY", "") if voice == "elevenlabs" else "",
+        base_url=os.environ.get("ELEVENLABS_URL", ELEVEN_BASE),
         publish=app.state.bus.publish,
         send_audio=send_audio,
     )
 
     @app.middleware("http")
     async def guard(request: Request, call_next):
-        import time as _t
         path = request.url.path
         origin = request.headers.get("origin")
         host = request.headers.get("host")
@@ -94,8 +93,7 @@ def create_app(base_dir: Path) -> FastAPI:
 
     @app.get("/bootstrap")
     async def bootstrap(token: str = ""):
-        import time as _t
-        if not auth.redeem_bootstrap(app.state.bootstrap, token, now=_t.time()):
+        if not auth.redeem_bootstrap(app.state.bootstrap, token, now=time.time()):
             return JSONResponse({"error": "invalid bootstrap token"}, status_code=403)
         cookie_value, stored_hash = auth.issue_session()
         cfg.session_token_hash = stored_hash

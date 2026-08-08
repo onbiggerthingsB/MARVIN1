@@ -28,7 +28,13 @@ class TurnLog:
         if self._open is None or t_first_audio is None:
             self._open = None
             return
-        self._open["final_to_audio"] = (t_first_audio - self._open["t_utterance"]) * 1000
+        delta = (t_first_audio - self._open["t_utterance"]) * 1000
+        if delta < 0:
+            # Mis-paired turn from a burst: audio "before" the utterance would
+            # record a bogus negative latency. Drop the turn instead.
+            self._open = None
+            return
+        self._open["final_to_audio"] = delta
         self._turns.append(self._open)
         self._open = None
 

@@ -1,18 +1,19 @@
 const $ = (sel) => document.querySelector(sel);
 const handlers = new Map();
-let lastSeq = 0;
 let audioCtx = null;
 const chimes = {};
 
 function connectSSE() {
   const es = new EventSource("/events");
   const dispatch = (type) => (e) => {
-    lastSeq = Number(e.lastEventId || lastSeq);
     (handlers.get(type) || []).forEach((h) => h(JSON.parse(e.data)));
   };
   ["wake", "command.received", "stt.interim", "stt.final", "stt.utterance",
-   "tts.start", "tts.done", "metrics.turn"].forEach((t) =>
+   "stt.error", "tts.start", "tts.done", "metrics.turn"].forEach((t) =>
     es.addEventListener(t, dispatch(t)));
+  // Deliberate: reconnect fresh (no Last-Event-ID). Replaying stale tts.start/
+  // stt.utterance on a live-voice UI would double-trigger playback. Server-side
+  // replay (ring buffer + bus.gap) stays ready for a future non-voice consumer.
   es.onerror = () => { es.close(); setTimeout(connectSSE, 1000); };
 }
 
@@ -151,11 +152,18 @@ document.addEventListener("keyup", (e) => {
 });
 
 window.jarvis.onEvent("stt.interim", (d) => {
-  $("#transcript").innerHTML = `<span class="interim">${d.text}</span>`;
+  const t = $("#transcript");
+  t.classList.add("interim");
+  t.textContent = d.text;
 });
 window.jarvis.onEvent("stt.utterance", (d) => {
+  $("#transcript").classList.remove("interim");
   $("#transcript").textContent = d.text;
   window.jarvis.playChime("ack");
+});
+window.jarvis.onEvent("stt.error", (d) => {
+  window.jarvis.setStatus("couldn't hear you — " + (d.reason || "audio error"));
+  if (typeof playClip === "function") playClip("cannot_hear");
 });
 
 // ---- /audio WebSocket → MediaSource playback ---------------------------

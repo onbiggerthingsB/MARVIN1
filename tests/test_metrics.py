@@ -19,3 +19,10 @@ def test_missing_timestamps_are_skipped():
     log.record_utterance(t_release=None, t_utterance=5.0)
     log.record_first_audio(t_first_audio=None)
     assert log.summary()["turns"] == 0
+
+
+def test_negative_latency_turn_is_dropped():
+    log = TurnLog()
+    log.record_utterance(t_release=1000.0, t_utterance=1000.5)
+    log.record_first_audio(t_first_audio=1000.2)  # audio "before" utterance → negative
+    assert log.summary()["turns"] == 0

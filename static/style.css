@@ -10,5 +10,5 @@ main { max-width: 640px; margin: 3rem auto; display: grid; gap: 1rem; }
   background: #101820; color: #cfe3ff; }
 #ptt.live { background: #7a1f1f; }
 #transcript { min-height: 8rem; white-space: pre-wrap; }
-#transcript .interim { opacity: 0.5; }
+#transcript.interim { opacity: 0.5; }
 footer { opacity: 0.6; font-size: 0.8rem; }
