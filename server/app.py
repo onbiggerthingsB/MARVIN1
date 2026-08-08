@@ -39,6 +39,31 @@ def create_app(base_dir: Path) -> FastAPI:
     app.state.bootstrap_token_plain = token_plain  # read by launcher tests only
     app.state.base_dir = base_dir
 
+    import os as _os
+    from server.tts import SpeakEngine, ELEVEN_BASE
+
+    audio_clients: set = set()
+
+    def send_audio(chunk: bytes) -> None:
+        for ws_ in list(audio_clients):
+            asyncio.ensure_future(_safe_send(ws_, chunk))
+
+    async def _safe_send(ws_, chunk):
+        try:
+            await ws_.send_bytes(chunk)
+        except Exception:
+            audio_clients.discard(ws_)
+
+    voice = _os.environ.get("JARVIS_VOICE",
+                            "elevenlabs" if _os.environ.get("ELEVENLABS_API_KEY") else "say")
+    app.state.speaker = SpeakEngine(
+        voice_id=_os.environ.get("ELEVENLABS_VOICE_ID", "") if voice == "elevenlabs" else "",
+        api_key=_os.environ.get("ELEVENLABS_API_KEY", "") if voice == "elevenlabs" else "",
+        base_url=_os.environ.get("ELEVENLABS_URL", ELEVEN_BASE),
+        publish=app.state.bus.publish,
+        send_audio=send_audio,
+    )
+
     @app.middleware("http")
     async def guard(request: Request, call_next):
         import time as _t
@@ -153,6 +178,38 @@ def create_app(base_dir: Path) -> FastAPI:
                          base_url=os.environ.get("DEEPGRAM_URL", "wss://api.deepgram.com"))
         await relay.run(inbound(), app.state.bus.publish)
         await ws.close()
+
+    @app.websocket("/audio")
+    async def audio(ws: WebSocket):
+        # Cookie + origin checks before accept, matching /mic (middleware skips WS).
+        if not auth.origin_ok(ws.headers.get("origin"), ws.headers.get("host"), cfg.port) \
+           or not auth.verify_session(ws.cookies.get(COOKIE), cfg.session_token_hash):
+            await ws.close(code=4401)
+            return
+        await ws.accept()
+        audio_clients.add(ws)
+        try:
+            while True:
+                await ws.receive_text()  # keepalive pings from page
+        except WebSocketDisconnect:
+            audio_clients.discard(ws)
+
+    async def echo_brain():
+        cid, q = app.state.bus.subscribe()
+        while True:
+            event = await q.get()
+            if event is None:
+                cid, q = app.state.bus.subscribe()
+                continue
+            if event["type"] in ("stt.utterance", "command.received"):
+                text = event["data"]["text"]
+                asyncio.create_task(app.state.speaker.speak(f"You said: {text}"))
+            if event["type"] == "wake":
+                asyncio.create_task(app.state.speaker.preconnect())
+
+    @app.on_event("startup")
+    async def _start_brain():
+        asyncio.create_task(echo_brain())
 
     static = base_dir / "static"
     if static.exists():

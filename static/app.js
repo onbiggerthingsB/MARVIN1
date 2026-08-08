@@ -157,3 +157,34 @@ window.jarvis.onEvent("stt.utterance", (d) => {
   $("#transcript").textContent = d.text;
   window.jarvis.playChime("ack");
 });
+
+// ---- /audio WebSocket → MediaSource playback ---------------------------
+function connectAudio() {
+  const ws = new WebSocket(`ws://${location.host}/audio`);
+  ws.binaryType = "arraybuffer";
+  let ms = null, sb = null, el = null, queue = [];
+
+  const reset = () => {
+    ms = new MediaSource();
+    el = new Audio();
+    el.src = URL.createObjectURL(ms);
+    ms.addEventListener("sourceopen", () => {
+      sb = ms.addSourceBuffer("audio/mpeg");
+      sb.addEventListener("updateend", () => {
+        if (queue.length && !sb.updating) sb.appendBuffer(queue.shift());
+      });
+    });
+    el.play().catch(() => {});   // AudioContext already unlocked by setup click
+  };
+
+  window.jarvis.onEvent("tts.start", () => { queue = []; reset(); });
+  ws.onmessage = (e) => {
+    if (!sb) return;
+    if (sb.updating || queue.length) queue.push(e.data);
+    else sb.appendBuffer(e.data);
+  };
+  ws.onclose = () => setTimeout(connectAudio, 1000);
+  setInterval(() => ws.readyState === 1 && ws.send("ping"), 10000);
+}
+connectAudio();
+window.jarvis.onEvent("tts.done", () => window.jarvis.setStatus("online — hold to talk"));
