@@ -16,9 +16,19 @@ from pathlib import Path
 from server.discovery import discover
 from server.registry import Project, Registry
 
+# A correction must show POSITIVE evidence: an explicit connector between the
+# negation and the new name. Without one ("No.", "no thanks", "no way"), the
+# reply is a rejection — never a name. Speech-to-text loves trailing "."/"!",
+# so leftover text after "no" must never be treated as a name by default.
 _CORRECTION = re.compile(
-    r"^\s*(?:no|nope)\b[,\s]*(?:it'?s|that'?s|i\s+said|call\s+it)?\s*(?P<name>.+?)\s*$", re.I)
-_YES = re.compile(r"^\s*(?:yes|yeah|yep|correct|right|that'?s (?:it|right)|confirm)\b", re.I)
+    r"^\s*(?:no|nope)\b[,\s]*(?:it'?s|it\s+is|that'?s|that\s+is|i\s+said|call\s+it)\s+(?P<name>.+?)\s*$",
+    re.I)
+# `right`/`correct` only count as a yes when they stand alone or follow
+# "that's" — bare `right\b` would confirm on filler like "right, hmm".
+_YES = re.compile(
+    r"^\s*(?:(?:yes|yeah|yep|confirm)\b"
+    r"|that'?s\s+(?:it|right|correct)\b"
+    r"|(?:right|correct)\s*[.!?]*\s*$)", re.I)
 _NO = re.compile(r"^\s*(?:no|nope|skip|not\s+(?:that|it)|wrong)\b", re.I)
 
 
@@ -75,10 +85,16 @@ class Onboarding:
         elif _NO.match(text):
             m = _CORRECTION.match(text)
             corrected = (m.group("name").strip() if m else "")
-            # "no, I said the trading system" teaches an alias; a bare "no" rejects.
-            if corrected and not _NO.match(corrected):
+            # A valid correction needs a real name: at least one word character,
+            # and not itself another negation ("not right", "not this one").
+            if (corrected and re.search(r"\w", corrected)
+                    and not _NO.match(corrected)
+                    and not re.match(r"not\b", corrected, re.I)):
+                # "no, I said the trading system" teaches an alias — but an
+                # utterance beginning with "no" is not an explicit yes. The
+                # project stays PENDING; the flow re-asks knowing the alias,
+                # and only a real "yes" can confirm it.
                 self.registry.add_alias_path(asked.path, corrected)
-                self._confirm(asked)
                 outcome = "renamed"
             else:
                 self._rejected.add(asked.path)
