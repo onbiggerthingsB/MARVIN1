@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
@@ -11,7 +12,8 @@ from fastapi.staticfiles import StaticFiles
 
 from server import auth
 from server.bus import EventBus
-from server.config import ensure_config, save_config
+from server.config import ensure_config, load_keyterms, save_config
+from server.stt import SttRelay
 
 COOKIE = "jarvis_session"
 OPEN_PATHS = {"/health", "/bootstrap"}
@@ -125,11 +127,32 @@ def create_app(base_dir: Path) -> FastAPI:
             await ws.close(code=4401)
             return
         await ws.accept()
-        try:
-            while True:
-                await ws.receive()  # Task 8 replaces this loop with the Deepgram relay
-        except WebSocketDisconnect:
-            pass
+        key = os.environ.get("DEEPGRAM_API_KEY", "")
+        if not key:
+            app.state.bus.publish("stt.error", {"reason": "no DEEPGRAM_API_KEY"})
+            await ws.close(code=4500)
+            return
+
+        async def inbound():
+            try:
+                while True:
+                    msg = await ws.receive()
+                    if msg.get("bytes") is not None:
+                        yield ("bytes", msg["bytes"])
+                    elif msg.get("text") is not None:
+                        yield ("text", msg["text"])
+                        if json.loads(msg["text"]).get("type") == "stop":
+                            return
+                    else:
+                        return
+            except WebSocketDisconnect:
+                return
+
+        relay = SttRelay(api_key=key,
+                         keyterms=load_keyterms(base_dir / "config" / "keyterms.json"),
+                         base_url=os.environ.get("DEEPGRAM_URL", "wss://api.deepgram.com"))
+        await relay.run(inbound(), app.state.bus.publish)
+        await ws.close()
 
     static = base_dir / "static"
     if static.exists():

@@ -5,8 +5,9 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
+import pytest
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocketDisconnect
 from fastapi.testclient import TestClient
 from server.app import create_app
 from server.config import load_config
@@ -111,6 +112,16 @@ def test_cross_origin_rejected(tmp_path):
 def test_command_requires_cookie(tmp_path):
     c = make_client(tmp_path)
     assert c.post("/command", json={"text": "hi"}).status_code == 401
+
+
+def test_mic_websocket_requires_cookie(tmp_path):
+    # /mic is closed (code=4401) before accept() when the session cookie is
+    # missing. Per Task 7 review, that surfaces to the client as a rejected
+    # handshake — assert the connection is refused, not the specific close code.
+    c = make_client(tmp_path)
+    with pytest.raises(WebSocketDisconnect):
+        with c.websocket_connect("/mic"):
+            pass
 
 
 def test_static_requires_cookie(tmp_path):
