@@ -84,3 +84,45 @@ def test_confirm_records_kind():
     p = r.confirm("quant agent", kind="finance")
     assert p.kind == "finance"
     assert r.pending() == []
+
+
+def test_match_ignores_short_filler_queries():
+    r = Registry()
+    r.merge_candidates([cand("/a/soccer", "soccer")])
+    r.confirm("soccer")
+    assert r.match("so") == []        # a two-letter filler must not route work
+    assert r.match("s") == []
+
+
+def test_match_still_finds_a_name_inside_a_longer_phrase():
+    r = Registry()
+    r.merge_candidates([cand("/a/soccer", "soccer")])
+    r.confirm("soccer")
+    assert r.match("pull up the soccer app")[0].name == "soccer"
+
+
+def test_reconfirming_does_not_downgrade_a_finance_project():
+    r = Registry()
+    r.merge_candidates([cand("/a/quant agent", "quant agent")])
+    r.confirm("quant agent", kind="finance")
+    r.confirm("quant agent")                 # idempotent re-confirm, no kind passed
+    assert r.match("quant agent")[0].kind == "finance"
+
+
+def test_duplicate_basenames_are_confirmable_by_path():
+    r = Registry()
+    r.merge_candidates([cand("/one/jarvis", "jarvis"), cand("/two/jarvis", "jarvis")])
+    r.confirm_path("/two/jarvis")
+    confirmed = [p for p in r.projects if p.confirmed]
+    assert [p.path for p in confirmed] == ["/two/jarvis"]   # the OTHER one, precisely
+    assert r.match("jarvis")[0].path == "/two/jarvis"
+
+
+def test_load_tolerates_valid_json_of_the_wrong_shape(tmp_path):
+    null_file = tmp_path / "null.json"
+    null_file.write_text("null", encoding="utf-8")
+    assert Registry.load(null_file).projects == []
+
+    list_file = tmp_path / "list.json"
+    list_file.write_text("[1,2,3]", encoding="utf-8")
+    assert Registry.load(list_file).projects == []
