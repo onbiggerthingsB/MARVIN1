@@ -1,3 +1,4 @@
+import asyncio
 import os
 import shutil
 from pathlib import Path
@@ -134,6 +135,41 @@ async def test_search_empty_query_returns_empty_shape(tmp_path):
     assert await vault_search("   ", tmp_path) == {"total": 0, "results": []}
 
 
+async def test_search_failure_is_distinguishable_from_empty_vault(tmp_path, monkeypatch):
+    """rg-not-found (or a bad cwd) must NOT return the genuine zero-match shape:
+    the butler would affirmatively tell Keke her vault has nothing on a topic
+    it simply failed to search."""
+    import server.vault_read as vr
+
+    async def no_rg(*args, **kwargs):
+        raise FileNotFoundError("[Errno 2] No such file or directory: 'rg'")
+
+    monkeypatch.setattr(vr.asyncio, "create_subprocess_exec", no_rg)
+    out = await vault_search("chant", tmp_path)
+    assert out.get("error"), "failure path returned no error key"
+    assert out != {"total": 0, "results": []}   # distinguishable from a true zero-hit
+    assert out["total"] == 0 and out["results"] == []
+
+
+async def test_search_timeout_carries_an_error(tmp_path, monkeypatch):
+    import server.vault_read as vr
+
+    class NeverDone:
+        returncode = None
+        async def communicate(self):
+            await asyncio.sleep(60)
+        def kill(self):
+            pass
+
+    async def slow_rg(*args, **kwargs):
+        return NeverDone()
+
+    monkeypatch.setattr(vr.asyncio, "create_subprocess_exec", slow_rg)
+    monkeypatch.setattr(vr, "SEARCH_TIMEOUT", 0.01)
+    out = await vault_search("chant", tmp_path)
+    assert "timed out" in out.get("error", "")
+
+
 def test_read_returns_content(tmp_path):
     seed(tmp_path)
     assert "session 2" in vault_read("Wiki/Tibet.md", tmp_path)
@@ -175,12 +211,33 @@ def test_read_missing_file(tmp_path):
         vault_read("Wiki/Nope.md", tmp_path)
 
 
-def test_read_is_size_capped(tmp_path):
+def test_read_is_size_capped_with_a_visible_marker(tmp_path):
     seed(tmp_path)
     big = "x" * 500_000
     (tmp_path / "Wiki" / "Big.md").write_text(big, encoding="utf-8")
     out = vault_read("Wiki/Big.md", tmp_path)
-    assert len(out.encode("utf-8")) <= 200_000
+    # the BODY is capped; the marker rides on top of it and must be visible
+    body, sep, marker = out.rpartition("\n\n[TRUNCATED: ")
+    assert sep, "truncation marker missing"
+    assert len(body.encode("utf-8")) <= 200_000
+    assert "first 200,000 of 500,000 bytes" in out
+    assert "NOT read" in out
+
+
+def test_read_small_file_has_no_truncation_marker(tmp_path):
+    seed(tmp_path)
+    assert "[TRUNCATED" not in vault_read("Wiki/Tibet.md", tmp_path)
+
+
+def test_read_non_utf8_note_cannot_inflate_past_the_cap(tmp_path):
+    """Every invalid byte decodes to U+FFFD (3 bytes re-encoded), so a 200KB
+    binary blob used to decode into ~600KB of replacement characters."""
+    seed(tmp_path)
+    (tmp_path / "Wiki" / "Blob.md").write_bytes(b"\xff" * 300_000)
+    out = vault_read("Wiki/Blob.md", tmp_path)
+    body, sep, _ = out.rpartition("\n\n[TRUNCATED: ")
+    assert sep
+    assert len(body.encode("utf-8")) <= 200_000
 
 
 def test_vault_is_downloaded(tmp_path):

@@ -24,22 +24,38 @@ def _safe_note(rel_path: str, vault_root: Path) -> Path:
 def vault_read(rel_path: str, vault_root: Path) -> str:
     """Return at most MAX_BYTES of the note, decoded as UTF-8 with replacement.
 
-    Output is TRUNCATED SILENTLY at the byte cap: there is no marker and no
-    signal to the caller, so a long note comes back cut off mid-line. Callers
-    that need the whole file must read it themselves.
+    A note longer than the cap comes back with a VISIBLE truncation marker
+    appended, so the model knows it read a prefix rather than the whole note.
+    Only the cap is ever read from disk (not the whole file sliced after), and
+    the decoded text is re-capped on its UTF-8 length so a non-UTF-8 note --
+    where each bad byte decodes to a 3-byte U+FFFD -- cannot triple in size.
     """
     p = _safe_note(rel_path, vault_root)
     if not p.is_file():
         raise FileNotFoundError(rel_path)
-    return p.read_bytes()[:MAX_BYTES].decode("utf-8", "replace")
+    size = p.stat().st_size
+    with p.open("rb") as f:
+        data = f.read(MAX_BYTES)
+    text = data.decode("utf-8", "replace")
+    encoded = text.encode("utf-8")
+    if len(encoded) > MAX_BYTES:
+        # "ignore" drops the one possibly-torn trailing sequence at the cut, so
+        # the result's UTF-8 length is <= MAX_BYTES with no mojibake tail
+        text = encoded[:MAX_BYTES].decode("utf-8", "ignore")
+    if size > MAX_BYTES:
+        text += (f"\n\n[TRUNCATED: first {MAX_BYTES:,} of {size:,} bytes"
+                 " — the rest of this note was NOT read]")
+    return text
 
 
 def _first_match_snippet(path: Path, query: str) -> str:
     q = query.lower()
     try:
-        text = path.read_bytes()[:MAX_BYTES].decode("utf-8", "replace")
+        with path.open("rb") as f:
+            data = f.read(MAX_BYTES)
     except OSError:
         return ""
+    text = data.decode("utf-8", "replace")
     for line in text.splitlines():
         if q in line.lower() and line.strip():
             return line.strip()[:200]
@@ -85,11 +101,19 @@ async def vault_search(query: str, vault_root: Path, limit: int = 5) -> dict:
     matched overall so the caller can tell the model it is seeing a subset -- a
     common word can match hundreds of notes, and silently showing five of them
     let the butler conclude the other 159 did not exist.
+
+    FAILURE is not emptiness. Every failure path (rg missing, bad cwd, timeout,
+    rg exit >= 2) returns the zero-hit shape PLUS an `"error": "<reason>"` key,
+    so the caller can tell "the vault has nothing on this" apart from "the
+    search never ran". A genuine zero-match result carries NO `error` key.
     """
     root = Path(vault_root).resolve()
-    empty: dict = {"total": 0, "results": []}
     if not query.strip():
-        return empty
+        return {"total": 0, "results": []}
+
+    def _failed(reason: str) -> dict:
+        return {"total": 0, "results": [], "error": reason}
+
     try:
         proc = await asyncio.create_subprocess_exec(
             # -F: literal/fixed-string match, so the snippet matcher agrees with rg
@@ -100,9 +124,11 @@ async def vault_search(query: str, vault_root: Path, limit: int = 5) -> dict:
             # DEVNULL, not inherit: rg searches stdin instead of cwd when fd 0 is a regular file
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    except FileNotFoundError:
-        log.warning("vault_search: ripgrep (rg) not installed")
-        return empty
+    except FileNotFoundError as e:
+        # Not necessarily "rg not installed": a missing/bad cwd raises the same
+        # exception. Log the actual exception so the two are distinguishable.
+        log.warning("vault_search: rg failed to start: %s", e)
+        return _failed(f"ripgrep not found or vault dir missing: {e}")
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=SEARCH_TIMEOUT)
     except asyncio.TimeoutError:
@@ -111,12 +137,12 @@ async def vault_search(query: str, vault_root: Path, limit: int = 5) -> dict:
         except Exception:
             pass
         log.warning("vault_search: rg timed out after %ss", SEARCH_TIMEOUT)
-        return empty
+        return _failed(f"timed out after {SEARCH_TIMEOUT:g}s")
     # rg exit codes: 0 = matches, 1 = no matches, 2+ = real error
     if proc.returncode not in (0, 1):
         log.warning("vault_search: rg failed (exit %s): %s",
                     proc.returncode, err.decode("utf-8", "replace")[:200])
-        return empty
+        return _failed(f"rg exit {proc.returncode}")
     hits: list[tuple[str, int]] = []
     for line in out.decode("utf-8", "replace").splitlines():
         if not line:

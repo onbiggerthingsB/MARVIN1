@@ -3,12 +3,29 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
 from server.butler_parse import _load_object, parse_butler_output
 from server.vault_mcp import VAULT_TOOL_NAMES
+
+log = logging.getLogger(__name__)
+
+# Strong refs to detached reaper tasks: the event loop holds tasks weakly, so a
+# bare create_task could be garbage-collected mid-disconnect.
+_REAPERS: set = set()
+
+
+async def _dispose(client) -> None:
+    """Best-effort disconnect of a dropped client, so the CLI child it spawned
+    (order 100MB RSS) does not survive until process exit. Detached: nothing
+    awaits it, and it must never propagate anything."""
+    try:
+        await client.disconnect()
+    except BaseException:  # noqa: BLE001 — best effort; never propagate
+        pass
 
 SYSTEM_PROMPT = (
     "You are JARVIS, a concise voice-first butler for Keke's Obsidian 'second brain' vault.\n"
@@ -195,7 +212,18 @@ class Butler:
                     if getattr(msg, "subtype", None) is not None:
                         session_id = getattr(msg, "session_id", None)
                 if session_id and session_id != self._session_id:
-                    self._save_session_id(session_id)
+                    # In-memory FIRST: the running session keeps continuity even
+                    # if the disk save below fails.
+                    self._session_id = session_id
+                    try:
+                        # Best-effort: a full or read-only state dir must not
+                        # discard the answer we already computed (the generic
+                        # handler would drop the client and speak the fallback
+                        # line on EVERY turn, forever). to_thread because the
+                        # write is blocking I/O on a loop carrying live audio.
+                        await asyncio.to_thread(self._save_session_id, session_id)
+                    except OSError as e:
+                        log.warning("could not persist session id: %s", e)
                 return _best_parse(messages)
             except (Exception, asyncio.CancelledError):
                 # Any failure can leave the transport half-dead; drop the client so
@@ -211,7 +239,19 @@ class Butler:
                 # either way (`async with` unwinds on CancelledError too); this
                 # is about the client, not the lock. Always re-raised -- never
                 # swallow a cancellation.
-                self._client = None
+                #
+                # The dropped client goes to a DETACHED reaper rather than being
+                # nulled and forgotten: ClaudeSDKClient has no __del__, so an
+                # undisconnected client leaks its `claude` subprocess until
+                # process exit -- and with a 120s ask timeout upstream, timeouts
+                # are an expected event, not a rarity. Never awaited inline: on
+                # the cancellation path an inline await could swallow or delay
+                # the cancellation we are re-raising.
+                old, self._client = self._client, None
+                if old is not None:
+                    task = asyncio.get_running_loop().create_task(_dispose(old))
+                    _REAPERS.add(task)                      # keep a strong ref
+                    task.add_done_callback(_REAPERS.discard)
                 raise
 
     async def close(self):

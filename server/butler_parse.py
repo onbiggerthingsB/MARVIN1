@@ -5,7 +5,12 @@ import json
 import re
 
 _WIKILINK = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]")
-_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
+# Three alternatives: ASCII terminators need trailing whitespace; CJK
+# terminators (。！？) split with OR WITHOUT it -- Chinese sentences run the
+# terminator straight into the next character, so requiring whitespace made the
+# 3-sentence spoken cap a no-op for Chinese. The zero-width CJK split can emit
+# empty segments; cap_sentences filters them before counting.
+_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])\s*|\n+")
 
 
 def _normalize_citation(c: str) -> str:
@@ -36,7 +41,10 @@ def cap_sentences(text: str, n: int = 3) -> str:
     text = str(text or "").strip()
     if not text:
         return ""
-    return " ".join(_SENT_SPLIT.split(text)[:n]).strip()
+    # drop empties BEFORE slicing: the zero-width CJK split yields "" segments,
+    # and counting those against `n` would under-cap real sentences
+    parts = [p for p in _SENT_SPLIT.split(text) if p]
+    return " ".join(parts[:n]).strip()
 
 
 def _load_object(raw: str) -> dict | None:

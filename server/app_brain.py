@@ -49,13 +49,20 @@ def speakable(spoken) -> str:
     parse_butler_output falls back to plain text when the model's JSON has only
     empty values -- which makes the raw serialized JSON the `spoken` string. Read
     aloud that is a mouthful of braces and quotes, so anything empty or
-    JSON-looking is replaced with a short canned line. `\\r` is stripped because
+    JSON-looking is replaced with a short canned line. JSON-looking includes a
+    reply wrapped in a ```json code fence: the fence line (``` plus an optional
+    language tag) is stripped before probing, so a truncated fenced reply is not
+    spoken verbatim, backticks and all. `\\r` is stripped because
     bulleted replies leave stray carriage returns that some voices verbalize.
     CRLF is collapsed to a bare newline FIRST -- replacing `\\r` alone would turn
     every `\\r\\n` into a stray trailing space before the newline.
     """
     text = (spoken or "").replace("\r\n", "\n").replace("\r", " ").strip()
-    if not text or text.startswith("{"):
+    probe = text
+    if probe.startswith("```"):
+        nl = probe.find("\n")
+        probe = probe[nl + 1:].lstrip() if nl != -1 else ""
+    if not text or not probe or probe.startswith(("{", "[")):
         return UNCLEAR_LINE
     return text
 

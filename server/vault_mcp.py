@@ -37,6 +37,13 @@ def build_vault_server(vault_root: Path):
         # 1..20 so a huge limit cannot drag the whole vault into the context.
         limit = max(1, min(int(args.get("limit") or 5), 20))
         found = await vault_search(args["query"], vault_root, limit)
+        if found.get("error"):
+            # A failed search must never read as an empty vault: "No matching
+            # notes" here would make the butler affirmatively tell Keke her
+            # vault has nothing on a topic it simply failed to search.
+            return _text(f"Search is unavailable right now ({found['error']}). "
+                         "Tell Keke you could not search rather than concluding "
+                         "the vault has nothing on this.")
         results, total = found["results"], found["total"]
         if not results:
             return _text("No matching notes. Try a single different keyword before "

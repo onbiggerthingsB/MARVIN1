@@ -55,6 +55,21 @@ class SpeakEngine:
                         self._ws = None
                         if attempt == 2:
                             break
+                    except BaseException:
+                        # CancelledError (the brain's 60s speak timeout lands
+                        # here, mid-protocol) or any unexpected error leaves the
+                        # socket mid-stream before `isFinal`. Keeping it cached
+                        # makes the NEXT utterance consume THIS turn's leftover
+                        # frames and break on the old isFinal -- every later
+                        # answer plays one turn late and never self-heals.
+                        # Discard the socket (best-effort close), then re-raise.
+                        ws, self._ws = self._ws, None
+                        if ws is not None:
+                            try:
+                                await ws.close()
+                            except BaseException:  # noqa: BLE001 — cleanup only
+                                pass
+                        raise
             await self._speak_say(text)
 
     async def _speak_eleven(self, text: str) -> None:
@@ -74,7 +89,15 @@ class SpeakEngine:
     async def _speak_say(self, text: str) -> None:
         proc = await asyncio.create_subprocess_exec("say", "-v", "Daniel", text)
         t0 = time.time()
-        await proc.wait()
+        try:
+            await proc.wait()
+        except asyncio.CancelledError:
+            # a speak timeout must not leave `say` talking over the next turn
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            raise
         self.publish("tts.done", {"t_first_audio": t0, "engine": "say"})
 
     async def close(self) -> None:

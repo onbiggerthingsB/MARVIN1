@@ -47,6 +47,31 @@ async def test_concurrent_captures_all_land(tmp_path):
         assert f"n{i}" in body
 
 
+async def test_symlinked_daily_note_cannot_reroute_a_capture(tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "Daily").mkdir(parents=True)
+    (vault / "Research").mkdir()
+    victim = vault / "Research" / "essay.md"
+    victim.write_text("Keke's own prose\n", encoding="utf-8")
+    # the dated note itself is a symlink pointing at Keke's essay
+    (vault / "Daily" / f"{NOW:%Y-%m-%d}.md").symlink_to(victim)
+    with pytest.raises(PermissionError):
+        await vault_capture("must not land", vault, now=NOW)
+    assert victim.read_text(encoding="utf-8") == "Keke's own prose\n"   # byte-identical
+
+
+async def test_symlinked_log_cannot_reroute_a_log_entry(tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_Claude").mkdir(parents=True)
+    (vault / "Coursework").mkdir()
+    victim = vault / "Coursework" / "essay.md"
+    victim.write_text("essay body\n", encoding="utf-8")
+    (vault / "_Claude" / "log.md").symlink_to(victim)
+    with pytest.raises(PermissionError):
+        await vault_log("create", "X", vault, now=NOW)
+    assert victim.read_text(encoding="utf-8") == "essay body\n"
+
+
 async def test_capture_refuses_symlinked_daily_and_creates_nothing(tmp_path):
     vault = tmp_path / "vault"
     vault.mkdir()

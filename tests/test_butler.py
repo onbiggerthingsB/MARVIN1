@@ -319,6 +319,84 @@ def test_build_options_passes_resume_id(tmp_path):
     assert opts.resume == "sess-abc"
 
 
+async def test_search_tool_reports_unavailable_instead_of_empty(tmp_path, monkeypatch):
+    """A failed search must render a DISTINCT message, not 'No matching notes':
+    the latter makes the butler affirmatively claim the vault lacks the topic."""
+    import server.vault_mcp as vm
+
+    async def broken_search(query, root, limit):
+        return {"total": 0, "results": [], "error": "timed out after 8s"}
+
+    monkeypatch.setattr(vm, "vault_search", broken_search)
+    result = await _call_tool(build_vault_server(tmp_path), "vault_search",
+                              {"query": "chant", "limit": 5})
+    text = _tool_text(result)
+    assert "unavailable" in text.lower()
+    assert "timed out after 8s" in text
+    assert "No matching notes" not in text
+
+
+async def test_state_write_failure_does_not_discard_the_answer(tmp_path, monkeypatch):
+    """A full or read-only state dir must cost the SAVE, not the turn: the
+    answer is already computed, and in-memory continuity must survive."""
+    b = make_butler(tmp_path)
+
+    def disk_full(sid):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(b, "_save_session_id", disk_full)
+    out = await b.ask("hi")
+    assert out["spoken"] == "Session 2."            # the answer survived
+    assert b._session_id == "sess-123"              # in-memory continuity kept
+    assert b._client is not None                    # client NOT dropped
+
+
+async def test_failed_turn_disposes_the_dropped_client(tmp_path):
+    """Nulling the client without disconnecting leaks the `claude` subprocess
+    (no __del__ on ClaudeSDKClient) until process exit -- and with a 120s ask
+    timeout upstream, failed/timed-out turns are an expected event."""
+    disconnected = []
+
+    class QueryBoom(FakeClient):
+        async def query(self, text, session_id="default"):
+            raise RuntimeError("mid-turn transport hiccup")
+
+        async def disconnect(self):
+            disconnected.append(self)
+
+    b = Butler(options_builder=lambda r: {"resume": r},
+               state_path=tmp_path / "butler.json", client_factory=QueryBoom)
+    with pytest.raises(RuntimeError):
+        await b.ask("hi")
+    assert b._client is None
+    for _ in range(5):                 # let the detached reaper run
+        await asyncio.sleep(0)
+    assert disconnected, "dropped client was never disconnected (subprocess leak)"
+
+
+async def test_cancelled_turn_also_disposes_the_dropped_client(tmp_path):
+    """The reaper must be DETACHED on the cancellation path -- awaiting
+    disconnect inline there would delay or swallow the cancellation."""
+    disconnected = []
+
+    class Hanging(FakeClient):
+        async def receive_response(self):
+            await asyncio.sleep(60)
+            yield _Assistant("never")
+
+        async def disconnect(self):
+            disconnected.append(self)
+
+    b = Butler(options_builder=lambda r: {"resume": r},
+               state_path=tmp_path / "butler.json", client_factory=Hanging)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(b.ask("hi"), 0.05)
+    assert b._client is None
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert disconnected, "cancelled turn leaked its client's subprocess"
+
+
 async def test_read_tool_materializes_and_runs_off_the_event_loop(tmp_path, monkeypatch):
     import threading
     import server.vault_mcp as vm

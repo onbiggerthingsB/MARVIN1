@@ -96,6 +96,17 @@ def test_speakable_never_reads_raw_json_or_nothing_aloud():
     assert speakable("   ") == UNCLEAR_LINE
 
 
+def test_speakable_catches_fenced_and_bracketed_json():
+    # a ```json-fenced (possibly truncated) reply must not be read aloud,
+    # backticks and braces included
+    assert speakable('```json\n{"spoken": "Hi.", "display": "Hi."') == UNCLEAR_LINE
+    assert speakable('```\n{"spoken": "Hi."}\n```') == UNCLEAR_LINE
+    assert speakable('[{"spoken": "Hi."}]') == UNCLEAR_LINE
+    assert speakable("```") == UNCLEAR_LINE          # a bare fence carries nothing
+    # non-JSON text is still spoken as-is
+    assert speakable("Plain answer.") == "Plain answer."
+
+
 def test_speakable_strips_carriage_returns():
     # CRLF collapses to a bare newline (a naive .replace("\r", " ") would leave
     # a stray trailing space); a lone CR still becomes a space.

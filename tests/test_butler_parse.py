@@ -12,6 +12,15 @@ def test_cap_sentences():
     assert cap_sentences("", 3) == ""
 
 
+def test_cap_sentences_handles_chinese():
+    # CJK sentences end with 。！？ immediately followed by the next character
+    # -- no whitespace -- so an ASCII-only splitter never capped Chinese at all.
+    five = "这是第一句。这是第二句。这是第三句。这是第四句。这是第五句。"
+    out = cap_sentences(five, 3)
+    assert out.count("。") == 3
+    assert "第四句" not in out
+
+
 def test_parse_json_happy_path():
     raw = ('{"spoken": "You left off at session 2.", '
            '"display": "You left off at [[Tibet Session 2]] on 2026-07-28.", '

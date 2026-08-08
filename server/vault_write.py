@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import weakref
 from datetime import datetime
 from pathlib import Path
@@ -42,6 +43,11 @@ def _write_sync(target: Path, entry: str, header: str | None) -> None:
     where a cold mkdir/open/write can stall for seconds and would otherwise freeze
     the event loop that is carrying live audio."""
     target.parent.mkdir(parents=True, exist_ok=True)
+    # The exists/size/last-byte probe runs BEFORE the append open (chosen over
+    # reading back through the same fd: that would need O_RDWR and an fstat-based
+    # "exists" proxy, which would mis-handle a pre-existing EMPTY file by writing
+    # the header into it). The probe follows symlinks, but it only READS one
+    # byte; the O_NOFOLLOW open below is what gates the actual write.
     exists = target.exists()
     size = target.stat().st_size if exists else 0
     prefix = ""
@@ -52,7 +58,12 @@ def _write_sync(target: Path, entry: str, header: str | None) -> None:
             f.seek(-1, 2)
             if f.read(1) != b"\n":
                 prefix = "\n"
-    with target.open("a", encoding="utf-8") as f:
+    # O_NOFOLLOW closes the check-to-open TOCTOU: if the FINAL component is (or
+    # has just become) a symlink, the open fails at use time instead of following
+    # the link into whatever it points at. Parent-component symlinks were already
+    # refused by assert_append_allowed before any I/O started.
+    fd = os.open(target, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
         if not exists and header:
             f.write(header)
         f.write(prefix + entry)
