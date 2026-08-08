@@ -13,6 +13,36 @@ from server.vault_mcp import VAULT_TOOL_NAMES
 
 log = logging.getLogger(__name__)
 
+
+class ButlerUnavailable(RuntimeError):
+    """The turn failed at the API/CLI layer — the model never answered.
+
+    Raised instead of returning the transport's error text as an answer, which
+    would otherwise be spoken aloud to the user as though it were a real reply.
+    """
+
+    def __init__(self, reason: str, detail: str = "", status: str | None = None):
+        super().__init__(detail or reason)
+        self.reason = reason        # short, safe to speak/display
+        self.detail = detail        # raw transport text, for logs and the console
+        self.status = status        # e.g. "401", when the SDK gave one
+
+
+def _failure_reason(status: str | None, text: str) -> str:
+    """Classify a transport failure for a human. CLASSIFICATION only: detection
+    (in ask()) keys on ResultMessage fields and never string-matches, because
+    these words legitimately appear in vault notes Keke might ask about. Once
+    the structured fields say the turn failed, the text may refine the label."""
+    low = (text or "").lower()
+    if status in ("401", "403") or any(w in low for w in ("authenticat", "oauth", "login")):
+        return "login expired"
+    if status == "429" or "rate limit" in low:
+        return "rate limited"
+    if (status or "").startswith("5"):
+        return "the service is having trouble"
+    return "the model is unavailable"
+
+
 # Strong refs to detached reaper tasks: the event loop holds tasks weakly, so a
 # bare create_task could be garbage-collected mid-disconnect.
 _REAPERS: set = set()
@@ -195,7 +225,7 @@ class Butler:
                 # calls emits a preamble message ("Let me search the vault for
                 # Tibet...") before the real reply, and _best_parse needs them
                 # separable to prefer the last one. See _best_parse.
-                messages, session_id = [], None
+                messages, session_id, failure = [], None, None
                 async for msg in client.receive_response():
                     parts = []
                     for block in getattr(msg, "content", None) or []:
@@ -204,13 +234,39 @@ class Butler:
                             parts.append(t)
                     if parts:
                         messages.append("".join(parts))
-                    # `subtype` is NOT unique to ResultMessage (SystemMessage and
-                    # others carry it too). This works because receive_response()
-                    # ends at the ResultMessage, so the LAST message carrying a
-                    # subtype -- the one whose session_id wins here -- is it.
-                    # Duck-typed so tests need no heavy SDK dataclasses.
-                    if getattr(msg, "subtype", None) is not None:
-                        session_id = getattr(msg, "session_id", None)
+                    # Keyed on the CLASS NAME, not the old `subtype is not None`
+                    # probe: SystemMessage carries a subtype too ('init',
+                    # 'api_retry'), and current SDKs put a session_id on
+                    # AssistantMessage, so no single attribute is distinctive.
+                    # The name check is exact against the real SDK, keeps the
+                    # test fakes light (isinstance would force constructing the
+                    # full SDK dataclass), and a SystemMessage -- whatever
+                    # fields a future SDK gives it -- can never overwrite the
+                    # saved id.
+                    if type(msg).__name__ == "ResultMessage":
+                        # Authoritative failure signals, read defensively (SDK
+                        # fields move). `subtype` is NOT one of them: the live
+                        # auth failure arrived with subtype='success'. And the
+                        # message TEXT is never used for detection -- Keke
+                        # asking about an error recorded in a vault note must
+                        # not trip this.
+                        status = getattr(msg, "api_error_status", None)
+                        status = str(status) if status not in (None, "") else None
+                        if (getattr(msg, "is_error", None) or status is not None
+                                or getattr(msg, "terminal_reason", None) == "api_error"):
+                            # A failed turn's id is not a resumable session:
+                            # do NOT capture it. Raise only after the loop has
+                            # finished draining the response.
+                            detail = (str(getattr(msg, "result", None) or "").strip()
+                                      or (messages[-1] if messages else ""))
+                            failure = ButlerUnavailable(
+                                _failure_reason(status, detail), detail, status)
+                        else:
+                            session_id = getattr(msg, "session_id", None)
+                if failure is not None:
+                    # Flows through the except below: an auth-failed client is
+                    # dead, so it is dropped and reaped like any other failure.
+                    raise failure
                 if session_id and session_id != self._session_id:
                     # In-memory FIRST: the running session keeps continuity even
                     # if the disk save below fails.

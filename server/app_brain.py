@@ -3,8 +3,20 @@ from __future__ import annotations
 
 import asyncio
 
+from server.butler import ButlerUnavailable
+
 FALLBACK_LINE = "Sorry sir, I couldn't reach my brain just now."
 UNCLEAR_LINE = "Sorry sir, I didn't get a clean answer that time — it's on screen."
+
+# What to SPEAK when the transport itself failed (ButlerUnavailable), keyed by
+# its `reason`. The raw error text is never read aloud -- it goes to the
+# console via the event's `detail` field instead. Unmapped reasons get the
+# default line.
+UNAVAILABLE_LINES = {
+    "login expired": "I can't reach my brain, sir — my login needs refreshing.",
+    "rate limited": "We're rate limited at the moment, sir. Try again shortly.",
+}
+UNAVAILABLE_DEFAULT = "I can't reach my brain just now, sir."
 
 # A single turn must never wedge the loop. permission_mode is "default" and this
 # process is headless: if a tool call ever lands outside the allowed surface
@@ -166,6 +178,16 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                     continue
                 try:
                     answer = await asyncio.wait_for(butler.ask(text), ASK_TIMEOUT_S)
+                except ButlerUnavailable as e:
+                    # The API/CLI layer failed -- there IS no answer. Speak a
+                    # line that tells Keke what to actually do, keyed on the
+                    # short reason; the raw transport text rides along as
+                    # `detail` for the console (the browser reads d.reason, so
+                    # the extra key is additive and safe) and is never spoken.
+                    bus.publish("butler.error",
+                                {"reason": e.reason, "detail": e.detail})
+                    await _speak(UNAVAILABLE_LINES.get(e.reason, UNAVAILABLE_DEFAULT))
+                    continue
                 except Exception as e:  # noqa: BLE001 — never let the brain die
                     reason = "timed out" if isinstance(e, asyncio.TimeoutError) else str(e)
                     bus.publish("butler.error", {"reason": reason})

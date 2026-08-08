@@ -5,7 +5,7 @@ from pathlib import Path
 import mcp.types as mt
 import pytest
 
-from server.butler import Butler
+from server.butler import Butler, ButlerUnavailable
 from server.vault_mcp import VAULT_TOOL_NAMES, build_vault_server
 
 
@@ -25,7 +25,11 @@ def _tool_text(result) -> str:
     return "".join(c.text for c in result.root.content if c.type == "text")
 
 
-# --- lightweight duck-typed fakes: the Butler reads .content/.text/.subtype/.session_id ---
+# --- lightweight fakes: the Butler reads .content/.text/.subtype/.session_id ---
+# The result fake is NAMED ResultMessage on purpose: Butler.ask keys session-id
+# capture and failure detection on type(msg).__name__ == "ResultMessage" (the
+# real SDK class name), so the fake must carry it too -- no other field of the
+# heavy SDK dataclass is needed.
 class _Text:
     def __init__(self, text): self.text = text
 
@@ -34,7 +38,7 @@ class _Assistant:
     def __init__(self, text): self.content = [_Text(text)]
 
 
-class _Result:
+class ResultMessage:
     def __init__(self, session_id): self.subtype = "success"; self.session_id = session_id
 
 
@@ -55,7 +59,7 @@ class FakeClient:
         yield _Assistant('{"spoken": "Session 2.", '
                          '"display": "You left off at [[Tibet Session 2]].", '
                          '"citations": ["Tibet Session 2"]}')
-        yield _Result("sess-123")
+        yield ResultMessage("sess-123")
 
 
 def make_butler(tmp_path, resume=None):
@@ -205,7 +209,7 @@ async def test_fallback_prefers_the_last_message_not_the_narration(tmp_path):
         async def receive_response(self):
             yield _Assistant("Let me search the vault for Tibet...")
             yield _Assistant("Session 2 is where you left it. See [[Tibet Session 2]].")
-            yield _Result("sess-123")
+            yield ResultMessage("sess-123")
 
     b = Butler(options_builder=lambda r: {"resume": r},
                state_path=tmp_path / "butler.json", client_factory=Narrating)
@@ -223,13 +227,89 @@ async def test_json_in_an_earlier_message_is_still_found(tmp_path):
             yield _Assistant('{"spoken": "Session 2.", "display": "At [[Tibet]].", '
                              '"citations": ["Tibet"]}')
             yield _Assistant("Let me know if you want the full note.")
-            yield _Result("sess-123")
+            yield ResultMessage("sess-123")
 
     b = Butler(options_builder=lambda r: {"resume": r},
                state_path=tmp_path / "butler.json", client_factory=TrailingChatter)
     out = await b.ask("hi")
     assert out["spoken"] == "Session 2."
     assert out["citations"] == ["Tibet"]
+
+
+# --- the first live failure: an API/auth error the SDK does NOT raise --------
+# Captured evidence from the real failing turn: receive_response() ended with
+#   ResultMessage: subtype='success'  is_error=True  api_error_status='401'
+#                  terminal_reason='api_error'
+#                  result='Failed to authenticate. API Error: 401 OAuth ...'
+# and Butler.ask returned that text as a normal answer, which the brain then
+# SPOKE ALOUD in the JARVIS voice. Detection must key on the structured fields
+# (is_error / api_error_status / terminal_reason), never the text.
+
+async def test_api_error_result_raises_instead_of_answering(tmp_path):
+    class ResultMessage:                 # mirrors the captured evidence exactly
+        subtype = "success"              # the SDK really does say 'success' here
+        is_error = True
+        api_error_status = "401"
+        terminal_reason = "api_error"
+        session_id = "sess-should-not-be-saved"
+        result = ("Failed to authenticate. API Error: 401 OAuth access token "
+                  "has been revoked.")
+
+    class ErrClient(FakeClient):
+        async def receive_response(self):
+            yield _Assistant(ResultMessage.result)
+            yield ResultMessage()
+
+    state = tmp_path / "butler.json"
+    b = Butler(options_builder=lambda r: {"resume": r},
+               state_path=state, client_factory=ErrClient)
+    with pytest.raises(ButlerUnavailable) as ei:
+        await b.ask("where did I leave the tibet study?")
+    assert ei.value.reason == "login expired"
+    assert "401" in (ei.value.detail or "") or ei.value.status == "401"
+    assert not state.exists()        # a failed turn must not persist a session id
+    assert b._client is None         # the auth-dead client was dropped for reaping
+
+
+async def test_rate_limited_result_classifies_as_rate_limited(tmp_path):
+    class ResultMessage:
+        subtype = "success"
+        is_error = True
+        api_error_status = "429"
+        terminal_reason = "api_error"
+        session_id = "sess-should-not-be-saved"
+        result = "API Error: 429 rate limit exceeded"
+
+    class ErrClient(FakeClient):
+        async def receive_response(self):
+            yield ResultMessage()
+
+    state = tmp_path / "butler.json"
+    b = Butler(options_builder=lambda r: {"resume": r},
+               state_path=state, client_factory=ErrClient)
+    with pytest.raises(ButlerUnavailable) as ei:
+        await b.ask("hi")
+    assert ei.value.reason == "rate limited"
+    assert ei.value.status == "429"
+    assert not state.exists()
+
+
+async def test_answer_about_an_error_note_is_not_mistaken_for_a_failure(tmp_path):
+    """Keke legitimately asking about an error recorded in a vault note must get
+    the answer: detection keys on ResultMessage fields, never the message text."""
+    class ErrorNoteClient(FakeClient):
+        async def receive_response(self):
+            yield _Assistant('{"spoken": "Your note says the token was revoked.", '
+                             '"display": "Per [[Auth Bug]]: Failed to authenticate. '
+                             'API Error: 401 OAuth access token has been revoked.", '
+                             '"citations": ["Auth Bug"]}')
+            yield ResultMessage("sess-123")
+
+    b = Butler(options_builder=lambda r: {"resume": r},
+               state_path=tmp_path / "butler.json", client_factory=ErrorNoteClient)
+    out = await b.ask("what did the auth bug note say?")
+    assert out["citations"] == ["Auth Bug"]
+    assert b._session_id == "sess-123"   # a healthy turn still saves its id
 
 
 def test_system_prompt_carries_the_vault_map():

@@ -381,6 +381,58 @@ async def test_app_validator_checks_real_files(tmp_path):
     assert _existing_note_titles(["*"], tmp_path) == set()
 
 
+# --- the first live failure: API/auth errors must be spoken usefully --------
+# Butler.ask now raises ButlerUnavailable when the SDK reports a transport-level
+# failure (observed live: a revoked OAuth token was read aloud, verbatim, as
+# the "answer"). The brain must speak a line that tells Keke what to DO and
+# route the raw error text to the console only.
+
+async def test_auth_failure_speaks_a_useful_line_not_the_raw_error(tmp_path):
+    from server.butler import ButlerUnavailable
+
+    class DeadButler(FakeButler):
+        async def ask(self, text):
+            raise ButlerUnavailable(
+                "login expired",
+                "Failed to authenticate. API Error: 401 OAuth access token "
+                "has been revoked.", "401")
+
+    bus = EventBus()
+    speaker, turnlog = FakeSpeaker(), FakeTurnLog()
+    task = asyncio.create_task(run_butler_brain(bus, DeadButler(), speaker, turnlog))
+    await asyncio.sleep(0)
+    err_fut = asyncio.ensure_future(_drain_until(bus, "butler.error"))
+    bus.publish("command.received", {"text": "hi"})
+    err = await err_fut
+    assert "login" in err["data"]["reason"].lower()
+    assert "401" in err["data"]["detail"]           # raw text goes to the console
+    spoken = " ".join(speaker.spoke)
+    assert "401" not in spoken and "API Error" not in spoken  # never recite the raw error
+    assert "login" in spoken.lower()                # tell Keke what to do
+    assert not task.done()
+    task.cancel()
+
+
+async def test_unmapped_unavailable_reason_speaks_the_default_line(tmp_path):
+    from server.butler import ButlerUnavailable
+
+    class DeadButler(FakeButler):
+        async def ask(self, text):
+            raise ButlerUnavailable("the model is unavailable", "boom", None)
+
+    bus = EventBus()
+    speaker, turnlog = FakeSpeaker(), FakeTurnLog()
+    task = asyncio.create_task(run_butler_brain(bus, DeadButler(), speaker, turnlog))
+    await asyncio.sleep(0)
+    err_fut = asyncio.ensure_future(_drain_until(bus, "butler.error"))
+    bus.publish("command.received", {"text": "hi"})
+    err = await err_fut
+    assert err["data"]["reason"] == "the model is unavailable"
+    assert speaker.spoke == [app_brain.UNAVAILABLE_DEFAULT]
+    assert not task.done()
+    task.cancel()
+
+
 # --- the lifespan really starts the brain -----------------------------------
 
 def test_lifespan_starts_the_butler_brain(tmp_path):
