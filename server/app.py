@@ -35,6 +35,8 @@ def create_app(base_dir: Path) -> FastAPI:
 
     app.state.cfg = cfg
     app.state.bus = EventBus()
+    from server.metrics import TurnLog
+    app.state.turnlog = TurnLog()
     app.state.bootstrap = bootstrap_state
     app.state.bootstrap_token_plain = token_plain  # read by launcher tests only
     app.state.base_dir = base_dir
@@ -85,6 +87,10 @@ def create_app(base_dir: Path) -> FastAPI:
     @app.get("/health")
     async def health():
         return {"ok": True}
+
+    @app.get("/metrics")
+    async def metrics():
+        return app.state.turnlog.summary()
 
     @app.get("/bootstrap")
     async def bootstrap(token: str = ""):
@@ -201,6 +207,13 @@ def create_app(base_dir: Path) -> FastAPI:
             if event is None:
                 cid, q = app.state.bus.subscribe()
                 continue
+            if event["type"] == "stt.utterance":
+                app.state.turnlog.record_utterance(
+                    t_release=(event["data"].get("t_release") or 0) / 1000 or None,
+                    t_utterance=event["data"]["t_utterance"])
+            if event["type"] == "tts.done":
+                app.state.turnlog.record_first_audio(event["data"].get("t_first_audio"))
+                app.state.bus.publish("metrics.turn", app.state.turnlog.summary())
             if event["type"] in ("stt.utterance", "command.received"):
                 text = event["data"]["text"]
                 asyncio.create_task(app.state.speaker.speak(f"You said: {text}"))

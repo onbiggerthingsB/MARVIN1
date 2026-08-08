@@ -215,3 +215,25 @@ function connectAudio() {
 }
 connectAudio();
 window.jarvis.onEvent("tts.done", () => window.jarvis.setStatus("online — hold to talk"));
+
+// ---- canned clips + metrics footer -------------------------------------
+let clipManifest = {};
+fetch("/static/clips/manifest.json").then((r) => r.json())
+  .then((m) => { clipManifest = m; })
+  .catch(() => {});
+
+const clipEls = {};
+function playClip(slug) {
+  if (!clipManifest[slug]) return;
+  clipEls[slug] = clipEls[slug] || new Audio(clipManifest[slug]);
+  clipEls[slug].currentTime = 0;
+  clipEls[slug].play().catch(() => {});
+}
+
+window.jarvis.onEvent("stt.utterance", () => playClip("got_it"));
+window.jarvis.onEvent("metrics.turn", (m) => {
+  $("#metrics").textContent =
+    `turns ${m.turns} · release→final p50 ${m.release_to_final_p50}ms ` +
+    `p95 ${m.release_to_final_p95}ms · final→audio p50 ${m.final_to_audio_p50}ms ` +
+    `p95 ${m.final_to_audio_p95}ms`;
+});
