@@ -9,7 +9,8 @@ function connectSSE() {
     (handlers.get(type) || []).forEach((h) => h(JSON.parse(e.data)));
   };
   ["wake", "command.received", "stt.interim", "stt.final", "stt.utterance",
-   "stt.error", "tts.start", "tts.done", "metrics.turn"].forEach((t) =>
+   "stt.error", "tts.start", "tts.done", "metrics.turn",
+   "butler.answer", "butler.error"].forEach((t) =>
     es.addEventListener(t, dispatch(t)));
   // Deliberate: reconnect fresh (no Last-Event-ID). Replaying stale tts.start/
   // stt.utterance on a live-voice UI would double-trigger playback. Server-side
@@ -164,6 +165,22 @@ window.jarvis.onEvent("stt.utterance", (d) => {
 window.jarvis.onEvent("stt.error", (d) => {
   window.jarvis.setStatus("couldn't hear you — " + (d.reason || "audio error"));
   if (typeof playClip === "function") playClip("cannot_hear");
+});
+
+window.jarvis.onEvent("butler.answer", (d) => {
+  $("#answer").textContent = d.display || "";
+  const box = $("#citations");
+  box.textContent = "";
+  (d.citations || []).forEach((name) => {
+    const chip = document.createElement("span");
+    chip.className = "cite";
+    chip.textContent = name;
+    box.appendChild(chip);
+  });
+  window.jarvis.setStatus("online — hold to talk");
+});
+window.jarvis.onEvent("butler.error", (d) => {
+  window.jarvis.setStatus("brain error — " + (d.reason || "unavailable"));
 });
 
 // ---- /audio WebSocket → MediaSource playback ---------------------------

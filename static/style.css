@@ -12,3 +12,7 @@ main { max-width: 640px; margin: 3rem auto; display: grid; gap: 1rem; }
 #transcript { min-height: 8rem; white-space: pre-wrap; }
 #transcript.interim { opacity: 0.5; }
 footer { opacity: 0.6; font-size: 0.8rem; }
+#answer { white-space: pre-wrap; line-height: 1.4; margin: 0.5rem 0; }
+#citations { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.cite { font-size: 0.75rem; padding: 0.15rem 0.5rem; border: 1px solid #2e6da4;
+  border-radius: 999px; opacity: 0.85; }

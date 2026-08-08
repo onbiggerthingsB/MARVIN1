@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import time
@@ -12,9 +13,14 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from server import auth
+from server.app_brain import run_butler_brain
 from server.bus import EventBus
+from server.butler import Butler, build_options
 from server.config import ensure_config, load_keyterms, save_config
 from server.stt import SttRelay
+from server.vault_mcp import build_vault_server
+from server.vault_paths import vault_root_from_env
+from server.vault_read import vault_is_downloaded
 
 COOKIE = "jarvis_session"
 OPEN_PATHS = {"/health", "/bootstrap"}
@@ -65,6 +71,17 @@ def create_app(base_dir: Path) -> FastAPI:
         publish=app.state.bus.publish,
         send_audio=send_audio,
     )
+
+    vault_root = vault_root_from_env()
+    if not vault_is_downloaded(vault_root):
+        # Not fatal: the butler still runs, but grounding may stall on iCloud.
+        # Surfaced once at startup; the setup screen guidance covers the fix.
+        print(f"[jarvis] WARNING: vault not fully downloaded at {vault_root} "
+              f"— enable 'Keep Downloaded' in Finder for reliable answers.")
+    vault_server = build_vault_server(vault_root)
+    app.state.butler = Butler(
+        options_builder=lambda resume: build_options(vault_root, vault_server, resume),
+        state_path=base_dir / "state" / "butler.json")
 
     @app.middleware("http")
     async def guard(request: Request, call_next):
@@ -198,33 +215,28 @@ def create_app(base_dir: Path) -> FastAPI:
         except WebSocketDisconnect:
             audio_clients.discard(ws)
 
-    async def echo_brain():
-        cid, q = app.state.bus.subscribe()
-        while True:
-            event = await q.get()
-            if event is None:
-                cid, q = app.state.bus.subscribe()
-                continue
-            if event["type"] == "stt.utterance":
-                app.state.turnlog.record_utterance(
-                    t_release=(event["data"].get("t_release") or 0) / 1000 or None,
-                    t_utterance=event["data"]["t_utterance"])
-            if event["type"] == "tts.done":
-                app.state.turnlog.record_first_audio(event["data"].get("t_first_audio"))
-                app.state.bus.publish("metrics.turn", app.state.turnlog.summary())
-            if event["type"] in ("stt.utterance", "command.received"):
-                text = event["data"]["text"]
-                asyncio.create_task(app.state.speaker.speak(f"You said: {text}"))
-            if event["type"] == "wake":
-                asyncio.create_task(app.state.speaker.preconnect())
-
-    @app.on_event("startup")
-    async def _start_brain():
-        asyncio.create_task(echo_brain())
-
     static = base_dir / "static"
     if static.exists():
         app.mount("/static", StaticFiles(directory=static), name="static")
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(_app):
+        task = asyncio.create_task(
+            run_butler_brain(app.state.bus, app.state.butler,
+                             app.state.speaker, app.state.turnlog))
+        try:
+            yield
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await app.state.butler.close()
+
+    # Assigned after the app is built (rather than passed to FastAPI(lifespan=…))
+    # so create_app's shape is unchanged. This is the spec §2 "lifespan-managed
+    # cancellation" the M1 review asked for, and it clears the @app.on_event
+    # deprecation warning the echo brain carried.
+    app.router.lifespan_context = _lifespan
     return app
 
 
