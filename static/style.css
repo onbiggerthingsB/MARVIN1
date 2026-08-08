@@ -16,3 +16,7 @@ footer { opacity: 0.6; font-size: 0.8rem; }
 #citations { display: flex; flex-wrap: wrap; gap: 0.4rem; }
 .cite { font-size: 0.75rem; padding: 0.15rem 0.5rem; border: 1px solid #2e6da4;
   border-radius: 999px; opacity: 0.85; }
+#confirm.asking { border: 1px solid #2e6da4; border-radius: 8px; padding: 0.6rem; }
+#projects { font-size: 0.8rem; opacity: 0.7; }
+#finance .pos { font-size: 0.85rem; }
+#finance .caveat { font-size: 0.75rem; opacity: 0.6; margin-top: 0.3rem; }

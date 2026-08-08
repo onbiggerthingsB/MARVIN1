@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from server.butler import ButlerUnavailable
+from server.finance import TRADE_REFUSAL, find_finance_project, portfolio_brief
 
 FALLBACK_LINE = "Sorry sir, I couldn't reach my brain just now."
 UNCLEAR_LINE = "Sorry sir, I didn't get a clean answer that time — it's on screen."
@@ -79,13 +81,20 @@ def speakable(spoken) -> str:
     return text
 
 
-async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=None):
+async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=None,
+                           router=None, registry=None, onboarding=None, finance=None):
     """Subscribe to the bus and drive the butler. Never raises out of the loop.
 
     `validate_citations` is an optional async callable taking the model's list of
     cited titles and returning the subset that resolves to real vault notes.
     None (the default) means no validation, which keeps this loop importable and
     testable without a vault behind it; server/app.py passes the real one.
+
+    `router`/`registry`/`onboarding` wire in M3's deterministic layer: dangerous
+    verbs are parsed BEFORE the model ever sees an utterance, and a pending
+    confirmation or approval owns the next reply. All keyword-optional so every
+    M2 caller and test keeps working. `finance` is reserved for M3 Part 2's
+    injection point and unused today (the brief pins the signature).
     """
     cid, q = bus.subscribe()
 
@@ -176,6 +185,82 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                 text = (data.get("text") or "").strip()
                 if not text:
                     continue
+
+                # A pending confirmation owns the next utterance ("...right?").
+                if onboarding is not None:
+                    outcome = "ignored"
+                    try:
+                        outcome = await onboarding.handle_reply(text)
+                    except Exception as e:  # noqa: BLE001 — onboarding must not kill the brain
+                        bus.publish("butler.error", {"reason": f"onboarding failed: {e}"})
+                    if outcome != "ignored":
+                        await _speak("Noted, sir." if outcome != "rejected" else "Understood.")
+                        continue
+
+                # Dangerous verbs are parsed deterministically, never by the model.
+                command = None
+                if router is not None and registry is not None:
+                    try:
+                        command = router.parse(text, registry)
+                    except Exception as e:  # noqa: BLE001 — a router fault falls through
+                        bus.publish("butler.error", {"reason": f"router failed: {e}"})
+                        command = None
+
+                # Deny-vs-stop tie-break (binding note from Task 3's review): the
+                # router's denial vocabulary ("stop", "cancel") overlaps the stop
+                # VERB, so call order alone cannot arbitrate. Gate on utterance
+                # SHAPE: a parse that resolved (or nearly resolved) a confirmed
+                # project — "stop soccer" — is positive evidence of a fleet
+                # command and wins; an utterance that names no project ("yes",
+                # bare "no", bare "cancel") may answer a pending approval first.
+                # The affirm vocabulary never overlaps any verb pattern, so no
+                # reading of this tie can ever APPROVE something unintended —
+                # both residual misreadings are refusals, which fail safe.
+                if (router is not None and router.pending_approvals()
+                        and not (command is not None
+                                 and (command.project or command.needs_disambiguation))):
+                    state, approval = "none", None
+                    try:
+                        state, approval = router.resolve_approval(text, time.time())
+                    except Exception as e:  # noqa: BLE001 — approvals must not kill the brain
+                        bus.publish("butler.error", {"reason": f"approval failed: {e}"})
+                    if state in ("approved", "denied"):
+                        bus.publish("approval.resolved", {
+                            "outcome": state, "project": approval.project,
+                            "tool": approval.tool, "nonce": approval.nonce})
+                        await _speak("Approved, sir." if state == "approved"
+                                     else "Denied, sir.")
+                        continue
+                    if state == "ambiguous":
+                        await _speak("More than one approval is pending, sir — "
+                                     "name the project.")
+                        continue
+                    if state == "expired":
+                        await _speak("That approval expired, sir.")
+                        continue
+                    # "none": not an approval answer — fall through.
+
+                if command is not None:
+                    bus.publish("router.command", {
+                        "verb": command.verb, "project": command.project,
+                        "argument": command.argument,
+                        "needs_disambiguation": command.needs_disambiguation})
+                    if command.verb == "refuse_trade":
+                        await _speak(TRADE_REFUSAL)
+                    elif command.needs_disambiguation:
+                        await _speak("Which one, sir? "
+                                     + " or ".join(command.needs_disambiguation) + ".")
+                    elif command.verb == "portfolio":
+                        brief = await portfolio_brief(find_finance_project(registry))
+                        bus.publish("finance.brief", {
+                            "rows": brief["rows"], "source": brief["source"],
+                            "as_of": brief["as_of"], "caveat": brief["caveat"]})
+                        await _speak(brief["spoken"])
+                    else:
+                        # Fleet verbs (spawn/steer/stop/pull_up) land in M3 Part 2.
+                        await _speak("Understood, sir — I can't run that yet.")
+                    continue
+
                 try:
                     answer = await asyncio.wait_for(butler.ask(text), ASK_TIMEOUT_S)
                 except ButlerUnavailable as e:

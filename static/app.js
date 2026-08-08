@@ -10,7 +10,9 @@ function connectSSE() {
   };
   ["wake", "command.received", "stt.interim", "stt.final", "stt.utterance",
    "stt.error", "tts.start", "tts.done", "metrics.turn", "metrics.error",
-   "butler.answer", "butler.error"].forEach((t) =>
+   "butler.answer", "butler.error", "router.command", "confirm.request",
+   "confirm.result", "registry.updated", "finance.brief",
+   "approval.resolved"].forEach((t) =>
     es.addEventListener(t, dispatch(t)));
   // Deliberate: reconnect fresh (no Last-Event-ID). Replaying stale tts.start/
   // stt.utterance on a live-voice UI would double-trigger playback. Server-side
@@ -265,6 +267,46 @@ function playClip(slug) {
   clipEls[slug].currentTime = 0;
   clipEls[slug].play().catch(() => {});
 }
+
+// ---- M3: router / confirmation / registry / finance surfaces ------------
+window.jarvis.onEvent("confirm.request", (d) => {
+  const box = $("#confirm");
+  box.textContent = d.question || "";
+  box.className = "asking";
+});
+window.jarvis.onEvent("confirm.result", (d) => {
+  const box = $("#confirm");
+  box.textContent = `${d.name}: ${d.outcome}`;
+  box.className = "";
+});
+window.jarvis.onEvent("registry.updated", (d) => {
+  $("#projects").textContent =
+    `projects: ${d.confirmed} confirmed, ${d.pending} awaiting your yes`;
+});
+window.jarvis.onEvent("router.command", (d) => {
+  window.jarvis.setStatus(
+    `command: ${d.verb}${d.project ? " → " + d.project : ""}`);
+});
+window.jarvis.onEvent("approval.resolved", (d) => {
+  window.jarvis.setStatus(`approval ${d.outcome}: ${d.project}`);
+});
+window.jarvis.onEvent("finance.brief", (d) => {
+  const box = $("#finance");
+  box.textContent = "";
+  (d.rows || []).forEach((row) => {
+    const line = document.createElement("div");
+    line.className = "pos";
+    line.textContent = Object.entries(row)
+      .map(([k, v]) => `${k}: ${v}`).join("  ");
+    box.appendChild(line);
+  });
+  if (d.caveat) {
+    const c = document.createElement("div");
+    c.className = "caveat";
+    c.textContent = d.caveat;
+    box.appendChild(c);
+  }
+});
 
 window.jarvis.onEvent("stt.utterance", () => playClip("got_it"));
 window.jarvis.onEvent("metrics.turn", (m) => {

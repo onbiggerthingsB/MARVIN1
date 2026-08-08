@@ -17,6 +17,9 @@ from server.app_brain import run_butler_brain
 from server.bus import EventBus
 from server.butler import Butler, build_options
 from server.config import ensure_config, load_keyterms, save_config
+from server.onboarding import Onboarding
+from server.registry import Registry
+from server.router import Router
 from server.stt import SttRelay
 from server.vault_mcp import build_vault_server
 from server.vault_paths import vault_root_from_env
@@ -108,6 +111,11 @@ def create_app(base_dir: Path) -> FastAPI:
             vault_root, vault_server, resume, use_api_key=use_api_key),
         state_path=base_dir / "state" / "butler.json")
 
+    registry_path = base_dir / "config" / "projects.json"
+    app.state.registry = Registry.load(registry_path)
+    app.state.router = Router()
+    app.state.onboarding = Onboarding(app.state.bus, app.state.registry, registry_path)
+
     @app.middleware("http")
     async def guard(request: Request, call_next):
         path = request.url.path
@@ -132,6 +140,11 @@ def create_app(base_dir: Path) -> FastAPI:
     @app.get("/metrics")
     async def metrics():
         return app.state.turnlog.summary()
+
+    @app.get("/registry")
+    async def registry():
+        from dataclasses import asdict
+        return {"projects": [asdict(p) for p in app.state.registry.projects]}
 
     @app.get("/bootstrap")
     async def bootstrap(token: str = ""):
@@ -258,7 +271,10 @@ def create_app(base_dir: Path) -> FastAPI:
         task = asyncio.create_task(
             run_butler_brain(app.state.bus, app.state.butler,
                              app.state.speaker, app.state.turnlog,
-                             validate_citations=validate_citations))
+                             validate_citations=validate_citations,
+                             router=app.state.router,
+                             registry=app.state.registry,
+                             onboarding=app.state.onboarding))
 
         def _brain_died(t):
             # Last resort. run_butler_brain guards every await, so reaching here
