@@ -9,7 +9,7 @@ function connectSSE() {
     (handlers.get(type) || []).forEach((h) => h(JSON.parse(e.data)));
   };
   ["wake", "command.received", "stt.interim", "stt.final", "stt.utterance",
-   "stt.error", "tts.start", "tts.done", "metrics.turn",
+   "stt.error", "tts.start", "tts.done", "metrics.turn", "metrics.error",
    "butler.answer", "butler.error"].forEach((t) =>
     es.addEventListener(t, dispatch(t)));
   // Deliberate: reconnect fresh (no Last-Event-ID). Replaying stale tts.start/
@@ -186,6 +186,12 @@ window.jarvis.onEvent("butler.error", (d) => {
   $("#answer").textContent = "";
   $("#citations").textContent = "";
   window.jarvis.setStatus("brain error — " + (d.reason || "unavailable"));
+});
+// Metrics failures are NOT brain failures: a TurnLog hiccup on tts.done must
+// never blank a correct answer that JARVIS is still speaking. Status line only —
+// no clearing of #answer / #citations.
+window.jarvis.onEvent("metrics.error", (d) => {
+  window.jarvis.setStatus("metrics: " + (d.reason || "unavailable"));
 });
 
 // ---- /audio WebSocket → MediaSource playback ---------------------------

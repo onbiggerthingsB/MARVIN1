@@ -20,8 +20,10 @@ class FakeSpeaker:
 
 
 class FakeTurnLog:
-    def __init__(self): self.utter = 0; self.audio = 0
-    def record_utterance(self, t_release, t_utterance): self.utter += 1
+    def __init__(self): self.utter = 0; self.audio = 0; self.last = None
+    def record_utterance(self, t_release, t_utterance):
+        self.utter += 1
+        self.last = (t_release, t_utterance)
     def record_first_audio(self, t_first_audio): self.audio += 1
     def summary(self): return {"turns": self.utter}
 
@@ -52,6 +54,8 @@ async def test_utterance_drives_butler_and_speaks_and_answers(tmp_path):
     assert butler.asked == ["where did I leave the tibet study?"]
     assert speaker.spoke == ["Session 2."]
     assert turnlog.utter == 1
+    # good input is unchanged by the guard: ms epoch -> seconds
+    assert turnlog.last == (1.0, 1000.5)
     task.cancel()
 
 
@@ -183,7 +187,12 @@ async def test_failed_speak_does_not_kill_the_brain(tmp_path):
 
 
 async def test_failed_turnlog_does_not_kill_the_brain(tmp_path):
-    """record_* take possibly-None timestamps straight off the wire."""
+    """record_* take possibly-None timestamps straight off the wire.
+
+    A metrics failure publishes metrics.error, NOT butler.error: the console's
+    butler.error handler clears #answer/#citations, so a TurnLog hiccup on
+    tts.done would otherwise wipe a correct answer off screen mid-speech.
+    """
     class BadTurnLog(FakeTurnLog):
         def record_utterance(self, t_release, t_utterance):
             raise TypeError("unsupported operand type(s) for -: 'NoneType' and 'float'")
@@ -194,7 +203,7 @@ async def test_failed_turnlog_does_not_kill_the_brain(tmp_path):
     butler, speaker, turnlog = FakeButler(), FakeSpeaker(), BadTurnLog()
     task = asyncio.create_task(run_butler_brain(bus, butler, speaker, turnlog))
     await asyncio.sleep(0)
-    err_fut = asyncio.ensure_future(_drain_until(bus, "butler.error"))
+    err_fut = asyncio.ensure_future(_drain_until(bus, "metrics.error"))
     bus.publish("tts.done", {"t_first_audio": None})
     err = await err_fut
     assert "turnlog failed" in err["data"]["reason"]
@@ -206,6 +215,42 @@ async def test_failed_turnlog_does_not_kill_the_brain(tmp_path):
     assert answer["data"]["display"]
     assert not task.done()
     task.cancel()
+
+
+async def test_garbage_t_release_does_not_kill_the_brain(tmp_path):
+    """`t_release` is unvalidated wire data — stt.py republishes it verbatim.
+
+    The ms->s division must happen INSIDE the guarded callable. As an argument
+    expression it is evaluated in the loop's own frame, so a non-numeric value
+    raises past _safe, ends run_butler_brain, and JARVIS goes silently deaf.
+    """
+    bus = EventBus()
+    butler, speaker, turnlog = FakeButler(), FakeSpeaker(), FakeTurnLog()
+    task = asyncio.create_task(run_butler_brain(bus, butler, speaker, turnlog))
+    await asyncio.sleep(0)
+    answer_fut = asyncio.ensure_future(_drain_until(bus, "butler.answer"))
+    # a non-numeric t_release arrives from the websocket
+    bus.publish("stt.utterance", {"text": "hello", "t_release": "not-a-number",
+                                  "t_utterance": 1000.5})
+    answer = await answer_fut          # the turn must still be answered
+    assert answer["data"]["display"]
+    assert not task.done()             # and the loop must still be alive
+    task.cancel()
+
+
+async def test_zero_and_none_t_release_are_still_skipped(tmp_path):
+    """The guard must not change the None/0 -> None contract metrics.py relies on."""
+    for raw in (None, 0):
+        bus = EventBus()
+        butler, speaker, turnlog = FakeButler(), FakeSpeaker(), FakeTurnLog()
+        task = asyncio.create_task(run_butler_brain(bus, butler, speaker, turnlog))
+        await asyncio.sleep(0)
+        answer_fut = asyncio.ensure_future(_drain_until(bus, "butler.answer"))
+        bus.publish("stt.utterance", {"text": "hi", "t_release": raw,
+                                      "t_utterance": 1000.5})
+        await answer_fut
+        assert turnlog.last == (None, 1000.5)
+        task.cancel()
 
 
 # --- the lifespan really starts the brain -----------------------------------

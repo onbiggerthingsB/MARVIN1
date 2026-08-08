@@ -14,6 +14,25 @@ UNCLEAR_LINE = "Sorry sir, I didn't get a clean answer that time — it's on scr
 ASK_TIMEOUT_S = 120
 
 
+def _record_utterance(turnlog, data):
+    """Convert the wire's millisecond `t_release` and hand it to the TurnLog.
+
+    The division lives HERE, not in the argument list of the `_safe(...)` call.
+    An argument expression is evaluated in the caller's frame BEFORE the guarded
+    callable is entered, so `(data.get("t_release") or 0) / 1000` written inline
+    would raise straight out of the brain loop -- and `t_release` is unvalidated
+    wire data (server/stt.py republishes whatever the /mic websocket JSON held).
+    A string, list or dict there would kill the task silently. Inside this
+    function the same TypeError is just another guarded failure.
+
+    Behaviour for good input is unchanged: None/0 -> None (metrics skipped),
+    a real millisecond epoch -> seconds.
+    """
+    raw = data.get("t_release")
+    t_release = (raw or 0) / 1000 or None
+    turnlog.record_utterance(t_release=t_release, t_utterance=data.get("t_utterance"))
+
+
 def speakable(spoken) -> str:
     """What to actually read aloud, given the butler's `spoken` field.
 
@@ -55,12 +74,20 @@ async def run_butler_brain(bus, butler, speaker, turnlog):
             bus.publish("butler.error", {"reason": f"preconnect failed: {e}"})
 
     def _safe(fn, *args, **kwargs):
-        # Metrics bookkeeping takes possibly-None timestamps straight off the
-        # wire; a TurnLog that trips over one must not take the brain with it.
+        # Metrics bookkeeping takes possibly-None (and possibly non-numeric)
+        # timestamps straight off the wire; a TurnLog that trips over one must
+        # not take the brain with it.
+        #
+        # This publishes metrics.error, NOT butler.error: the console's
+        # butler.error handler clears #answer and #citations, so routing a
+        # metrics hiccup there would wipe a correct, already-rendered answer off
+        # screen while JARVIS is still speaking it (tts.done arrives mid-speech).
+        # Every _safe call site is a turnlog path, so the event type is fixed
+        # here rather than parameterized.
         try:
             fn(*args, **kwargs)
         except Exception as e:  # noqa: BLE001 — metrics must never kill the brain
-            bus.publish("butler.error", {"reason": f"turnlog failed: {e}"})
+            bus.publish("metrics.error", {"reason": f"turnlog failed: {e}"})
 
     def _record_audio(t_first_audio):
         turnlog.record_first_audio(t_first_audio)
@@ -82,9 +109,7 @@ async def run_butler_brain(bus, butler, speaker, turnlog):
                 continue
             if etype in ("stt.utterance", "command.received"):
                 if etype == "stt.utterance":
-                    _safe(turnlog.record_utterance,
-                          t_release=(data.get("t_release") or 0) / 1000 or None,
-                          t_utterance=data.get("t_utterance"))
+                    _safe(_record_utterance, turnlog, data)
                 text = (data.get("text") or "").strip()
                 if not text:
                     continue
