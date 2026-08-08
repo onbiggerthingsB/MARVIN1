@@ -29,7 +29,11 @@ def build_vault_server(vault_root: Path):
           "long one. Use this to ground answers before replying.",
           {"query": str, "limit": int})
     async def _search(args):
-        results = await vault_search(args["query"], vault_root, int(args.get("limit", 5)))
+        # `or 5` (not a dict default) so an explicit limit:null -- which a model
+        # emits routinely -- falls back instead of raising TypeError; clamped to
+        # 1..20 so a huge limit cannot drag the whole vault into the context.
+        limit = max(1, min(int(args.get("limit") or 5), 20))
+        results = await vault_search(args["query"], vault_root, limit)
         if not results:
             return _text("No matching notes. Try a single different keyword before "
                          "concluding the vault has nothing on this.")

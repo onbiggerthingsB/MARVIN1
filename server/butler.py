@@ -86,28 +86,42 @@ class Butler:
 
     async def _ensure_client(self):
         if self._client is None:
-            self._client = self._client_factory(self._build(self._session_id))
-            await self._client.connect()
+            client = self._client_factory(self._build(self._session_id))
+            # connect() FIRST, publish second. A stale `resume` id (e.g. a cleared
+            # CLI session store) makes connect() raise on the first turn of a boot;
+            # assigning self._client before that would leave a never-connected
+            # client in place and wedge every later ask() on a dead object.
+            await client.connect()
+            self._client = client
         return self._client
 
     async def ask(self, text: str) -> dict:
         async with self._lock:
-            client = await self._ensure_client()
-            await client.query(text)
-            chunks, session_id = [], None
-            async for msg in client.receive_response():
-                for block in getattr(msg, "content", None) or []:
-                    t = getattr(block, "text", None)
-                    if t:
-                        chunks.append(t)
-                # ResultMessage is the only message carrying `subtype`; use it to
-                # capture the session id for resume. Duck-typed so tests need no
-                # heavy SDK dataclasses and it survives SDK field churn.
-                if getattr(msg, "subtype", None) is not None:
-                    session_id = getattr(msg, "session_id", None)
-            if session_id and session_id != self._session_id:
-                self._save_session_id(session_id)
-            return parse_butler_output("".join(chunks))
+            try:
+                client = await self._ensure_client()
+                await client.query(text)
+                chunks, session_id = [], None
+                async for msg in client.receive_response():
+                    for block in getattr(msg, "content", None) or []:
+                        t = getattr(block, "text", None)
+                        if t:
+                            chunks.append(t)
+                    # `subtype` is NOT unique to ResultMessage (SystemMessage and
+                    # others carry it too). This works because receive_response()
+                    # ends at the ResultMessage, so the LAST message carrying a
+                    # subtype -- the one whose session_id wins here -- is it.
+                    # Duck-typed so tests need no heavy SDK dataclasses.
+                    if getattr(msg, "subtype", None) is not None:
+                        session_id = getattr(msg, "session_id", None)
+                if session_id and session_id != self._session_id:
+                    self._save_session_id(session_id)
+                return parse_butler_output("".join(chunks))
+            except Exception:
+                # Any failure can leave the transport half-dead; drop the client so
+                # the next turn builds and connects a fresh one instead of retrying
+                # query() against a corpse.
+                self._client = None
+                raise
 
     async def close(self):
         if self._client is not None:
