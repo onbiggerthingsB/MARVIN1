@@ -31,9 +31,17 @@ class EventBus:
     def subscribe(self, last_seq: int | None = None) -> tuple[int, asyncio.Queue]:
         q: asyncio.Queue = asyncio.Queue(maxsize=self._queue_size)
         if last_seq is not None:
-            for event in self._ring:
-                if event["seq"] > last_seq and not q.full():
-                    q.put_nowait(event)
+            backlog = [e for e in self._ring if e["seq"] > last_seq]
+            room = self._queue_size
+            if len(backlog) > room:
+                kept = backlog[-(room - 1):] if room > 1 else []
+                dropped = len(backlog) - len(kept)
+                gap_seq = backlog[-len(kept) - 1]["seq"] if kept else backlog[-1]["seq"]
+                q.put_nowait({"seq": gap_seq, "type": "bus.gap",
+                              "data": {"dropped": dropped}})
+                backlog = kept
+            for event in backlog:
+                q.put_nowait(event)
         cid = next(self._ids)
         self._subs[cid] = q
         return cid, q

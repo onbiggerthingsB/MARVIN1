@@ -38,3 +38,18 @@ async def test_slow_client_gets_closed_not_blocked():
         items.append(item)
     assert len(items) <= 4
     bus.unsubscribe(cid)
+
+
+async def test_replay_overflow_emits_gap_marker():
+    bus = EventBus(queue_size=4, ring_size=16)
+    seqs = [bus.publish("t", {"i": i}) for i in range(10)]
+    cid, q = bus.subscribe(last_seq=0)
+    first = await asyncio.wait_for(q.get(), 1)
+    assert first["type"] == "bus.gap"
+    assert first["data"]["dropped"] == 7
+    rest = [await asyncio.wait_for(q.get(), 1) for _ in range(3)]
+    assert [e["data"]["i"] for e in rest] == [7, 8, 9]
+    all_seqs = [first["seq"], *[e["seq"] for e in rest]]
+    assert all_seqs == sorted(all_seqs)  # strictly ordered
+    assert all_seqs[0] < rest[0]["seq"]
+    bus.unsubscribe(cid)
