@@ -92,6 +92,30 @@ async def test_a_trade_request_is_refused_aloud_and_not_routed():
     task.cancel()
 
 
+async def test_capture_verb_actually_appends_to_the_daily_inbox(tmp_path, monkeypatch):
+    # The day-one regression: "remember/note that ..." must WRITE, not stub.
+    monkeypatch.setenv("JARVIS_VAULT", str(tmp_path))
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=confirmed_registry("soccer")))
+    await asyncio.sleep(0)
+    fut = asyncio.ensure_future(_drain(bus, "router.command"))
+    bus.publish("command.received", {"text": "note that Dr. Kong wants the HRV protocol by Friday"})
+    ev = await fut
+    assert ev["data"]["verb"] == "capture"
+    for _ in range(100):                       # wait for the off-loop append
+        daily = list((tmp_path / "Daily").glob("*.md"))
+        if daily and "Noted, sir." in spk.spoke:
+            break
+        await asyncio.sleep(0.01)
+    assert len(daily) == 1
+    assert "Dr. Kong wants the HRV protocol by Friday" in daily[0].read_text(encoding="utf-8")
+    assert "Noted, sir." in spk.spoke
+    assert butler.asked == []                  # the model was never consulted
+    task.cancel()
+
+
 async def test_the_brain_survives_a_router_explosion():
     class BoomRouter(Router):
         def parse(self, spoken, registry): raise RuntimeError("router broke")

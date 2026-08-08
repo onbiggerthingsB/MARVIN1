@@ -30,6 +30,11 @@ _YES = re.compile(
     r"|that'?s\s+(?:it|right|correct)\b"
     r"|(?:right|correct)\s*[.!?]*\s*$)", re.I)
 _NO = re.compile(r"^\s*(?:no|nope|skip|not\s+(?:that|it)|wrong)\b", re.I)
+# A negation ANYWHERE in the utterance disqualifies a yes. Spoken rejections
+# very often open affirmatively — "Yeah, no, that's not right", "yes, but not
+# that one" — and _YES anchors on that opener, so prefix order alone cannot
+# save us. Confirmation is consent; it must never ride on the first word.
+_NEGATION = re.compile(r"\b(?:no|nope|not|don'?t|wrong|isn'?t)\b", re.I)
 
 
 class Onboarding:
@@ -79,10 +84,10 @@ class Onboarding:
         asked, text = self._asking, (spoken or "").strip()
         outcome = "ignored"
 
-        if _YES.match(text):
-            self._confirm(asked)
-            outcome = "confirmed"
-        elif _NO.match(text):
+        # Negation is evaluated BEFORE affirmation: when both readings are
+        # available, the rejecting one must win — a wrong "rejected" costs one
+        # re-ask, a wrong "confirmed" hands over a repo (maybe the finance one).
+        if _NO.match(text):
             m = _CORRECTION.match(text)
             corrected = (m.group("name").strip() if m else "")
             # A valid correction needs a real name: at least one word character,
@@ -99,6 +104,16 @@ class Onboarding:
             else:
                 self._rejected.add(asked.path)
                 outcome = "rejected"
+        elif _YES.match(text):
+            if _NEGATION.search(text):
+                # "Yeah, no, that's not right" / "yes, but not that one":
+                # an affirmative opener with a negation anywhere in it is a
+                # rejection, never a confirmation.
+                self._rejected.add(asked.path)
+                outcome = "rejected"
+            else:
+                self._confirm(asked)
+                outcome = "confirmed"
 
         if outcome != "ignored":
             self.registry.save(self.path)

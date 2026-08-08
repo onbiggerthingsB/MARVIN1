@@ -63,6 +63,16 @@ async def test_spoken_rejections_never_confirm(tmp_path, said):
     assert not any(p.confirmed for p in r.projects)      # nothing confirmed, ever
 
 
+@pytest.mark.parametrize("said", [
+    "Yeah, no, that's not right", "yeah no", "yes, but not that one", "sure, no"])
+async def test_affirmative_prefixed_negations_never_confirm(tmp_path, said):
+    ob, r = seeded(tmp_path)
+    await ob.ask_next()
+    outcome = await ob.handle_reply(said)
+    assert outcome != "confirmed"
+    assert not any(p.confirmed for p in r.projects)
+
+
 async def test_mutation_lands_on_the_exact_path_asked_about(tmp_path):
     r = Registry()
     r.merge_candidates([Candidate(path="/one/jarvis", name="jarvis", sources=["a"]),

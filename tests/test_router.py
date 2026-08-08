@@ -45,6 +45,13 @@ def test_a_question_is_not_a_command_and_falls_through():
     assert Router().parse("where did I leave the Tibet study?", reg("soccer")) is None
 
 
+def test_status_questions_fall_through_to_the_butler():
+    # No fleet exists yet, and "what's going on..." is a natural question the
+    # butler used to answer. Part 2 restores the status verb with a real fleet.
+    assert Router().parse("what's going on with the fleet?", reg("soccer")) is None
+    assert Router().parse("what is running right now?", reg("soccer")) is None
+
+
 def test_unknown_project_does_not_become_a_spawn():
     c = Router().parse("start work in nonexistent: do a thing", reg("soccer"))
     assert c is None      # never spawn into a repo Keke has not confirmed

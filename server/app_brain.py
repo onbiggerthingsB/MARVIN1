@@ -6,6 +6,8 @@ import time
 
 from server.butler import ButlerUnavailable
 from server.finance import TRADE_REFUSAL, find_finance_project, portfolio_brief
+from server.vault_paths import vault_root_from_env
+from server.vault_write import vault_capture
 
 FALLBACK_LINE = "Sorry sir, I couldn't reach my brain just now."
 UNCLEAR_LINE = "Sorry sir, I didn't get a clean answer that time — it's on screen."
@@ -255,42 +257,68 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                 # "none": not an approval answer — fall through.
 
                 if command is not None:
-                    bus.publish("router.command", {
-                        "verb": command.verb, "project": command.project,
-                        "argument": command.argument,
-                        "needs_disambiguation": command.needs_disambiguation})
-                    if command.verb == "refuse_trade":
-                        await _speak(TRADE_REFUSAL)
-                    elif command.needs_disambiguation:
-                        # map(str, ... or []) because this join is an argument
-                        # expression evaluated BEFORE _speak's guard is entered;
-                        # a non-string element would raise out of the loop.
-                        await _speak("Which one, sir? "
-                                     + " or ".join(map(str, command.needs_disambiguation or []))
-                                     + ".")
-                    elif command.verb == "portfolio":
-                        # The whole finance path — project lookup, the brief
-                        # await, and every dict read — is guarded: a raise on
-                        # any of it must cost this turn, never the loop. The
-                        # dict reads use .get() so a shape change in the brief
-                        # cannot raise either.
-                        try:
-                            brief = await portfolio_brief(find_finance_project(registry))
-                            brief = brief or {}
-                            bus.publish("finance.brief", {
-                                "rows": brief.get("rows", []),
-                                "source": brief.get("source"),
-                                "as_of": brief.get("as_of"),
-                                "caveat": brief.get("caveat", "")})
-                            spoken = brief.get("spoken") or UNCLEAR_LINE
-                        except Exception as e:  # noqa: BLE001 — a finance fault must never kill the brain
-                            bus.publish("butler.error",
-                                        {"reason": f"portfolio brief failed: {_reason(e)}"})
-                            spoken = "I couldn't read your stock system just now, sir."
-                        await _speak(spoken)
-                    else:
-                        # Fleet verbs (spawn/steer/stop/pull_up) land in M3 Part 2.
-                        await _speak("Understood, sir — I can't run that yet.")
+                    # ONE guard around the whole dispatch: every read of
+                    # command.verb/.project/.argument and the iteration of
+                    # needs_disambiguation below trusts the Command contract,
+                    # and the same contract-violating-return class already bit
+                    # resolve_approval. A malformed Command must cost this
+                    # turn, never the loop.
+                    try:
+                        bus.publish("router.command", {
+                            "verb": command.verb, "project": command.project,
+                            "argument": command.argument,
+                            "needs_disambiguation": command.needs_disambiguation})
+                        if command.verb == "refuse_trade":
+                            await _speak(TRADE_REFUSAL)
+                        elif command.needs_disambiguation:
+                            # map(str, ... or []) because this join is an argument
+                            # expression evaluated BEFORE _speak's guard is entered;
+                            # a non-string element would raise out of the loop.
+                            await _speak("Which one, sir? "
+                                         + " or ".join(map(str, command.needs_disambiguation or []))
+                                         + ".")
+                        elif command.verb == "portfolio":
+                            # The whole finance path — project lookup, the brief
+                            # await, and every dict read — is guarded: a raise on
+                            # any of it must cost this turn, never the loop. The
+                            # dict reads use .get() so a shape change in the brief
+                            # cannot raise either.
+                            try:
+                                brief = await portfolio_brief(find_finance_project(registry))
+                                brief = brief or {}
+                                bus.publish("finance.brief", {
+                                    "rows": brief.get("rows", []),
+                                    "source": brief.get("source"),
+                                    "as_of": brief.get("as_of"),
+                                    "caveat": brief.get("caveat", "")})
+                                spoken = brief.get("spoken") or UNCLEAR_LINE
+                            except Exception as e:  # noqa: BLE001 — a finance fault must never kill the brain
+                                bus.publish("butler.error",
+                                            {"reason": f"portfolio brief failed: {_reason(e)}"})
+                                spoken = "I couldn't read your stock system just now, sir."
+                            await _speak(spoken)
+                        elif command.verb == "capture":
+                            # Regression fix: before the router existed, "note/
+                            # remember that ..." reached the butler, whose
+                            # vault_capture tool did the append. The verb now
+                            # short-circuits the model, so the server must run the
+                            # (append-only, path-firewalled, off-loop) capture
+                            # itself rather than stubbing a working feature.
+                            try:
+                                await vault_capture(command.argument or "",
+                                                    vault_root_from_env())
+                                await _speak("Noted, sir.")
+                            except Exception as e:  # noqa: BLE001 — a capture fault must never kill the brain
+                                bus.publish("butler.error",
+                                            {"reason": f"capture failed: {_reason(e)}"})
+                                await _speak("I couldn't save that note, sir.")
+                        else:
+                            # Fleet verbs (spawn/steer/stop/pull_up) land in M3 Part 2.
+                            await _speak("Understood, sir — I can't run that yet.")
+                    except Exception as e:  # noqa: BLE001 — a malformed Command must never kill the brain
+                        bus.publish("butler.error",
+                                    {"reason": f"command handling failed: {_reason(e)}"})
+                        await _speak("Sorry sir, that command failed.")
                     continue
 
                 try:

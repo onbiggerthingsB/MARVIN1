@@ -45,7 +45,24 @@ def test_load_rejects_a_future_schema(tmp_path):
     f = tmp_path / "projects.json"
     f.write_text(json.dumps({"schema_version": 99, "projects": []}), encoding="utf-8")
     with pytest.raises(ValueError):
-        Registry.load(f)
+        Registry.load_strict(f)
+
+
+def test_load_quarantines_a_corrupt_file_instead_of_destroying_it(tmp_path):
+    f = tmp_path / "projects.json"
+    f.write_text("{not json", encoding="utf-8")
+    r = Registry.load(f)
+    assert r.projects == []
+    quarantined = list(tmp_path.glob("projects.json.corrupt-*"))
+    assert len(quarantined) == 1                 # the human's data was preserved
+    assert quarantined[0].read_text(encoding="utf-8") == "{not json"
+
+
+def test_load_quarantines_a_future_schema_rather_than_refusing_to_boot(tmp_path):
+    f = tmp_path / "projects.json"
+    f.write_text(json.dumps({"schema_version": 99, "projects": []}), encoding="utf-8")
+    assert Registry.load(f).projects == []
+    assert list(tmp_path.glob("projects.json.corrupt-*"))
 
 
 def test_load_missing_file_gives_empty_registry(tmp_path):

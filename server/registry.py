@@ -5,6 +5,7 @@ from __future__ import annotations
 import difflib
 import json
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -44,12 +45,39 @@ class Registry:
     # ---------- persistence ----------
     @classmethod
     def load(cls, path: Path) -> "Registry":
+        """Quarantine-and-continue load. This is the boot path.
+
+        A file that exists but cannot be used (unparseable, wrong shape, or a
+        rejected schema version) is renamed aside to `<path>.corrupt-<unix_ts>`
+        and an empty registry is returned. One policy, two failures fixed:
+        silently returning empty lets the next save() PERMANENTLY overwrite
+        every confirmation, alias and mishearing with no signal, and raising
+        refuses to boot the whole server — quarantining does neither. The
+        human's file survives on disk for repair; callers who want the raise
+        use load_strict()."""
+        path = Path(path)
         try:
-            raw = json.loads(Path(path).read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return cls.load_strict(path)
+        except Exception:  # noqa: BLE001 — any unusable file is quarantined, never destroyed
+            if path.exists():
+                quarantined = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+                try:
+                    path.rename(quarantined)
+                except OSError:
+                    pass  # cannot rename (permissions?) — still boot empty
             return cls()
+
+    @classmethod
+    def load_strict(cls, path: Path) -> "Registry":
+        """Parse `path` or raise. A missing file is an empty registry; an
+        existing file that cannot be used raises (ValueError for shape/schema,
+        the underlying error for I/O and JSON faults)."""
+        path = Path(path)
+        if not path.exists():
+            return cls()
+        raw = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
-            return cls()  # valid JSON, wrong shape (null / list / string)
+            raise ValueError(f"wrong shape: expected a JSON object, got {type(raw).__name__}")
         version = raw.get("schema_version")
         if version is None or version > SCHEMA_VERSION:
             raise ValueError(f"unsupported schema_version: {version}")

@@ -20,6 +20,8 @@ _STEER = re.compile(r"^\s*tell\s+(?P<project>.+?)\s+to\s+(?P<task>.+)$", re.I)
 _PULL_UP = re.compile(r"^\s*(?:pull\s+up|show\s+me|open)\s+(?P<project>.+?)\s*$", re.I)
 _STOP = re.compile(r"^\s*(?:stop|halt|cancel|kill)\s+(?P<project>.+?)\s*$", re.I)
 _CAPTURE = re.compile(r"^\s*(?:note|capture|remember)\s+(?:that\s+)?(?P<text>.+)$", re.I)
+# Unused until Part 2 restores the status verb: with no fleet to report yet,
+# "what's going on..." must fall through to the butler, not be intercepted.
 _STATUS = re.compile(r"^\s*(?:what'?s|what is)\s+(?:running|the fleet|going on)\b.*$", re.I)
 _PORTFOLIO = re.compile(
     r"\b(?:the\s+)?(?:picks|portfolio|positions|holdings)\b|"
@@ -118,8 +120,6 @@ class Router:
                     return None
                 return Command(verb=verb, project=name, needs_disambiguation=ambiguous)
 
-        if _STATUS.match(text):
-            return Command(verb="status")
         if _PORTFOLIO.search(text):
             return Command(verb="portfolio")
 
