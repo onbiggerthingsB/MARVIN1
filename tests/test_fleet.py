@@ -9,8 +9,8 @@ import pytest
 from claude_agent_sdk import CanUseToolShadowedWarning
 
 from server.bus import EventBus
-from server.fleet import (APPROVAL_WAIT_S, Fleet, Worker, _full_args,
-                          _named_paths, _risk_note, _short_args)
+from server.fleet import (APPROVAL_WAIT_S, Fleet, Worker, _FleetLogWriter,
+                          _full_args, _named_paths, _risk_note, _short_args)
 from server.fleet_log import FleetLog
 from server.fleet_state import (ACTIVE_TURN, CLOSED, IDLE_AT_PROMPT, UNKNOWN,
                                 WAITING_PERMISSION)
@@ -1130,6 +1130,126 @@ async def test_a_worker_free_session_does_not_erase_the_last_one(tmp_path,
     assert quiet._log.path.stat().st_size == 0
     await quiet.close_all()
     assert rotated.read_text(encoding="utf-8") == history
+
+
+# ---------- the queue drain must not eat what it popped ----------
+def _drain_events(q):
+    out = []
+    while not q.empty():
+        ev = q.get_nowait()
+        if ev:
+            out.append(ev)
+    return out
+
+
+async def test_a_transient_refusal_puts_the_queued_item_back(tmp_path,
+                                                             monkeypatch):
+    """_admit_next POPS before it spawns, and _spawn's three pre-flight
+    refusals (forbidden root, proxy_problem, empty task) return before the
+    queue logic — so the popped project was silently dropped. A missing proxy
+    is TRANSIENT: the item goes back on the FRONT, and nothing is announced,
+    because it is still queued and the 5-second tick would otherwise repeat the
+    same sentence forever."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    path1 = repo(tmp_path, "soccer")
+    await fleet.spawn("soccer", path1, "task one")
+    await fleet.spawn("alethic", repo(tmp_path, "alethic"), "task two")
+    assert len(fleet.queue) == 1
+    cid, q = bus.subscribe()
+    try:
+        monkeypatch.delenv("JARVIS_SKIP_PROXY_CHECK", raising=False)
+        for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+            monkeypatch.delenv(var, raising=False)
+        await fleet.stop(path1)                       # frees the slot, drains
+        assert [item[0] for item in fleet.queue] == ["alethic"]   # NOT dropped
+        spoken = [ev["data"]["text"] for ev in _drain_events(q)
+                  if ev["type"] == "fleet.spoken"]
+        assert spoken == []                           # still queued, no news
+    finally:
+        bus.unsubscribe(cid)
+        await cleanup(fleet)
+
+
+async def test_a_permanently_refused_queue_item_is_dropped_and_announced(
+        tmp_path, monkeypatch):
+    """The mirror: a refusal that can never succeed must NOT be requeued, or
+    the poisoned head shadows the whole queue and re-refuses on every tick. It
+    leaves the queue, and Keke is told — in one sentence that does not staple
+    two vocatives together."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    (tmp_path / "vault").mkdir(exist_ok=True)
+    fleet.queue.append(("notes", str(tmp_path / "vault"), "do work"))
+    cid, q = bus.subscribe()
+    try:
+        await fleet._admit_next()
+        assert list(fleet.queue) == []                # gone, not looping
+        spoken = [ev["data"]["text"] for ev in _drain_events(q)
+                  if ev["type"] == "fleet.spoken"]
+        assert len(spoken) == 1
+        assert "don't run workers in that directory" in spoken[0]
+        assert spoken[0].count("sir") == 1            # not "…, sir: …, sir: …"
+    finally:
+        bus.unsubscribe(cid)
+        await cleanup(fleet)
+
+
+async def test_the_queue_announcement_reads_as_one_sentence(tmp_path,
+                                                            monkeypatch):
+    """"Next in the queue, sir: I couldn't prepare a worktree for X, sir: …"
+    stapled two vocatives together. Success has to read cleanly too."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    path1 = repo(tmp_path, "soccer")
+    await fleet.spawn("soccer", path1, "task one")
+    await fleet.spawn("alethic", repo(tmp_path, "alethic"), "task two")
+    cid, q = bus.subscribe()
+    try:
+        await fleet.stop(path1)
+        spoken = [ev["data"]["text"] for ev in _drain_events(q)
+                  if ev["type"] == "fleet.spoken"]
+        assert len(spoken) == 1
+        assert spoken[0].startswith("From the queue: On it, sir")
+        assert spoken[0].count("sir") == 1
+    finally:
+        bus.unsubscribe(cid)
+        await cleanup(fleet)
+
+
+# ---------- durability: the flush and the compaction ----------
+async def test_a_cancelled_drain_does_not_abort_the_flush(tmp_path):
+    """contextlib.suppress(Exception) does NOT catch CancelledError, so one
+    cancelled drain task raised straight out of flush() and took close_all()'s
+    compaction with it — no snapshot, and no ghosts on the next boot."""
+    log = FleetLog(tmp_path / "fleet.jsonl")
+    writer = _FleetLogWriter(log, EventBus())
+    writer.append("spawned", {"worker": "w1", "state": "IDLE_AT_PROMPT"})
+    assert writer._task is not None
+    writer._task.cancel()                             # the shutdown race
+    await asyncio.wait_for(writer.flush(), 2)         # used to raise
+    records, torn = log.replay()
+    assert [r["kind"] for r in records] == ["spawned"]  # written by the retry
+    assert torn is False
+
+
+def test_the_snapshot_is_durable_before_the_log_rotates(tmp_path):
+    """Two renames, one fsync. A crash between them left the log rotated aside
+    with the new snapshot not on the platter — and recover() then reports
+    nothing, with no torn flag, because both files are individually
+    well-formed."""
+    import server.fleet_log as fleet_log
+    log = FleetLog(tmp_path / "fleet.jsonl")
+    log.append("spawned", {"worker": "w1", "state": "IDLE_AT_PROMPT"})
+    snap = log.path.with_suffix(".snap")
+    rotated = log.path.with_suffix(".jsonl.1")
+    seen = []
+    real = fleet_log._fsync_dir
+    fleet_log._fsync_dir = lambda p: seen.append((snap.exists(),
+                                                  rotated.exists()))
+    try:
+        log.snapshot({"workers": {}})
+    finally:
+        fleet_log._fsync_dir = real
+    assert seen[0] == (True, False)     # snapshot durable BEFORE the rotation
+    assert seen[-1] == (True, True)     # and the rotation durable after it
 
 
 # ---------- the spoken readback IS the containment (spec §5) ----------

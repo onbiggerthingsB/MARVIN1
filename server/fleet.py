@@ -334,11 +334,21 @@ class _FleetLogWriter:
 
     def _enqueue(self, kind, payload: dict) -> None:
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             self._write_now(kind, payload)      # no loop — blocking is fine
             return
         self._backlog.append((kind, payload))
+        self._ensure_drain()
+
+    def _ensure_drain(self) -> None:
+        """Start the single drain task if there is work and none is running."""
+        if not self._backlog:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
         if self._task is None or self._task.done():
             self._task = loop.create_task(self._drain(),
                                           name="fleet-log-writer")
@@ -366,9 +376,30 @@ class _FleetLogWriter:
                                   {"reason": f"event log failed: {e}"})
 
     async def flush(self) -> None:
-        while self._task is not None and not self._task.done():
-            with contextlib.suppress(Exception):
-                await self._task
+        """Wait out the drain — and SURVIVE a cancelled one.
+
+        contextlib.suppress(Exception) does not catch CancelledError, so a
+        drain task cancelled by the shutdown that is calling us raised straight
+        out of here and aborted close_all() before its compaction: no snapshot,
+        and therefore no ghosts on the next boot. A cancelled drain leaves its
+        records in the backlog, so start a replacement and keep going.
+
+        OUR OWN cancellation is never swallowed: `task.cancelled()` tells the
+        two apart, and the attempt count bounds the loop so a pathologically
+        cancelled drain cannot spin here forever."""
+        for _ in range(3):
+            task = self._task
+            if task is not None and not task.done():
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    if not task.cancelled():
+                        raise           # this coroutine was cancelled, not it
+                except Exception:  # noqa: BLE001 — _drain already reported it
+                    pass
+            if not self._backlog:
+                return
+            self._ensure_drain()
 
 
 class Worker:
@@ -795,6 +826,19 @@ class Fleet:
     async def _spawn(self, project: str, path: str, task: str,
                      requeue_front: bool) -> str:
         try:
+            # These three pre-flight refusals return BEFORE the queue logic
+            # below, and _admit_next has already POPPED this item — so each of
+            # them used to drop a queued project on the floor. They are not the
+            # same kind of failure, and they are not treated the same:
+            #
+            #   * a forbidden root and an empty task are PERMANENT. Requeueing
+            #     them would poison the head of the queue, which _admit_next
+            #     pops on every 5-second tick, shadowing every item behind it
+            #     forever. They leave the queue, and _admit_next says so.
+            #   * a missing proxy is TRANSIENT — it is one exported variable
+            #     away from working — so the item goes back on the FRONT and
+            #     waits. _admit_next stays silent about a requeue, or the tick
+            #     would speak the same sentence every 5 seconds.
             resolved = str(Path(path).resolve())
             for bad in self.forbidden:
                 if resolved == bad or resolved.startswith(bad + "/"):
@@ -802,6 +846,8 @@ class Fleet:
                     return "I don't run workers in that directory, sir."
             problem = proxy_problem()
             if problem:
+                if requeue_front:
+                    self.queue.appendleft((project, path, task))
                 return f"I can't spawn safely, sir: {problem}."
             if not (task or "").strip():
                 return "Spawn it to do what, sir?"
@@ -1173,10 +1219,20 @@ class Fleet:
         if not self.queue or (len(self.live) + self._pending_spawns
                               >= self.max_workers):
             return
-        project, path, task = self.queue.popleft()
+        item = self.queue.popleft()
+        project, path, task = item
         spoken = await self._spawn(project, path, task, requeue_front=True)
+        if self.queue and self.queue[0] == item:
+            # It went straight back on the front — capacity, or a transient
+            # refusal like a missing proxy. It is still queued and Keke already
+            # knows that; announcing it here would repeat the same sentence on
+            # every 5-second tick for as long as the condition lasts.
+            return
+        # "Next in the queue, sir: I couldn't prepare a worktree for X, sir: …"
+        # stapled two vocatives together. The fleet's own sentence already ends
+        # in one, so this prefix supplies only the context.
         self._bus.publish("fleet.spoken",
-                          {"text": f"Next in the queue, sir: {spoken}"})
+                          {"text": f"From the queue: {spoken}"})
 
     # ---------- reporting ----------
     def status_line(self) -> str:

@@ -121,11 +121,16 @@ class FleetLog:
             f.flush()
             os.fsync(f.fileno())
         tmp.replace(snap_path)
+        # BETWEEN the two renames, not merely after them. A rename is durable
+        # only once the directory entry itself is on the platter, and these two
+        # are ordered for a reason: a crash after the ROTATION but before the
+        # SNAPSHOT reached disk leaves the log rotated aside and the snapshot
+        # gone — and each file that remains is individually well-formed, so
+        # recover() reports nothing at all and has no torn flag to admit it.
+        _fsync_dir(self.path.parent)
         if self.path.exists():
             self.path.replace(self.path.with_suffix(".jsonl.1"))
-        # A rename is only durable once the directory entry itself is on the
-        # platter. Without this, power loss can keep the log rotated aside yet
-        # lose the new snapshot — a silent state regression with no torn flag.
+        # And again for the rotation itself, for the same reason.
         _fsync_dir(self.path.parent)
 
     # ---------- reading ----------
