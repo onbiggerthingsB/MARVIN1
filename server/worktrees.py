@@ -25,6 +25,7 @@ The hook settings go into the WORKTREE's .claude/settings.local.json:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -61,7 +62,21 @@ async def _git(repo: Path, *args: str) -> str:
         "git", "-C", str(repo), *args,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         stdin=asyncio.subprocess.DEVNULL)
-    out, err = await asyncio.wait_for(proc.communicate(), GIT_TIMEOUT_S)
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), GIT_TIMEOUT_S)
+    except BaseException:
+        # Cancelling the AWAIT does not cancel the PROCESS. Every worktree
+        # verb the brain dispatches is wrapped in its own asyncio.wait_for, so
+        # a timeout there abandons this coroutine while git keeps running —
+        # the removal lands seconds after JARVIS has already said "that
+        # command failed", which is the same class of lie as claiming a
+        # removal that never happened. Kill it, then reap it: an unreaped
+        # child holds its pipes open for the life of the server.
+        with contextlib.suppress(ProcessLookupError, OSError):
+            proc.kill()
+        with contextlib.suppress(BaseException):
+            await proc.wait()
+        raise
     if proc.returncode != 0:
         raise WorktreeError(err.decode(errors="replace").strip()
                             or f"git {args[0]} failed")

@@ -149,6 +149,39 @@ async def test_remove_worktree_refuses_a_relative_path(tmp_path, monkeypatch):
                            cwd=repo, check=False, capture_output=True)
 
 
+async def test_a_cancelled_git_call_kills_the_subprocess(tmp_path, monkeypatch):
+    """Cancelling the await must cancel the WORK, not just stop waiting on it.
+
+    app_brain wraps every worktree verb in asyncio.wait_for; on timeout it
+    cancels this coroutine and speaks "that command failed" — while git, a
+    separate process, carries the removal through anyway. A spoken failure
+    followed by the removal succeeding is a lie the same size as a spoken
+    success that never happened."""
+    import asyncio as aio
+
+    from server import worktrees as mod
+    repo = make_repo(tmp_path)
+    # An alias, so what blocks is a real git process and not a fake.
+    subprocess.run(["git", "config", "alias.snooze", "!sleep 5"], cwd=repo,
+                   check=True)
+    procs = []
+    real = aio.create_subprocess_exec
+
+    async def spy(*a, **kw):
+        proc = await real(*a, **kw)
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(aio, "create_subprocess_exec", spy)
+    task = aio.create_task(mod._git(repo, "snooze"))
+    await aio.sleep(0.4)
+    assert procs and procs[0].returncode is None      # really running
+    task.cancel()
+    with pytest.raises(aio.CancelledError):
+        await task
+    assert procs[0].returncode is not None            # killed, and reaped
+
+
 def test_hook_settings_cover_all_seven_events(tmp_path):
     out = write_hook_settings(tmp_path, port=7777, bearer="tok123")
     body = json.loads(out.read_text(encoding="utf-8"))
