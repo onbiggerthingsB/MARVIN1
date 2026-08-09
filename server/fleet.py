@@ -76,14 +76,31 @@ def _risk_note(tool: str, args) -> str:
 
 async def _default_open_terminal(cmd: str) -> None:
     """Open Terminal.app running `cmd`. json.dumps produces a double-quoted
-    escaped literal that AppleScript accepts (same \" and \\ escapes; the
-    command never contains newlines)."""
-    script = f'tell application "Terminal" to do script {json.dumps(cmd)}'
+    literal whose \" and \\ escapes AppleScript reads the same way, and the
+    command never contains newlines.
+
+    ensure_ascii=False is load-bearing: with the default, a non-ASCII worktree
+    path (a project named in Chinese, an accent in a folder) is emitted as
+    \\uXXXX, which AppleScript does NOT decode — it would `cd` into a literal
+    backslash-u path, fail, and still exit 0, so JARVIS would confidently say
+    "yours in the terminal" over a shell sitting in the wrong directory.
+
+    The child is reaped on every exit: a hung osascript (a modal dialog, a
+    wedged Terminal) outlives the wait_for otherwise, leaving an orphan
+    process holding the window for the rest of the session."""
+    script = f'tell application "Terminal" to do script {json.dumps(cmd, ensure_ascii=False)}'
     proc = await asyncio.create_subprocess_exec(
         "osascript", "-e", script,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         stdin=asyncio.subprocess.DEVNULL)
-    await asyncio.wait_for(proc.wait(), 10)
+    try:
+        await asyncio.wait_for(proc.wait(), 10)
+    finally:
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
     if proc.returncode != 0:
         raise RuntimeError(f"osascript exited {proc.returncode}")
 
@@ -191,6 +208,13 @@ class Worker:
         self.transcript: deque[dict] = deque(maxlen=TRANSCRIPT_KEEP)
         self.locked = False               # handoff lockout: no more input
         self.handoff_in_flight = False    # a lockout sequence is mid-flight
+        # The symmetric partner of handoff_in_flight, set by _stop_worker (so
+        # it covers stop() AND _spawn's deferred stop). Both flags are pure
+        # REFUSALS — neither side ever waits on the other, so they cannot
+        # deadlock — and both are reserved synchronously, with no await
+        # between the check and the set, so exactly one sequence can own a
+        # worker's teardown at a time.
+        self.stop_in_flight = False
         self.stop_requested = False       # a stop that landed mid-start, deferred
         # Set by _spawn around its own await of start(), cleared the moment
         # that await returns — the ONLY thing that may mean "starting".
@@ -736,7 +760,14 @@ class Fleet:
     async def _stop_worker(self, w: Worker) -> bool:
         """Lockout → interrupt → disconnect → session_end, shared by stop()
         and _spawn's deferred stop. False = dirty stop, worker marked lost
-        (UNKNOWN still counts live, so admission stays blocked)."""
+        (UNKNOWN still counts live, so admission stays blocked).
+
+        Reserves stop_in_flight SYNCHRONOUSLY, before the first await: this
+        suspends for seconds inside the interrupt wait and only applies
+        session_end afterwards, so without the reservation a handoff clicked
+        into that window passes every one of its gates and one of the two
+        sequences ends up lying about the other."""
+        w.stop_in_flight = True
         try:
             await asyncio.wait_for(w.shutdown(interrupt_first=True),
                                    STOP_TIMEOUT_S)
@@ -745,6 +776,8 @@ class Fleet:
         except Exception as e:  # noqa: BLE001 — a dirty stop is reported, not raised
             w._apply("lost", {"reason": f"stop failed: {e}"})
             return False
+        finally:
+            w.stop_in_flight = False
 
     async def handoff(self, path: str) -> dict:
         """Spec §5 lockout: stop input → reject pending approvals → interrupt
@@ -774,12 +807,27 @@ class Fleet:
             # ONE session — two drivers, exactly what this method prevents.
             return {"ok": False,
                     "spoken": f"I'm already handing {w.project} over, sir."}
-        if w.starting:
-            # Early registration makes a half-started worker visible here, and
-            # the SessionStart hook can already have handed us a session id
-            # while _spawn is still awaiting start(). Detaching under that
-            # await would rebuild a consumer and pump on a disconnected client
-            # and end in a spawn-failure sentence contradicting this one.
+        if w.stop_in_flight:
+            # The mirror of the branch above, and of stop()'s deferral to
+            # handoff_in_flight. A stop is already seconds deep in its own
+            # teardown — suspended inside the interrupt wait, before it applies
+            # session_end — so every gate here still reads live. Going on ends
+            # in one of two lies: `detached` bounces off the CLOSED the stop
+            # lands (a terminal over a tile reading CLOSED), or the stop's
+            # session_end — the one event allowed off DETACHED — collapses the
+            # just-detached worker back to CLOSED. Refuse; the stop finishes in
+            # seconds and the CLOSED gate answers the next press honestly.
+            return {"ok": False,
+                    "spoken": (f"I'm stopping {w.project} right now, sir — "
+                               f"one moment.")}
+        if w.spawn_in_flight:
+            # The WHOLE spawn, not the `starting` property: that is False for
+            # the second half of start() (consumer and pump are built, then
+            # client.query(task_text) is awaited), where the tile and its
+            # button already exist and the SessionStart hook may already have
+            # handed us a session id. Detaching in that window opens a terminal
+            # and then lets _spawn resume into a spawn-failure or
+            # stopped-while-starting sentence that flatly contradicts it.
             return {"ok": False,
                     "spoken": (f"{w.project} is still starting, sir — "
                                f"give it a moment.")}
@@ -799,6 +847,18 @@ class Fleet:
                 for t in (w.consumer, w.pump):
                     if t is not None and not t.done():
                         raise RuntimeError("worker tasks still running")
+                # The transition is a STEP, verified like every other one. The
+                # CLOSED gate above protects only this sequence's ENTRY, and
+                # WorkerStateMachine.apply BOUNCES every event but session_end
+                # off CLOSED *without raising*: a concurrent stop, or the CLI's
+                # own SessionEnd hook fired by the disconnect() we just did,
+                # can land inside these awaits. Unverified, the lines below
+                # would publish the resume command, open a terminal and say
+                # "yours in the terminal" over a worker recorded CLOSED.
+                w._apply("detached", {"session_id": w.session_id})
+                if w.machine.base != DETACHED:
+                    raise RuntimeError(
+                        f"the session went {w.machine.base} mid-handoff")
             except Exception as e:  # noqa: BLE001 — a half-dead session must never detach
                 w._apply("lost", {"reason": f"handoff failed: {e}"})
                 # Through the writer, like every other append: it never raises
@@ -807,11 +867,18 @@ class Fleet:
                 self._log_writer.append("handoff_failed",
                                         {"worker": w.id, "path": w.path,
                                          "reason": str(e)})
+                if w.machine.base == CLOSED:
+                    # `lost` bounced too: the session really did end under the
+                    # lockout. "Marked unknown" would be the same lie pointing
+                    # the other way, over a tile that reads CLOSED.
+                    return {"ok": False,
+                            "spoken": (f"{w.project}'s session closed while I "
+                                       f"was handing it over, sir — I did not "
+                                       f"open a terminal on it.")}
                 return {"ok": False,
                         "spoken": (f"The handoff failed, sir — {w.project} is "
                                    f"marked unknown, and I did not open a "
                                    f"terminal on it.")}
-            w._apply("detached", {"session_id": w.session_id})
             cmd = (f"cd {shlex.quote(w.worktree.path)} && "
                    f"claude --resume {shlex.quote(w.session_id)}")
             # Published BEFORE the launch: if osascript hangs or is missing,
@@ -826,6 +893,12 @@ class Fleet:
                 spoken = (f"{w.project} is detached, sir — I couldn't open a "
                           f"terminal, so run the command on screen to pick "
                           f"it up.")
+            # Cleared BEFORE the drain, not by the finally after it:
+            # _admit_next spawns the next queued worker under SPAWN_TIMEOUT_S,
+            # and for that whole minute steer() — which checks this flag before
+            # the DETACHED branch — would say "I'm handing X over right now"
+            # about a worker that is already detached with its terminal open.
+            w.handoff_in_flight = False
             await self._admit_next()      # DETACHED freed the slot
             return {"ok": True, "command": cmd, "spoken": spoken}
         finally:

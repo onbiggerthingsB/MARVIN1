@@ -318,21 +318,31 @@ window.jarvis.onEvent("metrics.turn", (m) => {
 
 // ---- M3 Part 2: fleet tiles / interrupt cards / worker transcript --------
 const fleetTiles = new Map();
+// Nothing can be handed to a terminal from either of these: CLOSED has no
+// session left and DETACHED already has its window.
+const FLEET_FINAL = new Set(["CLOSED", "DETACHED"]);
 function renderFleetTile(d) {
   let tile = fleetTiles.get(d.worker);
   if (!tile) {
     tile = document.createElement("div");
     tile.className = "tile";
-    ["tile-name", "tile-state", "tile-task"].forEach((cls) => {
+    ["tile-name", "tile-state", "tile-task", "tile-resume"].forEach((cls) => {
       const el = document.createElement("div");
       el.className = cls;
       tile.appendChild(el);
     });
     const handoff = document.createElement("button");
+    handoff.className = "tile-open";
     handoff.textContent = "Open in Terminal";
     handoff.addEventListener("click", () => fetch("/handoff", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path: tile.dataset.path }),
+    }).then((r) => {
+      // A refused request RESOLVES — the .catch below only ever sees a network
+      // failure — so without this a 401 from an expired session (or a 400)
+      // produces no feedback at all and the click looks ignored.
+      if (!r.ok) window.jarvis.setStatus(
+        `handoff refused — HTTP ${r.status}; reload the console and retry`);
     }).catch(() => window.jarvis.setStatus(
       "handoff failed to send — try again")));
     tile.appendChild(handoff);
@@ -343,6 +353,12 @@ function renderFleetTile(d) {
   tile.querySelector(".tile-name").textContent = d.project || "?";
   tile.querySelector(".tile-state").textContent = d.state || "?";
   tile.querySelector(".tile-task").textContent = d.task || "";
+  // Tiles are worker-keyed and never removed, but the button posts a PATH —
+  // and the server prefers the non-final worker on that path. So a stale
+  // CLOSED tile sitting beside a live worker on the same repo would hand off
+  // the LIVE one. Hide the button wherever it has nothing of its own to give.
+  tile.querySelector(".tile-open").hidden = FLEET_FINAL.has(d.state);
+  return tile;
 }
 window.jarvis.onEvent("fleet.update", renderFleetTile);
 window.jarvis.onEvent("fleet.message", (d) => {
@@ -359,6 +375,16 @@ window.jarvis.onEvent("fleet.transcript", (d) => {
 });
 window.jarvis.onEvent("fleet.handoff", (d) => {
   window.jarvis.setStatus(`handed off: ${d.command}`);
+  // #status is wiped back to "online — hold to talk" by the tts.done handler,
+  // which fires the moment JARVIS finishes saying "run the command on screen"
+  // — and when osascript failed, that line is the ONLY copy of the command
+  // Keke has. Park it on the worker's own tile, which nothing clears. The
+  // tile already exists (fleet.update for DETACHED is published first, on the
+  // same bus); build one anyway if a reconnect lost it.
+  const tile = fleetTiles.get(d.worker) || renderFleetTile(
+    { worker: d.worker, project: d.project, path: d.path, state: "DETACHED" });
+  // textContent, never innerHTML: this string is a server-built shell command.
+  tile.querySelector(".tile-resume").textContent = d.command || "";
 });
 window.jarvis.onEvent("approval.request", (d) => {
   const card = document.createElement("div");

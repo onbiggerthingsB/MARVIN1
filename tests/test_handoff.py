@@ -1,6 +1,9 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
+from server import fleet as fleet_mod
 from server.fleet_state import CLOSED, DETACHED, QUIET_AFTER_S, UNKNOWN
 from tests.test_app_auth import bootstrap, make_client
 from tests.test_fleet import (FakeClient, ResultMessage, cleanup, make_fleet,
@@ -290,6 +293,219 @@ async def test_handoff_refuses_a_worker_that_is_still_starting(tmp_path, monkeyp
         assert fleet.workers[0].machine.base != DETACHED
     finally:
         await cleanup(fleet)
+
+
+# ---------- the three real interleavings ----------
+async def test_a_stop_already_inside_its_interrupt_refuses_the_handoff(tmp_path, monkeypatch):
+    """stop() defers to handoff_in_flight, but nothing was symmetric: stop
+    suspends inside w.shutdown's `await interrupt()` BEFORE it applies
+    session_end, and it runs on the brain task while POST /handoff runs on the
+    HTTP task. A click landing in that multi-second window passed every handoff
+    gate — base still live, handoff_in_flight False, session id set — and then
+    either ordering lies: `detached` bounces off the CLOSED the stop lands, or
+    the stop collapses the freshly DETACHED worker back to CLOSED."""
+    fleet, bus, router, clients, path, opened = await spawned(tmp_path, monkeypatch)
+
+    async def slow_interrupt():
+        await asyncio.sleep(0.05)             # the CLI takes a moment to interrupt
+        clients[0].interrupted = True
+
+    clients[0].interrupt = slow_interrupt
+    stopping = asyncio.create_task(fleet.stop(path))
+    await asyncio.sleep(0.01)                 # suspended inside the interrupt wait
+    result = await fleet.handoff(path)
+    stopped = await asyncio.wait_for(stopping, 2)
+
+    assert result["ok"] is False and "command" not in result
+    assert "stopping" in result["spoken"].lower()   # not "yours in the terminal"
+    assert opened == []                       # no window on a session being closed
+    assert "Stopped soccer" in stopped        # the stop was never contradicted
+    assert fleet.workers[0].machine.base == CLOSED   # ONE outcome, and the tile says it
+
+
+async def test_a_session_end_between_the_close_and_the_detached_apply_aborts(tmp_path, monkeypatch):
+    """WorkerStateMachine.apply BOUNCES every event but session_end off CLOSED
+    and returns without error. The handoff's own disconnect() kills the CLI, so
+    the CLI's SessionEnd hook can POST while the lockout is still inside that
+    disconnect — and an unverified `detached` then publishes the resume command,
+    opens a terminal and speaks "yours in the terminal" over a worker recorded
+    CLOSED. The transition is a step like any other: verify it landed."""
+    fleet, bus, router, clients, path, opened = await spawned(tmp_path, monkeypatch)
+    w = fleet.workers[0]
+    real_disconnect = clients[0].disconnect
+
+    async def slow_disconnect():
+        await asyncio.sleep(0.05)             # closing the subprocess takes a moment
+        await real_disconnect()
+
+    clients[0].disconnect = slow_disconnect
+    cid, q = bus.subscribe()
+    handing = asyncio.create_task(fleet.handoff(path))
+    await asyncio.sleep(0.01)                 # inside the lockout, mid-disconnect
+    fleet.handle_hook({"hook_event_name": "SessionEnd",
+                       "session_id": "sess-42", "cwd": w.worktree.path})
+    result = await asyncio.wait_for(handing, 2)
+    types = [ev["type"] for ev in _drain(q)]
+    bus.unsubscribe(cid)
+
+    assert result["ok"] is False and "command" not in result
+    assert opened == []                       # never a terminal on a closed session
+    assert w.machine.base == CLOSED           # honest: the CLI really did end
+    assert "fleet.handoff" not in types       # the console never gets the command
+    assert "closed" in result["spoken"].lower()
+
+
+async def test_a_handoff_in_the_query_window_refuses_for_the_whole_spawn(tmp_path, monkeypatch):
+    """`Worker.starting` is False for the SECOND half of the spawn: start()
+    sets consumer and pump and THEN awaits client.query(task_text). The tile and
+    its button already exist (_apply("spawned") published one line earlier) and
+    the SessionStart hook may already have handed us a session id — so a click
+    there cleared the starting gate, detached, opened a terminal, and _spawn
+    then resumed to speak a stop-or-failure sentence contradicting it."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    opened = []
+
+    async def fake_terminal(cmd):
+        opened.append(cmd)
+
+    fleet._open_terminal = fake_terminal
+    path = repo(tmp_path)
+    inner = fleet._client_factory
+
+    def factory(options):
+        c = inner(options)
+        real_query = c.query
+
+        async def query(text):
+            if not c.queries:                 # the spawn's own opening task text
+                await asyncio.sleep(0.05)     # the CLI is still taking it
+            await real_query(text)
+
+        c.query = query
+        return c
+
+    fleet._client_factory = factory
+    try:
+        spawning = asyncio.create_task(fleet.spawn("soccer", path, "task"))
+        await asyncio.sleep(0.02)             # consumer + pump exist; query in flight
+        w = fleet.workers[0]
+        fleet.handle_hook({"hook_event_name": "SessionStart",
+                           "session_id": "sess-early",
+                           "cwd": w.worktree.path})
+        assert w.consumer is not None and not w.starting   # the gap the review named
+        result = await fleet.handoff(path)
+        spoken = await asyncio.wait_for(spawning, 5)
+
+        assert result["ok"] is False and "command" not in result
+        assert "still starting" in result["spoken"]
+        assert opened == []
+        assert spoken.startswith("On it")     # the spawn was untouched
+        assert w.machine.base != DETACHED
+    finally:
+        await cleanup(fleet)
+
+
+async def test_steer_during_the_post_handoff_queue_drain_says_detached(tmp_path, monkeypatch):
+    """handoff_in_flight used to be cleared by a finally that runs AFTER
+    _admit_next() — i.e. after the next queued worker's whole spawn, bounded by
+    SPAWN_TIMEOUT_S. For that window steer() (which checks the flag BEFORE the
+    DETACHED branch) said "I'm handing soccer over right now" about a worker
+    already detached with its terminal open — false, and it invites a retry
+    that is then refused with a different sentence."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    opened = []
+
+    async def fake_terminal(cmd):
+        opened.append(cmd)
+
+    fleet._open_terminal = fake_terminal
+    inner = fleet._client_factory
+
+    def factory(options):
+        c = inner(options)
+        if len(clients) > 1:                  # the QUEUED worker's client
+            real_connect = c.connect
+
+            async def connect():
+                await asyncio.sleep(0.2)      # its spawn takes a while
+                await real_connect()
+
+            c.connect = connect
+        return c
+
+    fleet._client_factory = factory
+    path = repo(tmp_path)
+    try:
+        await fleet.spawn("soccer", path, "task")
+        clients[0].stream.put_nowait(ResultMessage(session_id="sess-42"))
+        await asyncio.sleep(0.05)             # session id captured
+        await fleet.spawn("alethic", repo(tmp_path, "alethic"), "other task")
+        assert len(fleet.queue) == 1          # max_workers=1: it queued
+
+        handing = asyncio.create_task(fleet.handoff(path))
+        await asyncio.sleep(0.05)             # inside _admit_next's slow spawn
+        steered = fleet.steer_path(path, "do more")
+        result = await asyncio.wait_for(handing, 5)
+
+        assert result["ok"] is True and opened == [result["command"]]
+        assert "detached" in steered.lower()  # the truth, from the moment it was
+        assert "handing" not in steered.lower()
+    finally:
+        await cleanup(fleet)
+
+
+# ---------- the default launcher (never launches a real Terminal) ----------
+class _FakeProc:
+    """Stands in for the osascript child. `hangs` makes wait() report the
+    deadline the real wait_for(…, 10) would raise, without spending 10s."""
+
+    def __init__(self, *, hangs=False):
+        self.returncode = None if hangs else 0
+        self.hangs = hangs
+        self.killed = False
+
+    async def wait(self):
+        if self.hangs and not self.killed:
+            raise asyncio.TimeoutError
+        self.returncode = -9 if self.hangs else 0
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+
+
+async def test_the_applescript_literal_keeps_a_non_ascii_path_verbatim(monkeypatch):
+    """AppleScript does not decode \\uXXXX. With json.dumps' default
+    ensure_ascii, one non-ASCII character anywhere in the worktree path turns
+    the whole `cd` into a literal backslash-u string — and osascript STILL
+    exits 0, so JARVIS says "yours in the terminal" over a shell that never
+    left home."""
+    seen = {}
+
+    async def fake_exec(*argv, **kw):
+        seen["argv"] = argv
+        return _FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await fleet_mod._default_open_terminal(
+        "cd /Users/keke/项目/wt && claude --resume s-1")
+    script = seen["argv"][2]
+    assert "项目" in script and "\\u" not in script
+
+
+async def test_a_hung_osascript_is_killed_instead_of_orphaned(monkeypatch):
+    """wait_for cancels the WAIT, never the child: a wedged osascript (a modal
+    dialog, a stuck Terminal) would outlive the handoff and hold its window for
+    the rest of the session."""
+    proc = _FakeProc(hangs=True)
+
+    async def fake_exec(*argv, **kw):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    with pytest.raises(asyncio.TimeoutError):
+        await fleet_mod._default_open_terminal("cd /wt && claude --resume s-1")
+    assert proc.killed and proc.returncode == -9      # reaped, not left behind
 
 
 # ---------- the endpoint (cookie-authed console click) ----------
