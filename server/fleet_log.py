@@ -52,6 +52,13 @@ class FleetLog:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         snap = self.load_snapshot()
         records, torn = self.replay()
+        # The repair below REMOVES the damage, so every later replay() reports
+        # torn=False on a file that was in fact torn when this process opened
+        # it. Recovery must still be able to say so — a restart that quietly
+        # drops the lost tail and reports a clean log is exactly the lie this
+        # module exists to prevent — so the fact is recorded once, here, where
+        # it is still observable.
+        self.torn_on_open = torn
         if torn:
             self._repair(records)
         self._seq = max(int((snap or {}).get("seq", 0)),

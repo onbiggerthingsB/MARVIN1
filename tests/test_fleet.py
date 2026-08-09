@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 import warnings
 from pathlib import Path
@@ -1075,12 +1076,39 @@ async def test_spawn_steer_stop_leaves_an_untorn_ordered_log(tmp_path, monkeypat
     assert "Told soccer" in fleet.steer_path(path, "also lint")
     await asyncio.sleep(0.05)                         # let the pump run
     await fleet.stop(path)
-    await fleet.close_all()                           # flushes the log writer
-    records, torn = fleet._log.replay()
-    assert torn is False
+    await fleet.close_all()                           # flushes, then compacts
+    # close_all compacts (Task 10): the snapshot rotates the whole life aside
+    # to `.jsonl.1` and leaves a fresh, empty log behind. That rotated
+    # generation IS the durable record now, so read it — this test exists to
+    # prove the whole life is on disk, untorn and in order, not to pin which
+    # file holds it.
+    assert fleet._log.replay() == ([], False)         # the post-compaction tail
+    rotated = fleet._log.path.with_suffix(".jsonl.1")
+    records = [json.loads(line) for line in
+               rotated.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert fleet._log.load_snapshot() is not None     # ...and it is compacted
     seqs = [r["seq"] for r in records]
     assert seqs == list(range(1, len(seqs) + 1))      # untorn, gapless, ordered
     kinds = [r["kind"] for r in records]
     assert kinds[0] == "spawned"
     assert kinds.count("prompt") == 2                 # the task, then the steer
     assert kinds[-1] == "session_end"
+
+
+async def test_a_worker_free_session_does_not_erase_the_last_one(tmp_path,
+                                                                 monkeypatch):
+    """Compaction keeps exactly ONE rotated generation, so an unconditional
+    snapshot at every shutdown would let a JARVIS session that never spawned
+    anything rotate its own empty log over the previous session's history.
+    Nothing to compact means no compaction."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    await fleet.spawn("soccer", repo(tmp_path), "fix the tests")
+    await fleet.stop(repo(tmp_path))
+    await fleet.close_all()                           # session 1 compacts
+    rotated = fleet._log.path.with_suffix(".jsonl.1")
+    history = rotated.read_text(encoding="utf-8")
+    assert "spawned" in history
+
+    quiet, *_ = make_fleet(tmp_path, monkeypatch)     # session 2, same log path
+    await quiet.close_all()
+    assert rotated.read_text(encoding="utf-8") == history

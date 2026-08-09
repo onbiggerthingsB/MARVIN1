@@ -28,8 +28,8 @@ from claude_agent_sdk import (CanUseToolShadowedWarning, ClaudeAgentOptions,
                               ClaudeSDKClient, PermissionResultAllow,
                               PermissionResultDeny)
 
-from server.fleet_state import (CLOSED, DETACHED, QUIET, WAITING_PERMISSION,
-                                WorkerStateMachine)
+from server.fleet_state import (CLOSED, DETACHED, QUIET, UNKNOWN,
+                                WAITING_PERMISSION, WorkerStateMachine)
 from server.worktrees import (WorktreeError, create_worktree, proxy_problem,
                               write_hook_settings)
 
@@ -135,6 +135,16 @@ def _shield_bearer(wt_path: Path) -> None:
                       encoding="utf-8")
 
 
+class _Snapshot:
+    """Sentinel `kind` marking a queue item as a compaction, not an event.
+
+    An object, not a string: no real event kind can ever collide with it, so
+    a forged or drifting kind name cannot make an append rotate the log."""
+
+
+_SNAPSHOT = _Snapshot()
+
+
 class _FleetLogWriter:
     """Single-writer funnel between the fleet and the SYNCHRONOUS FleetLog.
 
@@ -155,32 +165,52 @@ class _FleetLogWriter:
     def __init__(self, log, bus):
         self._log = log
         self._bus = bus
-        self._backlog: deque[tuple[str, dict]] = deque()
+        self._backlog: deque[tuple[object, dict]] = deque()
         self._task: asyncio.Task | None = None
 
     def append(self, kind: str, data: dict) -> None:
+        self._enqueue(kind, dict(data))
+
+    def snapshot(self, state: dict) -> None:
+        """Compaction, queued behind every append already in flight.
+
+        FleetLog.snapshot fsyncs a temp file, ROTATES the log out from under
+        the append path, and fsyncs the directory. Run on the loop thread it
+        would stall live audio; run from an ad-hoc to_thread it would rename
+        the log while a concurrent append still holds the old inode — the
+        record would land in `.jsonl.1` and vanish from the next replay. Same
+        funnel, same single writer, same ordering."""
+        self._enqueue(_SNAPSHOT, dict(state))
+
+    def _enqueue(self, kind, payload: dict) -> None:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            self._write_now(kind, dict(data))   # no loop — blocking is fine
+            self._write_now(kind, payload)      # no loop — blocking is fine
             return
-        self._backlog.append((kind, dict(data)))
+        self._backlog.append((kind, payload))
         if self._task is None or self._task.done():
             self._task = loop.create_task(self._drain(),
                                           name="fleet-log-writer")
 
-    def _write_now(self, kind: str, data: dict) -> None:
+    def _write_now(self, kind, payload: dict) -> None:
         try:
-            self._log.append(kind, data)
+            if kind is _SNAPSHOT:
+                self._log.snapshot(payload)
+            else:
+                self._log.append(kind, payload)
         except Exception as e:  # noqa: BLE001 — durability failure is reported, not fatal
             self._bus.publish("fleet.error",
                               {"reason": f"event log failed: {e}"})
 
     async def _drain(self) -> None:
         while self._backlog:
-            kind, data = self._backlog.popleft()
+            kind, payload = self._backlog.popleft()
             try:
-                await asyncio.to_thread(self._log.append, kind, data)
+                if kind is _SNAPSHOT:
+                    await asyncio.to_thread(self._log.snapshot, payload)
+                else:
+                    await asyncio.to_thread(self._log.append, kind, payload)
             except Exception as e:  # noqa: BLE001
                 self._bus.publish("fleet.error",
                                   {"reason": f"event log failed: {e}"})
@@ -755,6 +785,11 @@ class Fleet:
                   f"I couldn't stop {w.project} cleanly, sir — "
                   f"treat it as unknown.")
         await self._admit_next()
+        # Deliberately NO snapshot here (see Fleet.snapshot): stop's final
+        # state is the fsync'd `session_end` this method just applied, so a
+        # compaction would add nothing and would rotate the stopped worker's
+        # whole event history into the single generation that the next
+        # compaction overwrites.
         return spoken
 
     async def _stop_worker(self, w: Worker) -> bool:
@@ -787,7 +822,27 @@ class Fleet:
         two drivers on one session interleave messages."""
         w = self._find(path)
         if w is None:
-            return {"ok": False, "spoken": "Nothing is running there, sir."}
+            # A restart ghost is not a Worker, so _find cannot see it — but
+            # its tile IS on the console, button and all, and "nothing is
+            # running there" would read as a denial that the tile means
+            # anything. Answer the tile Keke is looking at. This is also the
+            # ghost's handoff gate: spawn_in_flight guards a starting worker,
+            # never a ghost, and there is no session id to resume — the SDK
+            # client that owned it died with the old process.
+            ghost = next((g for g in self.ghosts
+                          if g.get("path") == path), None)
+            if ghost is None:
+                return {"ok": False, "spoken": "Nothing is running there, sir."}
+            project = ghost.get("project") or "That worker"
+            if ghost.get("state") == DETACHED:
+                return {"ok": False,
+                        "spoken": (f"{project} was already detached before the "
+                                   f"restart, sir — it has its own terminal.")}
+            return {"ok": False,
+                    "spoken": (f"{project} didn't survive the restart, sir — I "
+                               f"don't hold its session any more, so there's "
+                               f"nothing to hand over. Its worktree is "
+                               f"preserved.")}
         if w.machine.base == DETACHED:
             # DETACHED is a one-way door: the terminal owns this session now,
             # and a second window on it is the exact accident this prevents.
@@ -900,6 +955,9 @@ class Fleet:
             # about a worker that is already detached with its terminal open.
             w.handoff_in_flight = False
             await self._admit_next()      # DETACHED freed the slot
+            # No snapshot here either, for the same reason as stop(): the
+            # `detached` record above is already fsync'd, and it is the exact
+            # fact the next boot needs in order to leave this worker alone.
             return {"ok": True, "command": cmd, "spoken": spoken}
         finally:
             w.handoff_in_flight = False
@@ -1038,4 +1096,115 @@ class Fleet:
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(
                         w.shutdown(interrupt_first=False), 10)
+        # Flush BEFORE compacting: a snapshot that rotates the log while
+        # records are still queued would push them into a fresh generation
+        # behind the snapshot's own seq — harmless for recovery, but it makes
+        # what is on disk depend on drain timing. Then compact, then flush
+        # again, because the compaction rides the same queue and a drain task
+        # created after the last flush would be cancelled by the shutdown.
         await self._log_writer.flush()    # orderly shutdown keeps its records
+        with contextlib.suppress(Exception):
+            self.snapshot()
+        await self._log_writer.flush()
+
+    # ---------- restart honesty ----------
+    def snapshot(self) -> None:
+        """Compaction point: current worker facts through the durable log.
+
+        Called ONCE per server lifetime, from close_all. FleetLog.snapshot
+        ROTATES the log and keeps exactly ONE generation (`.jsonl.1`), so each
+        compaction destroys the one before it: snapshotting on every stop and
+        handoff as well would rotate a finished worker's whole event history
+        aside and then overwrite it at shutdown seconds later. Those paths need
+        nothing from a snapshot anyway — `session_end` and `detached` are
+        fsync'd kinds, already on the platter before either method speaks.
+
+        `machine.base`, never `state(now)`: QUIET is a DERIVED display state
+        that decays out of ACTIVE_TURN by the clock alone, and writing it down
+        would record a worker as quiet in a file read minutes or days later,
+        by a process with no clock context at all. Bases are what recover()
+        maps: anything live becomes UNKNOWN/INTERRUPTED, which is exactly what
+        close_all's refusal to log session_end intends."""
+        # An empty or absent log has nothing to compact, and rotating it is not
+        # a compaction — it is a deletion of the previous generation. A JARVIS
+        # session that never spawned a worker must not erase the last one that
+        # did.
+        try:
+            if self._log.path.stat().st_size == 0:
+                return
+        except OSError:
+            return
+        workers = {w.id: {"worker": w.id, "project": w.project, "path": w.path,
+                          "state": w.machine.base, "task": w.task_text,
+                          "worktree": w.worktree.path,
+                          "session_id": w.session_id or ""}
+                   for w in self.workers}
+        self._log_writer.snapshot({"workers": workers})
+
+    def recover(self) -> list[dict]:
+        """Replay snapshot + log and report what a restart cannot know.
+
+        Honesty rules (spec §5): a worker whose last recorded state was live
+        is now UNKNOWN with interrupted=True — its process, stream, and every
+        approval callback died with the old server, so nothing is re-armed
+        and nothing is claimed to be waiting. DETACHED stays DETACHED
+        (another driver owns it); CLOSED stays gone. Ghost tiles are published
+        so the console shows the wreckage, and fleet.recovered lets the brain
+        say it out loud.
+
+        Ghosts are deliberately NOT registered as Workers. A hand-built Worker
+        would have no client, no consumer and no pump, so steer() would answer
+        "Told X, sir" into an inbox nothing drains, handoff() would open a
+        terminal on a session we do not hold, and its UNKNOWN would count into
+        `live` and block every future spawn against a subprocess that provably
+        died with the old server. They live in `self.ghosts`, which GET /fleet
+        serves beside the live workers and handoff() refuses by name.
+
+        The fold trusts the `state` each record CARRIES, because every record
+        is written by _apply AFTER the machine has decided — so a `lost` that
+        bounced off CLOSED is recorded CLOSED, and a handoff that lost its
+        session mid-flight reads as closed rather than as a terminal somebody
+        owns. Nothing here re-runs the state machine: replaying a
+        WAITING_PERMISSION verbatim would resurrect a state that never decays,
+        waiting on a future that died with the process."""
+        folded: dict[str, dict] = {}
+        snap = self._log.load_snapshot()
+        if snap:
+            for wid, info in (snap.get("state", {}).get("workers", {}) or {}).items():
+                if isinstance(info, dict):
+                    folded[wid] = dict(info)
+        records, torn = self._log.replay()
+        # A tail torn by a power cut is repaired (and quarantined) by
+        # FleetLog's constructor, so replay() now reports a clean file. The
+        # log remembers that it was torn when this process opened it; without
+        # that, recovery would report a whole log as verified when its last
+        # records are sitting in a `.torn-*` file nobody read.
+        torn = bool(torn or getattr(self._log, "torn_on_open", False))
+        for rec in records:
+            data = rec.get("data", {})
+            wid = data.get("worker")
+            if not wid:
+                continue
+            slot = folded.setdefault(wid, {})
+            for key in ("project", "path", "state", "task", "worktree",
+                        "session_id"):
+                if data.get(key):
+                    slot[key] = data[key]
+        reports: list[dict] = []
+        for wid, info in folded.items():
+            last = info.get("state")
+            if last == CLOSED:
+                continue
+            state = DETACHED if last == DETACHED else UNKNOWN
+            report = {"worker": wid, "project": info.get("project", "?"),
+                      "path": info.get("path", ""), "state": state,
+                      "task": info.get("task", ""),
+                      "interrupted": last != DETACHED, "torn_log": torn}
+            reports.append(report)
+            self._bus.publish("fleet.update",
+                              {**report, "worktree": info.get("worktree", "")})
+        interrupted = sum(1 for r in reports if r["interrupted"])
+        if interrupted:
+            self._bus.publish("fleet.recovered", {"count": interrupted})
+        self.ghosts = reports
+        return reports

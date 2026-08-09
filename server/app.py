@@ -161,6 +161,21 @@ def create_app(base_dir: Path) -> FastAPI:
         from dataclasses import asdict
         return {"projects": [asdict(p) for p in app.state.registry.projects]}
 
+    @app.get("/fleet")
+    async def fleet_view():
+        # Page load, not live updates: the console reconnects to /events
+        # WITHOUT a Last-Event-ID (replaying stale tts/stt on a voice UI would
+        # double-trigger playback), so the boot-time ghost tiles and any tile
+        # published before this browser existed would otherwise never appear.
+        # Cookie-authed by the middleware like the rest of the console — NOT
+        # the hook bearer, which lives in every worktree.
+        now = time.time()
+        live = [{"worker": w.id, "project": w.project, "path": w.path,
+                 "state": w.machine.state(now), "task": w.task_text,
+                 "worktree": w.worktree.path}
+                for w in app.state.fleet.workers]
+        return {"workers": live + list(app.state.fleet.ghosts)}
+
     @app.get("/bootstrap")
     async def bootstrap(token: str = ""):
         if not auth.redeem_bootstrap(app.state.bootstrap, token, now=time.time()):
@@ -393,6 +408,25 @@ def create_app(base_dir: Path) -> FastAPI:
                                       {"reason": f"fleet ticker died: {exc!r}"})
 
         ticker.add_done_callback(_ticker_died)
+
+        # One tick so the brain task has subscribed — the recovery report and
+        # ghost tiles must land in a queue somebody is reading. (EventBus
+        # delivers to CURRENT subscribers; run_butler_brain subscribes before
+        # its first await, so a single yield to the loop is enough.)
+        await asyncio.sleep(0)
+        try:
+            app.state.fleet.recover()
+        except Exception as e:  # noqa: BLE001 — recovery must never block boot
+            app.state.bus.publish("fleet.error",
+                                  {"reason": f"recovery failed: {e}"})
+            # ...and SAY so. Silence here is the one outcome restart honesty
+            # cannot afford: JARVIS would come up knowing nothing about the
+            # previous run and mention nothing, which reads exactly like "all
+            # clear". The console gets the reason; Keke gets the fact.
+            app.state.bus.publish("fleet.spoken", {
+                "text": ("Sir, I couldn't read my own fleet log after that "
+                         "restart — I don't know what was running. Details "
+                         "are on screen.")})
         try:
             yield
         finally:

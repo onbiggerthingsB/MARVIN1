@@ -53,6 +53,14 @@ $("#setup-btn").addEventListener("click", async () => {
     $("#setup-overlay").hidden = true;
     $("#console").hidden = false;
     connectSSE();
+    // Page load only. SSE carries every LATER tile, but it reconnects without
+    // a Last-Event-ID, so anything published before this browser existed —
+    // above all the restart ghosts, which are published once at boot — is
+    // only ever visible through this fetch. Failure is silent by design: a
+    // missing initial render must not block the console coming online.
+    fetch("/fleet").then((r) => r.json())
+      .then((d) => (d.workers || []).forEach(renderFleetTile))
+      .catch(() => {});
     window.jarvis.setStatus("online — hold to talk");
   } catch (err) {
     $("#setup-status").textContent = `setup failed: ${err.message} — fix and click again`;
@@ -357,7 +365,13 @@ function renderFleetTile(d) {
   // and the server prefers the non-final worker on that path. So a stale
   // CLOSED tile sitting beside a live worker on the same repo would hand off
   // the LIVE one. Hide the button wherever it has nothing of its own to give.
-  tile.querySelector(".tile-open").hidden = FLEET_FINAL.has(d.state);
+  // `interrupted` is the restart ghost's own marker (only recover() sets it):
+  // its session died with the old server, so there is nothing to resume and
+  // the button would be a promise the server can only refuse. UNKNOWN alone
+  // is NOT that signal — a live worker that failed a health probe still holds
+  // a session id and is genuinely handoff-able.
+  tile.querySelector(".tile-open").hidden =
+    FLEET_FINAL.has(d.state) || d.interrupted === true;
   return tile;
 }
 window.jarvis.onEvent("fleet.update", renderFleetTile);
