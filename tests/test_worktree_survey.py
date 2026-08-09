@@ -9,6 +9,7 @@ away rather than into a checkout somebody uses.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -17,9 +18,10 @@ import pytest
 from server.bus import EventBus
 from server.fleet_state import DETACHED
 from server.worktree_survey import (KIND_EMPTY, KIND_HOLDS_WORK, KIND_LIVE,
-                                    KIND_STALE, KIND_UNRECOGNIZED,
-                                    OFFER_TTL_S, WorktreeCleanup, survey)
-from server.worktrees import create_worktree, write_hook_settings
+                                    KIND_ORPHAN_BRANCH, KIND_STALE,
+                                    KIND_UNRECOGNIZED, OFFER_TTL_S,
+                                    WorktreeCleanup, spoken_report, survey)
+from server.worktrees import Worktree, create_worktree, write_hook_settings
 
 
 # ---------------------------------------------------------------- fixtures --
@@ -93,6 +95,38 @@ async def add_worktree(repo, wts, task):
     return wt
 
 
+def add_worktree_stamped(repo, wts, task, stamp):
+    """`create_worktree` with the timestamp chosen by the test.
+
+    create_worktree stamps to the SECOND, so two worktrees cut for the same
+    task in one process cannot exist unless the stamps are forced apart. Two
+    that DO exist are the case this file has to cover: same repo, same slug,
+    identical spoken label."""
+    from server.fleet import _shield_bearer
+    from server.worktrees import _slug
+    slug = _slug(task)
+    dest = Path(wts) / f"{Path(repo).name}-{slug}-{stamp}"
+    branch = f"jarvis/{slug}-{stamp}"
+    base = _git(repo, "rev-parse", "HEAD")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _git(repo, "worktree", "add", "-q", "-b", branch, str(dest), base)
+    write_hook_settings(dest, 7777, "tok")
+    _shield_bearer(dest)
+    return Worktree(repo=str(repo), path=str(dest), branch=branch,
+                    base_commit=base)
+
+
+def move_head_off_the_worktrees(repo):
+    """Put the MAIN checkout on a branch that contains none of the worktree
+    commits — a human switching branches, nothing more exotic.
+
+    `git branch -d` measures merged-ness against HEAD, so after this every
+    jarvis branch cut from main is 'not fully merged' and git refuses to
+    delete it. That refusal is what the batch used to swallow."""
+    _git(repo, "checkout", "-q", "--orphan", "elsewhere")
+    _commit(repo, "somewhere else entirely")
+
+
 # ---------------------------------------------------------- classification --
 async def test_a_fresh_worktree_with_only_jarvis_plumbing_is_empty(repo, tmp_path):
     # The hook settings and the bearer shield are written BEFORE the CLI ever
@@ -136,6 +170,37 @@ async def test_a_live_worker_worktree_is_live_even_when_it_is_empty(repo, tmp_pa
     wt = await add_worktree(repo, tmp_path / "wts", "running right now")
     entries = await survey(tmp_path / "wts", live_paths=[wt.path])
     assert [e.kind for e in entries] == [KIND_LIVE]
+
+
+async def test_a_live_worktree_recorded_under_a_different_spelling_is_live(
+        repo, tmp_path):
+    # THE ONE FAIL-OPEN SURFACE. The fleet records the path it built; git
+    # answers with its own canonical spelling. On a case-insensitive
+    # filesystem git case-corrects and Path.resolve() does not, so two strings
+    # for ONE directory compare unequal — and a string mismatch here classifies
+    # a running worker's checkout as empty, which is removable.
+    wt = await add_worktree(repo, tmp_path / "wts", "running right now")
+    variant = str(Path(wt.path).with_name(Path(wt.path).name.upper()))
+    if variant == wt.path or not os.path.exists(variant):
+        pytest.skip("case-sensitive filesystem: the two spellings are two "
+                    "different directories here, so there is nothing to miss")
+    entries = await survey(tmp_path / "wts", live_paths=[variant])
+    assert [e.kind for e in entries] == [KIND_LIVE]
+
+
+async def test_a_stray_file_in_the_worktrees_directory_is_reported(
+        repo, tmp_path):
+    # Silence about a thing you cannot classify is worse than naming it — the
+    # module's own words. A file (or a symlink to one) was skipped outright.
+    wts = tmp_path / "wts"
+    wts.mkdir(parents=True)
+    (wts / "notes.txt").write_text("stray\n", encoding="utf-8")
+    (wts / "pointer").symlink_to(wts / "notes.txt")
+    entries = await survey(wts)
+    assert [e.kind for e in entries] == [KIND_UNRECOGNIZED, KIND_UNRECOGNIZED]
+    assert {Path(e.path).name for e in entries} == {"notes.txt", "pointer"}
+    assert all(e.note for e in entries)         # each says why
+    assert not any(e.removable for e in entries)
 
 
 async def test_a_foreign_branch_is_unrecognized_and_never_removable(repo, tmp_path):
@@ -233,6 +298,79 @@ async def test_the_batch_removes_the_empties_and_their_branches(repo, tmp_path):
     assert not Path(a.path).exists() and not Path(b.path).exists()
     branches = _git(repo, "branch", "--list", "jarvis/*")
     assert branches == ""                       # nothing beyond base to keep
+    # The claim is only allowed BECAUSE git agreed. HEAD is still main here,
+    # which contains both base commits; the test below is the same batch with
+    # HEAD moved, where git refuses and this sentence would be a lie. Pinned on
+    # the WHOLE clause: "…and 2 of their branches; git wouldn't delete…" also
+    # contains the words "their branches" and means the opposite.
+    assert "Removed 2 empty worktrees, sir, and their branches." in spoken
+
+
+async def test_the_batch_never_claims_a_branch_git_refused_to_delete(
+        repo, tmp_path):
+    # THE FALSE SENTENCE. `git branch -d` fails whenever HEAD has moved off
+    # the commit the worktree was cut from, and the batch used to swallow the
+    # failure and say "and its branch" anyway.
+    wt = await add_worktree(repo, tmp_path / "wts", "empty a")
+    move_head_off_the_worktrees(repo)
+    gate, _bus, _fleet = make_gate(tmp_path / "wts")
+    await gate.report()
+    spoken = await gate.remove_empty()
+    assert not Path(wt.path).exists()                   # the directory did go
+    assert wt.branch in _git(repo, "branch", "--list", "jarvis/*")
+    assert "and its branch." not in spoken              # the lie
+    assert "kept" in spoken.lower()
+    assert wt.branch in spoken                          # names what survived
+
+
+async def test_a_branch_that_survived_the_batch_stays_visible(repo, tmp_path):
+    # Worse than the false sentence: once the directory is gone the branch has
+    # no directory and no registration, so without a bucket of its own the
+    # survey could never surface it again — the unbounded accumulation this
+    # whole feature exists to fix.
+    wt = await add_worktree(repo, tmp_path / "wts", "empty a")
+    move_head_off_the_worktrees(repo)
+    gate, _bus, _fleet = make_gate(tmp_path / "wts", repos=[repo])
+    await gate.report()
+    await gate.remove_empty()
+    entries = await survey(tmp_path / "wts", repos=[repo])
+    assert [e.kind for e in entries] == [KIND_ORPHAN_BRANCH]
+    assert entries[0].branch == wt.branch
+    assert entries[0].removable is False        # report-only, never cleared
+    assert "branch" in spoken_report(entries).lower()
+
+
+async def test_an_orphan_branch_is_refused_by_name(repo, tmp_path):
+    wt = await add_worktree(repo, tmp_path / "wts", "soccer captain page")
+    move_head_off_the_worktrees(repo)
+    gate, _bus, _fleet = make_gate(tmp_path / "wts", repos=[repo])
+    await gate.report()
+    await gate.remove_empty()                   # leaves the branch behind
+    await gate.report()                         # now it is an orphan branch
+    spoken = await gate.remove_named("soccer captain page")
+    assert wt.branch in _git(repo, "branch", "--list", "jarvis/*")
+    assert "branch" in spoken.lower()
+
+
+async def test_the_prune_leaves_a_registration_the_survey_never_mentioned(
+        repo, tmp_path):
+    # A human's own worktree on the same repo, outside the directory JARVIS
+    # cleans, whose checkout is temporarily missing — an unplugged drive, a
+    # moved directory, the case `git worktree repair` exists for. The survey
+    # never mentioned it, so the batch must not clear its registration; the
+    # spoken count is the count of NAMED entries, and the action has to match.
+    mine = await add_worktree(repo, tmp_path / "wts", "gone")
+    subprocess.run(["rm", "-rf", mine.path], check=True)
+    theirs = tmp_path / "human-checkout"
+    _git(repo, "worktree", "add", "-q", "-b", "feature/human", str(theirs))
+    subprocess.run(["rm", "-rf", str(theirs)], check=True)
+    gate, _bus, _fleet = make_gate(tmp_path / "wts", repos=[repo])
+    spoken = await gate.report()
+    assert "1 registration" in spoken or "One registration" in spoken
+    await gate.remove_empty()
+    listing = _git(repo, "worktree", "list", "--porcelain")
+    assert mine.path not in listing             # ours, named aloud, is cleared
+    assert str(theirs) in listing               # theirs, unmentioned, survives
 
 
 async def test_the_batch_never_touches_a_worktree_holding_work(repo, tmp_path):
@@ -345,6 +483,84 @@ async def test_an_ambiguous_name_removes_nothing(repo, tmp_path):
     assert "more than one" in spoken.lower()
 
 
+async def test_an_ambiguous_name_leaves_the_offer_standing(repo, tmp_path):
+    # The refusal removed NOTHING, so it must not spend the survey: the whole
+    # point of refusing is to let Keke say a better name, and consuming the
+    # offer answered the follow-up with "I haven't gone through your worktrees
+    # yet" — advice that cannot be followed.
+    a = add_worktree_stamped(repo, tmp_path / "wts", "soccer captain page",
+                             "20260101-000001")
+    b = add_worktree_stamped(repo, tmp_path / "wts", "soccer captain page",
+                             "20260102-000002")
+    for wt in (a, b):
+        (Path(wt.path) / "draft.md").write_text("keep\n", encoding="utf-8")
+    gate, _bus, _fleet = make_gate(tmp_path / "wts")
+    spoken_survey = await gate.report()
+    refusal = await gate.remove_named("soccer captain page")
+    assert "more than one" in refusal.lower()
+    assert "haven't gone through" not in refusal
+    assert Path(a.path).exists() and Path(b.path).exists()
+    # …and the name the refusal offered is one the SURVEY already spoke, so
+    # saying it back is an instruction this gate can act on.
+    assert "soccer captain page one" in spoken_survey
+    assert "soccer captain page one" in refusal
+    spoken = await gate.remove_named("soccer captain page one")
+    assert "haven't gone through" not in spoken
+    assert not Path(a.path).exists() and Path(b.path).exists()
+
+
+async def test_two_worktrees_for_one_task_are_told_apart_by_their_branch(
+        repo, tmp_path):
+    # "Name its branch instead" was impossible advice twice over: the second
+    # reason is that router._words drops digits, so two worktrees cut for the
+    # same task on the same repo had IDENTICAL branch vocabularies and the
+    # branch could not disambiguate them either.
+    a = add_worktree_stamped(repo, tmp_path / "wts", "soccer captain page",
+                             "20260101-000001")
+    b = add_worktree_stamped(repo, tmp_path / "wts", "soccer captain page",
+                             "20260102-000002")
+    for wt in (a, b):
+        (Path(wt.path) / "draft.md").write_text("keep\n", encoding="utf-8")
+    gate, _bus, _fleet = make_gate(tmp_path / "wts")
+    await gate.report()
+    spoken = await gate.remove_named(b.branch)
+    assert Path(a.path).exists() and not Path(b.path).exists()
+    assert b.branch in spoken
+
+
+async def test_a_name_made_only_of_politeness_removes_nothing(repo, tmp_path):
+    # A plausible STT truncation of "remove the worktree for the soccer page".
+    # The whitelist is _POLITE plus the entry's words, so "the" was explained
+    # by every entry, matched all of them, and removed the only one whenever
+    # the offer held exactly one.
+    wt = await add_worktree(repo, tmp_path / "wts", "soccer captain page")
+    gate, _bus, _fleet = make_gate(tmp_path / "wts")
+    await gate.report()
+    spoken = await gate.remove_named("the")
+    assert Path(wt.path).exists()
+    assert "removed" not in spoken.lower()
+
+
+async def test_a_named_worktree_that_gained_files_since_the_report_is_refused(
+        repo, tmp_path):
+    # THE SPOKEN LOSS, not the classification. The survey said "1 commit";
+    # untracked files arrived afterwards, the kind is still holds-work, and
+    # `worktree remove --force` would destroy files that were never in the
+    # sentence Keke answered.
+    wt = await add_worktree(repo, tmp_path / "wts", "soccer captain page")
+    (Path(wt.path) / "README.md").write_text("changed\n", encoding="utf-8")
+    _commit(wt.path, "worker commit")
+    gate, _bus, _fleet = make_gate(tmp_path / "wts")
+    spoken_survey = await gate.report()
+    assert "1 commit" in spoken_survey and "untracked" not in spoken_survey
+    (Path(wt.path) / "urgent.md").write_text("wrote this after\n",
+                                             encoding="utf-8")
+    spoken = await gate.remove_named("soccer captain page")
+    assert Path(wt.path).exists()
+    assert (Path(wt.path) / "urgent.md").exists()
+    assert "changed" in spoken.lower()
+
+
 async def test_a_named_worktree_that_changed_since_the_report_is_refused(
         repo, tmp_path):
     wt = await add_worktree(repo, tmp_path / "wts", "soccer captain page")
@@ -356,14 +572,31 @@ async def test_a_named_worktree_that_changed_since_the_report_is_refused(
     assert "changed" in spoken.lower()
 
 
-async def test_a_foreign_checkout_cannot_be_removed_by_name(repo, tmp_path):
+async def test_a_foreign_checkout_is_refused_before_the_destructive_call(
+        repo, tmp_path, monkeypatch):
+    # ONE guarantee, pinned once: the refusal happens in this module, BEFORE
+    # remove_worktree is called at all. remove_worktree's own namespace guard
+    # would refuse it too — which is exactly why asserting only "the file
+    # survived" passed with either guard reverted and pinned neither.
     wts = tmp_path / "wts"
     wts.mkdir(parents=True)
     _git(repo, "worktree", "add", "-q", "-b", "feature/human", str(wts / "human"))
     (wts / "human" / "notes.txt").write_text("hours of work\n", encoding="utf-8")
+
+    import server.worktree_survey as mod
+    calls = []
+    real = mod.remove_worktree
+
+    async def spy(record):
+        calls.append(record)
+        return await real(record)
+
+    monkeypatch.setattr(mod, "remove_worktree", spy)
     gate, _bus, _fleet = make_gate(wts)
     await gate.report()
-    await gate.remove_named("human")
+    spoken = await gate.remove_named("human")
+    assert calls == []                          # never reached the removal
+    assert "didn't create" in spoken
     assert (wts / "human" / "notes.txt").exists()
 
 
@@ -377,7 +610,7 @@ async def test_removal_refuses_a_target_outside_the_worktrees_directory(
     wt = await add_worktree(repo, outside, "not under the configured dir")
     gate, _bus, _fleet = make_gate(tmp_path / "wts")
     entry = (await survey(outside))[0]
-    ok, why = await gate._remove(entry)
+    ok, why, _branch_gone = await gate._remove(entry)
     assert ok is False and "outside" in why.lower()
     assert Path(wt.path).exists()
 
@@ -444,6 +677,22 @@ async def test_the_report_states_what_would_be_lost(repo, tmp_path):
     gate, _bus, _fleet = make_gate(tmp_path / "wts")
     spoken = await gate.report()
     assert "1 commit" in spoken and "1 untracked file" in spoken
+
+
+async def test_the_report_says_what_a_live_worktree_holds(repo, tmp_path):
+    # _classify gathers ahead/dirty/untracked for live entries too, and says
+    # in as many words that it does so BECAUSE the report has to state them —
+    # then the sentence said only "I won't touch it", which reads as "there is
+    # nothing in there" and is the opposite of why it is being left alone.
+    wt = await add_worktree(repo, tmp_path / "wts", "soccer captain page")
+    (Path(wt.path) / "README.md").write_text("changed\n", encoding="utf-8")
+    _commit(wt.path, "worker commit")
+    (Path(wt.path) / "scratch.md").write_text("draft\n", encoding="utf-8")
+    gate, _bus, _fleet = make_gate(tmp_path / "wts", live=[wt.path])
+    spoken = await gate.report()
+    assert "belongs to a session" in spoken
+    assert "1 commit" in spoken and "1 untracked file" in spoken
+    assert "won't touch" in spoken
 
 
 # --------------------------------------------------------- the Fleet's view -

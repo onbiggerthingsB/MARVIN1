@@ -252,6 +252,7 @@ def test_get_worktrees_is_cookie_authed_and_never_the_hook_lane(tmp_path):
 
 def test_get_worktrees_reports_a_real_worktree(tmp_path):
     import subprocess
+    from pathlib import Path
 
     from tests.test_app_auth import bootstrap, make_client
     from tests.test_worktree_survey import add_worktree
@@ -266,11 +267,14 @@ def test_get_worktrees_reports_a_real_worktree(tmp_path):
     c = make_client(tmp_path)
     bootstrap(c)
     wts = tmp_path / "state" / "worktrees"
+    # asyncio.run, not a loop nobody closes: this is a SYNC test (the route is
+    # driven through TestClient), and the previous spelling leaked an event
+    # loop per run. `wt` is bound BEFORE the try, because binding it inside
+    # meant a failure in add_worktree raised NameError in the finally and
+    # buried the real error.
+    wt = asyncio.run(add_worktree(repo, wts, "left a draft"))
     try:
-        wt = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-            add_worktree(repo, wts, "left a draft"))
-        (__import__("pathlib").Path(wt.path) / "draft.md").write_text(
-            "keep\n", encoding="utf-8")
+        (Path(wt.path) / "draft.md").write_text("keep\n", encoding="utf-8")
         body = c.get("/worktrees").json()
         assert [w["kind"] for w in body["worktrees"]] == ["holds-work"]
         assert body["worktrees"][0]["untracked"] == 1

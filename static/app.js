@@ -500,12 +500,15 @@ window.jarvis.onEvent("approval.resolved", (d) => {
 // accidentally press. The order below is the order of danger: what is still
 // live first, then what would be lost, then what is safe to clear.
 const WORKTREE_ORDER = ["live", "holds-work", "empty", "stale-registration",
-                        "unrecognized"];
+                        "orphan-branch", "unrecognized"];
 const WORKTREE_WORDS = {
   "live": "in use — a worker or a terminal owns this",
   "holds-work": "holds work",
   "empty": "did nothing worth keeping",
   "stale-registration": "registration only — the directory is gone",
+  // A branch git declined to delete. It has no directory and no registration,
+  // so this row is the ONLY place it can still be seen.
+  "orphan-branch": "branch only — no worktree left, and I am keeping it",
   "unrecognized": "not mine — I will not touch it",
 };
 
@@ -544,7 +547,12 @@ function renderWorktrees(d) {
     // checkout. textContent everywhere, never innerHTML.
     const name = document.createElement("div");
     name.className = "wt-name";
-    name.textContent = `${w.project || (w.path || "").split("/").pop() || "?"}`;
+    // `alias` first: when two rows would share a name the survey gives each a
+    // spoken one, and the screen has to show the same string Keke heard. A
+    // branch-only row has no path at all, hence the branch fallback.
+    name.textContent = `${w.alias || w.project
+                          || (w.path || "").split("/").pop()
+                          || w.branch || "?"}`;
     const kind = document.createElement("div");
     kind.className = "wt-kind";
     kind.textContent = `${w.kind || "?"} — ${WORKTREE_WORDS[w.kind] || ""}`;

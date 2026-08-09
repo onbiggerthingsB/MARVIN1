@@ -28,9 +28,20 @@ The four classifications, and why each is safe:
                     confirmation covers these and nothing else. Its branch has
                     no commits beyond base, so the branch goes too.
   stale-registration
-                    Git still registers it but the directory is gone.
-                    `git worktree prune` clears the administrative file and
-                    destroys nothing — not the branch, not any object.
+                    Git still registers it but the directory is gone. Clearing
+                    it destroys nothing — not the branch, not any object — and
+                    it is cleared ONE REGISTRATION AT A TIME, by name.
+                    `git worktree prune` would take the whole repo with it,
+                    including registrations the survey never mentioned and a
+                    human may be about to `git worktree repair`.
+  orphan-branch     A `jarvis/*` branch with no worktree and no registration
+                    anywhere. REPORT-ONLY: nothing here ever deletes it. It
+                    exists because `git branch -d` is allowed to refuse — when
+                    it does, the directory is already gone, and without this
+                    bucket the branch would have no directory and no
+                    registration to surface it ever again. That is the
+                    unbounded accumulation this module exists to end, so a
+                    branch that survives a removal stays visible instead.
 
 There is a FIFTH bucket, `unrecognized`, for anything in the worktrees
 directory that is not a jarvis worktree: a foreign branch, a symlink, a plain
@@ -44,10 +55,19 @@ non-jarvis ref", which needs no recorded base_commit and degrades in the safe
 direction: if the commit this branch was cut from has itself become
 unreachable, its ancestors count as ahead too, and the worktree classifies as
 holds-work rather than empty.
+
+EVERY SENTENCE HERE IS A CLAIM ABOUT WHAT HAPPENED, and this feature speaks
+aloud, so a sentence that outruns what git actually did is a real defect and
+not a wording nit. Nothing below reports an outcome it did not observe: the
+branch line is phrased from `git branch -d`'s exit status, the prune count is
+the count of registrations that were actually cleared, and a removal is
+refused outright when the worktree no longer matches the loss that was read
+out — not merely when its bucket changed.
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
@@ -60,6 +80,7 @@ KIND_LIVE = "live"
 KIND_HOLDS_WORK = "holds-work"
 KIND_EMPTY = "empty"
 KIND_STALE = "stale-registration"
+KIND_ORPHAN_BRANCH = "orphan-branch"
 KIND_UNRECOGNIZED = "unrecognized"
 
 # What a spoken survey may still authorise, and for how long. Same number as
@@ -77,6 +98,28 @@ SPEAK_ITEM_LIMIT = 3
 # writes; the stamp is when the worker was spawned).
 _STAMP = re.compile(r"-(\d{8}-\d{6})$")
 
+# Runs of digits, which router._words drops by construction ([a-z']+). Two
+# worktrees cut for the same task on the same repo differ ONLY in their
+# timestamp, so without these their vocabularies are identical and no
+# spoken name — branch included — can ever tell them apart.
+_DIGITS = re.compile(r"\d+")
+
+# Spoken tie-breakers for two things that would otherwise share a name. Words,
+# not numerals: this is read aloud.
+_ORDINALS = ("one", "two", "three", "four", "five", "six", "seven", "eight",
+             "nine", "ten")
+
+
+def _spoken_tokens(text: str) -> list[str]:
+    """Words AND number runs — the unit `_explains` matches on both sides.
+
+    router._words is the right tokenizer for consent vocabulary and the wrong
+    one for identity: it drops digits, and the digits are the only thing that
+    distinguishes two worktrees cut for one task. Adding them to BOTH the
+    vocabulary and the spoken side keeps the whitelist rule exact — a number
+    said aloud still has to be explained by the entry."""
+    return _words(text) + _DIGITS.findall(text or "")
+
 
 @dataclass
 class SurveyEntry:
@@ -93,10 +136,20 @@ class SurveyEntry:
     age_s: float = 0.0
     project: str = ""         # spoken name, when a live worker supplies one
     note: str = ""            # why something is unrecognized, when it is
+    alias: str = ""           # set by _disambiguate when two labels collide
 
     @property
     def removable(self) -> bool:
         return self.kind in (KIND_EMPTY, KIND_HOLDS_WORK)
+
+    @property
+    def ident(self) -> str:
+        """The key an offer holds this entry under.
+
+        A branch with no worktree has no path at all, and two of those keyed
+        on "" would collapse into one — so a refusal would name the wrong
+        branch. Every real worktree still keys on its path, unchanged."""
+        return self.path or f"{self.repo}#{self.branch}"
 
     @property
     def label(self) -> str:
@@ -110,11 +163,17 @@ class SurveyEntry:
         It must ROUND-TRIP: _explains builds its vocabulary from this same
         directory name, so every label JARVIS offers is a name the per-item
         instruction can match back. Two worktrees cut for the same task on the
-        same repo therefore share a label and a voice instruction naming it is
-        AMBIGUOUS — refused rather than guessed, with both on screen."""
+        same repo would otherwise share a label outright — `alias`, assigned
+        once per survey by _disambiguate, is what keeps every spoken name
+        pointing at exactly one entry."""
+        if self.alias:
+            return self.alias
         if self.project:
             return self.project
-        name = _STAMP.sub("", Path(self.path).name or "") or self.branch
+        name = _STAMP.sub("", Path(self.path).name or "")
+        # An orphan branch has no directory; its branch is the only name it
+        # has, and "jarvis/" is a namespace, not something anybody says.
+        name = name or _STAMP.sub("", self.branch.removeprefix("jarvis/"))
         return name.replace("-", " ").replace("_", " ").strip() or self.path
 
 
@@ -126,34 +185,75 @@ def _age_s(branch: str, path: str, now: float) -> float:
                 time.strptime(m.group(1), "%Y%m%d-%H%M%S")))
         except (ValueError, OverflowError):
             pass
+    if not path:
+        return 0.0        # a branch with no directory has no mtime to read
     try:
         return max(0.0, now - Path(path).stat().st_mtime)
     except OSError:
         return 0.0
 
 
-def _live_forms(live_paths) -> set[str]:
-    """Every spelling of a live worktree path we might have to recognise.
+class _Live:
+    """Which directories belong to a running worker or a live terminal.
 
-    The fleet records `worktrees_dir / name` unresolved; git answers with its
-    own canonicalised form. On a machine where the worktrees directory sits
-    under a symlink (/tmp on macOS is one) those two strings differ, and this
-    is the single most safety-critical comparison in the module — a miss
-    classifies a running worker's checkout as removable. So hold BOTH forms and
-    compare against both."""
-    forms: set[str] = set()
-    for p in live_paths or ():
-        if not p:
-            continue
-        forms.add(str(p))
-        try:
-            forms.add(str(Path(p).resolve()))
-        except (OSError, RuntimeError, ValueError):
-            pass
-    return forms
+    This is the single most safety-critical comparison in the module: a miss
+    classifies a running worker's checkout as EMPTY, which is removable by a
+    batch. It is therefore decided on FILESYSTEM IDENTITY — `st_dev, st_ino` —
+    and not on strings.
+
+    Strings could not be made sound. The fleet records `worktrees_dir / name`
+    unresolved and git answers with its own canonical spelling, so the two
+    already differ under a symlinked parent; and `Path.resolve()` closes only
+    that one gap. It does not case-correct, so on a case-insensitive
+    filesystem (this machine's) git's spelling and the fleet's can differ by a
+    letter for one directory; it does not normalise Unicode, so a name
+    recorded NFD by one process and NFC by another is two strings for one
+    directory; and a restart ghost's path was recorded by an EARLIER process,
+    which is exactly where a different spelling comes from. An inode is immune
+    to all three at once.
+
+    The resolved strings are kept as a fallback and the two are OR-ed, never
+    intersected — a path that no longer exists cannot be stat'ed, and the only
+    direction this class is allowed to be wrong in is "protected something it
+    did not have to"."""
+
+    def __init__(self, live_paths=()):
+        self._ids: set[tuple[int, int]] = set()
+        self._forms: set[str] = set()
+        for p in live_paths or ():
+            if not p:
+                continue
+            self._forms.add(str(p))
+            try:
+                self._forms.add(str(Path(p).resolve()))
+            except (OSError, RuntimeError, ValueError):
+                pass
+            try:
+                st = os.stat(p)
+                self._ids.add((st.st_dev, st.st_ino))
+            except (OSError, ValueError):
+                pass
+
+    def __bool__(self) -> bool:
+        return bool(self._ids or self._forms)
+
+    def holds(self, *candidates) -> bool:
+        """True if ANY spelling given names a directory a worker still owns."""
+        for c in candidates:
+            if not c:
+                continue
+            if str(c) in self._forms:
+                return True
+            try:
+                st = os.stat(c)
+            except (OSError, ValueError):
+                continue
+            if (st.st_dev, st.st_ino) in self._ids:
+                return True
+        return False
 
 
-async def _classify(entry_dir: Path, live: set[str], now: float) -> SurveyEntry:
+async def _classify(entry_dir: Path, live: _Live, now: float) -> SurveyEntry:
     """One directory. Every git failure lands in `unrecognized`, which is in no
     removable bucket — an entry we could not interrogate is never one we offer
     to delete."""
@@ -183,7 +283,7 @@ async def _classify(entry_dir: Path, live: set[str], now: float) -> SurveyEntry:
         # this path would aim git at a checkout nobody surveyed.
         e.note = "not the root of its checkout"
         return e
-    if str(entry_dir) in live or str(top) in live:
+    if live.holds(entry_dir, top):
         e.kind = KIND_LIVE
     elif not branch.startswith("jarvis/"):
         e.note = f"branch {branch!r} is outside the jarvis/ namespace"
@@ -224,19 +324,31 @@ async def _classify(entry_dir: Path, live: set[str], now: float) -> SurveyEntry:
     return e
 
 
-async def _stale(repos, root: Path, seen: set[str], now: float) -> list[SurveyEntry]:
-    """Registrations git still holds whose directory is gone.
+async def _repo_scan(repos, root: Path, seen: set[str],
+                     now: float) -> list[SurveyEntry]:
+    """What the worktrees directory cannot show you, asked of the repos.
+
+    Two things live here, and both are invisible to a walk of the directory
+    because neither has a directory:
+
+      stale-registration  git still registers it, the directory is gone.
+      orphan-branch       a `jarvis/*` branch with no registration at all —
+                          which is what a branch becomes the moment its
+                          worktree is removed and `git branch -d` refuses.
+                          Without this it would never be surfaced again.
 
     Only for repos we can still reach — the ones the surviving worktrees point
     at, plus whatever the fleet still remembers. A repo whose every worktree
     directory has been deleted is unreachable from here, and the survey says
     nothing about it rather than guessing."""
-    out: list[SurveyEntry] = []
+    stale: list[SurveyEntry] = []
+    orphans: list[SurveyEntry] = []
     for repo in sorted({str(r) for r in repos if r}):
         try:
             listing = await _git(Path(repo), "worktree", "list", "--porcelain")
         except (WorktreeError, asyncio.TimeoutError, OSError):
             continue
+        registered: set[str] = set()
         path = branch = ""
         for line in listing.splitlines() + [""]:
             if line.startswith("worktree "):
@@ -244,6 +356,7 @@ async def _stale(repos, root: Path, seen: set[str], now: float) -> list[SurveyEn
             elif line.startswith("branch "):
                 branch = line[7:].removeprefix("refs/heads/")
             elif not line.strip() and path:
+                registered.add(branch)
                 try:
                     gone = not Path(path).exists()
                 except OSError:
@@ -251,11 +364,47 @@ async def _stale(repos, root: Path, seen: set[str], now: float) -> list[SurveyEn
                 inside = root == Path(path).parent or root in Path(path).parents
                 if gone and inside and path not in seen:
                     seen.add(path)
-                    out.append(SurveyEntry(
+                    stale.append(SurveyEntry(
                         path=path, repo=repo, branch=branch,
                         kind=KIND_STALE, age_s=_age_s(branch, path, now)))
                 path = branch = ""
-    return out
+        try:
+            refs = await _git(Path(repo), "for-each-ref",
+                              "--format=%(refname:short)", "refs/heads/jarvis/")
+        except (WorktreeError, asyncio.TimeoutError, OSError):
+            continue
+        for name in refs.splitlines():
+            # A registered branch is not orphaned even when its directory is
+            # gone — the stale entry above is already speaking for it.
+            if name and name not in registered:
+                orphans.append(SurveyEntry(
+                    repo=repo, branch=name, kind=KIND_ORPHAN_BRANCH,
+                    age_s=_age_s(name, "", now)))
+    return stale + orphans
+
+
+def _disambiguate(entries: list[SurveyEntry]) -> None:
+    """Give every entry a spoken name that points at exactly one of them.
+
+    Two worktrees cut for the same task on the same repo share a directory
+    name up to the timestamp, and the timestamp is precisely what speech
+    throws away — so they share a label, and the old refusal told Keke to
+    "name its branch instead" when the branches were equally indistinguishable
+    to the matcher. An ordinal is a discriminator that survives being said out
+    loud, and it is assigned HERE, once, so the name the survey speaks and the
+    name the instruction may use are the same string.
+
+    Ordered by ident, which is unique and stable, so the same survey always
+    numbers the same way."""
+    groups: dict[str, list[SurveyEntry]] = {}
+    for e in entries:
+        groups.setdefault(e.label, []).append(e)
+    for base, group in groups.items():
+        if len(group) < 2:
+            continue
+        for i, e in enumerate(sorted(group, key=lambda x: x.ident)):
+            tail = _ORDINALS[i] if i < len(_ORDINALS) else str(i + 1)
+            e.alias = f"{base} {tail}"
 
 
 async def survey(worktrees_dir, *, live_paths=(), repos=(),
@@ -266,7 +415,7 @@ async def survey(worktrees_dir, *, live_paths=(), repos=(),
     is safe to call from an HTTP GET on every page load."""
     now = time.time() if now is None else now
     root = Path(worktrees_dir)
-    live = _live_forms(live_paths)
+    live = _Live(live_paths)
     names = dict(projects or {})
     entries: list[SurveyEntry] = []
     try:
@@ -276,9 +425,22 @@ async def survey(worktrees_dir, *, live_paths=(), repos=(),
     known_repos = {str(r) for r in repos if r}
     for child in children:
         try:
-            if not child.is_dir():
-                continue
+            is_dir = child.is_dir()
         except OSError:
+            is_dir = False
+        if not is_dir:
+            # A stray file, a symlink to one, a dangling symlink. NOT skipped:
+            # silence about a thing you cannot classify is worse than naming
+            # it, and a directory nobody can account for is exactly what this
+            # survey exists to put on the screen. `unrecognized` is in no
+            # removable bucket, so reporting it costs nothing.
+            odd = SurveyEntry(path=str(child), age_s=_age_s("", str(child), now))
+            try:
+                odd.note = ("a symlink, not a worktree" if child.is_symlink()
+                            else "not a directory")
+            except OSError:
+                odd.note = "not a directory I can read"
+            entries.append(odd)
             continue
         e = await _classify(child, live, now)
         if e.repo:
@@ -290,8 +452,9 @@ async def survey(worktrees_dir, *, live_paths=(), repos=(),
         root_resolved = root.resolve()
     except (OSError, RuntimeError, ValueError):
         root_resolved = root
-    entries.extend(await _stale(known_repos, root_resolved, seen, now))
-    entries.sort(key=lambda e: (e.kind, e.path))
+    entries.extend(await _repo_scan(known_repos, root_resolved, seen, now))
+    entries.sort(key=lambda e: (e.kind, e.path, e.branch))
+    _disambiguate(entries)
     return entries
 
 
@@ -313,6 +476,21 @@ def _loss(e: SurveyEntry) -> str:
     return " and ".join(bits) if bits else "nothing I can see"
 
 
+def _holding(e: SurveyEntry) -> str:
+    """What a worktree currently CONTAINS, for one that is not being offered.
+    Same facts as _loss, phrased as a state rather than as a cost."""
+    if not (e.ahead or e.dirty or e.untracked):
+        return "nothing yet"
+    return _loss(e)
+
+
+def _join(names: list[str]) -> str:
+    """'a', 'a and b', 'a, b and c' — spoken punctuation."""
+    if len(names) <= 1:
+        return "".join(names)
+    return f"{', '.join(names[:-1])} and {names[-1]}"
+
+
 def spoken_report(entries: list[SurveyEntry]) -> str:
     """The sentence Keke hears. Everything a later "yes" may act on has to be
     IN here — that is the whole correlation rule."""
@@ -325,13 +503,26 @@ def spoken_report(entries: list[SurveyEntry]) -> str:
     holds = buckets.get(KIND_HOLDS_WORK, [])
     empty = buckets.get(KIND_EMPTY, [])
     stale = buckets.get(KIND_STALE, [])
+    orphans = buckets.get(KIND_ORPHAN_BRANCH, [])
     odd = buckets.get(KIND_UNRECOGNIZED, [])
-    parts = [f"Sir, I found {_plural(len(entries), 'worktree')}."]
+    # An orphan branch is not a worktree and must not be counted as one; it
+    # gets its own sentence below.
+    found = [e for e in entries if e.kind != KIND_ORPHAN_BRANCH]
+    parts = [f"Sir, I found {_plural(len(found), 'worktree')}." if found else
+             "Sir, there are no worktrees left."]
     if live:
-        parts.append("One still belongs to a session — I won't touch it."
-                     if len(live) == 1 else
-                     f"{len(live)} still belong to sessions — I won't touch "
-                     f"those.")
+        # What a live worker HOLDS, not merely that it is live. _classify
+        # gathers these facts for live entries precisely so this line can say
+        # them: "I won't touch it" with no content reads as "there is nothing
+        # there", which is the opposite of why it is being left alone.
+        shown = live[:SPEAK_ITEM_LIMIT]
+        detail = "; ".join(f"{e.label}, holding {_holding(e)}" for e in shown)
+        more = ("" if len(live) <= SPEAK_ITEM_LIMIT
+                else f", and {len(live) - len(shown)} more on screen")
+        lead = ("One still belongs to a session" if len(live) == 1 else
+                f"{len(live)} still belong to sessions")
+        parts.append(f"{lead}: {detail}{more} — I won't touch "
+                     f"{'it' if len(live) == 1 else 'those'}.")
     if holds:
         shown = holds[:SPEAK_ITEM_LIMIT]
         detail = "; ".join(f"{e.label}, {_loss(e)}" for e in shown)
@@ -347,6 +538,11 @@ def spoken_report(entries: list[SurveyEntry]) -> str:
                      "gone." if len(stale) == 1 else
                      f"{len(stale)} registrations point at directories that "
                      f"are already gone.")
+    if orphans:
+        parts.append("One jarvis branch has no worktree left — it's on screen "
+                     "and I'm keeping it." if len(orphans) == 1 else
+                     f"{len(orphans)} jarvis branches have no worktrees left "
+                     f"— they're on screen and I'm keeping them.")
     if odd:
         parts.append("One isn't mine — it's on screen and I'll leave it alone."
                      if len(odd) == 1 else
@@ -365,7 +561,7 @@ def spoken_report(entries: list[SurveyEntry]) -> str:
     if holds:
         parts.append("For one that holds work, say 'remove the worktree for' "
                      "and its name.")
-    if not (empty or stale or holds):
+    if not (empty or stale or holds) and found:
         parts.append("Nothing here is mine to clear.")
     return " ".join(parts)
 
@@ -376,8 +572,9 @@ class _Offer:
     """What a spoken survey authorises, and nothing beyond it.
 
     `empty` is the exact set of paths the sentence called empty; `entries` is
-    every path it mentioned at all, so a per-item instruction can refuse a live
-    one BY NAME instead of pretending not to know it."""
+    every entry it mentioned at all, keyed by `ident`, so a per-item
+    instruction can refuse a live one BY NAME instead of pretending not to
+    know it."""
     at: float = 0.0
     empty: frozenset[str] = frozenset()
     entries: dict[str, SurveyEntry] = field(default_factory=dict)
@@ -454,7 +651,7 @@ class WorktreeCleanup:
             at=self._now(),
             empty=frozenset(e.path for e in entries if e.kind == KIND_EMPTY),
             stale=frozenset(e.path for e in entries if e.kind == KIND_STALE),
-            entries={e.path: e for e in entries})
+            entries={e.ident: e for e in entries})
         return spoken_report(entries)
 
     # ---------- removal ----------
@@ -462,33 +659,47 @@ class WorktreeCleanup:
         """The batch. Removes ONLY worktrees this gate called empty out loud
         AND that are still empty, still not live, and still inside the
         configured directory. Consumes the offer either way."""
-        offer, refusal = self._take_offer()
+        offer, refusal = self._peek_offer()
         if offer is None:
             return refusal
+        self._consume_offer()      # the batch redeems the survey, act or not
         try:
-            current = {e.path: e for e in await self.entries()}
+            current = {e.ident: e for e in await self.entries()}
         except Exception as e:  # noqa: BLE001
             self._publish_error(f"worktree survey failed: {e}")
             return ("Sir, I couldn't re-check your worktrees, so I removed "
                     "nothing — details are on screen.")
-        removed, changed, failed = [], [], []
+        removed, kept_branch, changed, failed = [], [], [], []
         for path in sorted(offer.empty):
             now_entry = current.get(path)
             if now_entry is None or now_entry.kind != KIND_EMPTY:
                 changed.append(offer.entries[path].label)
                 continue
-            ok, why = await self._remove(now_entry)
-            (removed if ok else failed).append(now_entry.label)
+            ok, why, branch_gone = await self._remove(now_entry)
             if not ok:
+                failed.append(now_entry.label)
                 self._publish_error(why)
+                continue
+            removed.append(now_entry.label)
+            if not branch_gone:
+                # git kept it. Say so — and the survey will keep saying so,
+                # because it is an orphan branch from here on.
+                kept_branch.append(now_entry.branch)
         pruned = await self._prune(offer)
-        return self._batch_sentence(removed, changed, failed, pruned)
+        return self._batch_sentence(removed, kept_branch, changed, failed,
+                                    pruned)
 
     async def remove_named(self, spoken_name: str) -> str:
         """Per-item. One worktree, named, whose loss the survey already read
         aloud. The match must explain EVERY word said — the whitelist rule
-        router._approval_vocabulary enforces for tool approvals."""
-        offer, refusal = self._take_offer()
+        router._approval_vocabulary enforces for tool approvals.
+
+        A refusal that removed NOTHING leaves the offer standing. Consuming it
+        on the way in made the advice in every refusal unfollowable: the
+        answer to "name it more precisely" was "I haven't gone through your
+        worktrees yet". The one-shot rule is about REMOVALS — at most one per
+        spoken survey — and that is where the offer is now spent."""
+        offer, refusal = self._peek_offer()
         if offer is None:
             return refusal
         said = (spoken_name or "").strip()
@@ -499,8 +710,15 @@ class WorktreeCleanup:
             return (f"I don't have a worktree called {said} in what I just "
                     f"read you, sir.")
         if len(matched) > 1:
-            return (f"More than one of those matches {said}, sir — name its "
-                    f"branch instead.")
+            # Refusing is right; "name its branch instead" was not, because
+            # the branches of two worktrees cut for one task differ only in
+            # digits. _disambiguate already gave each of these a name the
+            # survey SPOKE and this matcher can tell apart — offer those.
+            shown = sorted(m.label for m in matched)[:SPEAK_ITEM_LIMIT]
+            more = ("" if len(matched) <= SPEAK_ITEM_LIMIT
+                    else f", and {len(matched) - len(shown)} more on screen")
+            return (f"More than one of those matches {said}, sir — I have "
+                    f"{_join(shown)}{more}. Say one of those exactly.")
         target = matched[0]
         if target.kind == KIND_LIVE:
             return (f"{target.label} still belongs to a running session, sir "
@@ -508,27 +726,42 @@ class WorktreeCleanup:
         if target.kind == KIND_STALE:
             return (f"{target.label}'s directory is already gone, sir — its "
                     f"branch is all that's left, and I'm keeping that.")
+        if target.kind == KIND_ORPHAN_BRANCH:
+            return (f"{target.label} is only a branch now, sir — its worktree "
+                    f"is gone and the branch is the record, so I'm keeping it.")
         if not target.removable:
             return (f"I didn't create {target.label}, sir — I won't remove it.")
         try:
-            current = {e.path: e for e in await self.entries()}
+            current = {e.ident: e for e in await self.entries()}
         except Exception as e:  # noqa: BLE001
             self._publish_error(f"worktree survey failed: {e}")
             return ("Sir, I couldn't re-check that worktree, so I removed "
                     "nothing — details are on screen.")
-        fresh = current.get(target.path)
-        if fresh is None or fresh.kind != target.kind:
+        fresh = current.get(target.ident)
+        # The re-check is against the LOSS THAT WAS SPOKEN, not against the
+        # bucket. An entry read out as "1 commit" that picks up untracked
+        # files is still holds-work, and removing it destroys files that were
+        # never in the sentence Keke answered — one yes may never cost more
+        # than it described, so any drift in the counts refuses.
+        if (fresh is None or fresh.kind != target.kind
+                or (fresh.ahead, fresh.dirty, fresh.untracked)
+                != (target.ahead, target.dirty, target.untracked)):
             return (f"{target.label} has changed since I read it to you, sir "
                     f"— ask me to go through the worktrees again.")
-        ok, why = await self._remove(fresh)
+        self._consume_offer()      # from here on, something is being removed
+        ok, why, branch_gone = await self._remove(fresh)
         if not ok:
             self._publish_error(why)
-            return (f"I couldn't remove {fresh.label}, sir — it's still there "
-                    f"and details are on screen.")
+            return (f"I couldn't remove {target.label}, sir — it's still "
+                    f"there and details are on screen.")
         if fresh.kind == KIND_EMPTY:
-            return (f"Removed {fresh.label}, sir. It held nothing, so its "
-                    f"branch went with it.")
-        return (f"Removed {fresh.label}, sir. It held {_loss(fresh)} — that "
+            if branch_gone:
+                return (f"Removed {target.label}, sir. It held nothing, so "
+                        f"its branch went with it.")
+            return (f"Removed {target.label}, sir. It held nothing, but git "
+                    f"wouldn't delete branch {fresh.branch}, so I've kept "
+                    f"that — it's on screen.")
+        return (f"Removed {target.label}, sir. It held {_loss(fresh)} — that "
                 f"work is still on branch {fresh.branch}, which I've kept.")
 
     # ---------- internals ----------
@@ -538,23 +771,35 @@ class WorktreeCleanup:
         except Exception:  # noqa: BLE001 — the bus is the thing that just failed
             pass
 
-    def _take_offer(self) -> tuple[_Offer | None, str]:
-        """Consume the standing offer, or say why there isn't one.
+    def _peek_offer(self) -> tuple[_Offer | None, str]:
+        """The standing offer, or why there isn't one. Spends nothing.
 
-        One-shot: a second instruction cannot ride the same sentence, and an
-        offer that has aged out is not the description Keke is answering."""
-        offer, self._offer = self._offer, None
+        An offer that has aged out is not the description Keke is answering,
+        so it is dropped here rather than left to be found again later."""
+        offer = self._offer
         if offer is None:
             return None, ("I haven't gone through your worktrees yet, sir — "
                           "ask me to tidy up the worktrees and I'll tell you "
                           "what's there first.")
         if self._now() - offer.at > OFFER_TTL_S:
+            self._offer = None
             return None, ("That survey is stale now, sir — ask me to go "
                           "through the worktrees again.")
         return offer, ""
 
-    async def _remove(self, entry: SurveyEntry) -> tuple[bool, str]:
+    def _consume_offer(self) -> None:
+        """Spend the survey. One-shot: a second REMOVAL cannot ride one
+        spoken sentence. Called at the point of action, never on a refusal
+        that removed nothing — a refusal Keke is meant to answer must leave
+        something for the answer to land on."""
+        self._offer = None
+
+    async def _remove(self, entry: SurveyEntry) -> tuple[bool, str, bool]:
         """The ONE destructive call, and every gate in front of it.
+
+        Returns (removed, why-not, branch_deleted). The third value is an
+        OBSERVATION, not an intention: git is allowed to refuse the branch, and
+        the sentence that follows has to be phrased from what it actually did.
 
         Containment is checked here rather than only at the survey, because
         this is the last place before deletion: the offer is a dict a bug (or a
@@ -567,68 +812,123 @@ class WorktreeCleanup:
         check, and the branch-is-checked-out-there check are four proven
         failures' worth of reasoning and this module adds nothing to them."""
         if not entry.removable:
-            return False, f"refusing to remove {entry.path}: it is {entry.kind}"
+            return False, f"refusing to remove {entry.path}: it is {entry.kind}", False
         try:
             root = Path(self._fleet.worktrees_dir).resolve()
             target = Path(entry.path)
             resolved = target.resolve()
         except (OSError, RuntimeError, ValueError, AttributeError) as e:
-            return False, f"refusing to remove {entry.path}: unreadable path ({e})"
+            return False, f"refusing to remove {entry.path}: unreadable path ({e})", False
         if not target.is_absolute():
-            return False, f"refusing to remove {entry.path!r}: not an absolute path"
+            return False, f"refusing to remove {entry.path!r}: not an absolute path", False
         if root not in resolved.parents:
             return False, (f"refusing to remove {entry.path}: it is outside "
-                           f"{root}, which is the only directory I clean")
+                           f"{root}, which is the only directory I clean"), False
         record = Worktree(repo=entry.repo, path=str(target),
                           branch=entry.branch, base_commit=entry.base_commit)
         try:
             await remove_worktree(record)
         except (WorktreeError, asyncio.TimeoutError, OSError) as e:
-            return False, f"could not remove {entry.path}: {e}"
+            return False, f"could not remove {entry.path}: {e}", False
+        branch_deleted = False
         if entry.kind == KIND_EMPTY:
             # The branch is the record — but an empty worktree's branch has no
             # commits beyond base, so there is no record on it. `-d`, never
             # `-D`: git's own merged-ness check is a free second opinion, and
-            # if it disagrees with our count we keep the branch and say
-            # nothing more. A kept branch costs a line in `git branch`; a
-            # deleted one with commits on it costs the commits.
+            # when it disagrees with our count we keep the branch.
+            #
+            # It disagrees more often than it looks: `-d` measures merged-ness
+            # against HEAD, so any human who has switched the real checkout to
+            # a branch that does not contain the commit this worktree was cut
+            # from makes every one of these refuse. That outcome is CAPTURED
+            # and returned, because the sentence used to claim the branch went
+            # regardless — and once the directory is gone a branch nobody
+            # mentioned has nothing left to surface it. `orphan-branch` is the
+            # other half of this: it keeps the survivor visible.
             try:
                 await _git(Path(entry.repo), "branch", "-d", entry.branch)
-            except (WorktreeError, asyncio.TimeoutError, OSError):
-                pass
-        return True, ""
+                branch_deleted = True
+            except (WorktreeError, asyncio.TimeoutError, OSError) as e:
+                self._publish_error(f"kept branch {entry.branch}: {e}")
+        return True, "", branch_deleted
 
     async def _prune(self, offer: _Offer) -> int:
-        """`git worktree prune` on the repos whose stale registrations the
-        survey actually named. Destroys nothing: it deletes the administrative
-        file for a directory that is already gone, and never a branch, a ref or
-        an object — so for a worktree that held work, the branch that is now
-        its only trace survives this untouched.
+        """Clear the stale registrations the survey NAMED, one at a time.
 
-        Counted per REPO, not per fleet: reporting every stale entry as pruned
-        because one repo's prune succeeded would be a spoken claim about repos
-        this never reached."""
-        by_repo: dict[str, int] = {}
-        for path in offer.stale:
-            entry = offer.entries.get(path)
-            if entry is not None and entry.repo:
-                by_repo[entry.repo] = by_repo.get(entry.repo, 0) + 1
+        Not `git worktree prune`: that is a whole-repo sweep, and it would
+        also clear registrations this survey never mentioned — including a
+        human's own checkout that is only temporarily missing, whose
+        registration is exactly what `git worktree repair` needs to put it
+        back. The spoken count is the count of NAMED entries, so the action
+        has to be the named entries too.
+
+        `git worktree remove` on a registration whose directory is gone
+        deletes the administrative file and nothing else: not the branch, not
+        a ref, not an object. The directory's absence is RE-CHECKED here
+        first, because on a directory that is present the same command would
+        delete it — that is a removal nobody consented to, and it is refused
+        rather than raced."""
         pruned = 0
-        for repo, count in sorted(by_repo.items()):
+        try:
+            root = Path(self._fleet.worktrees_dir).resolve()
+        except (OSError, RuntimeError, ValueError, AttributeError) as e:
+            self._publish_error(f"could not prune: unreadable worktrees dir ({e})")
+            return 0
+        for path in sorted(offer.stale):
+            entry = offer.entries.get(path)
+            if entry is None or not entry.repo:
+                continue
+            target = Path(path)
             try:
-                await _git(Path(repo), "worktree", "prune")
-                pruned += count
+                resolved = target.resolve()
+                back = target.exists()
+            except (OSError, RuntimeError, ValueError) as e:
+                self._publish_error(f"could not prune {path}: unreadable ({e})")
+                continue
+            if not target.is_absolute() or root not in resolved.parents:
+                self._publish_error(f"refusing to prune {path}: it is outside "
+                                    f"{root}, which is the only directory I clean")
+                continue
+            if back:
+                self._publish_error(f"not pruning {path}: its directory is "
+                                    f"back since I read the survey to you")
+                continue
+            try:
+                await _git(Path(entry.repo), "worktree", "remove", "--force",
+                           str(target))
+                pruned += 1
             except (WorktreeError, asyncio.TimeoutError, OSError) as e:
-                self._publish_error(f"could not prune {repo}: {e}")
+                self._publish_error(f"could not prune {path}: {e}")
         return pruned
 
-    def _batch_sentence(self, removed, changed, failed, pruned) -> str:
+    def _batch_sentence(self, removed, kept_branch, changed, failed,
+                        pruned) -> str:
+        """Phrased from OUTCOMES. The branch clause in particular is never
+        assumed: git is entitled to refuse `-d`, and this sentence used to
+        claim the branches went anyway."""
         parts = []
         if removed:
-            parts.append("Removed one empty worktree, sir, and its branch."
-                         if len(removed) == 1 else
-                         f"Removed {len(removed)} empty worktrees, sir, and "
-                         f"their branches.")
+            n, kept = len(removed), len(kept_branch)
+            if not kept:
+                parts.append("Removed one empty worktree, sir, and its branch."
+                             if n == 1 else
+                             f"Removed {n} empty worktrees, sir, and their "
+                             f"branches.")
+            elif kept == n:
+                parts.append(f"Removed one empty worktree, sir, but git "
+                             f"wouldn't delete branch {kept_branch[0]}, so "
+                             f"I've kept it." if n == 1 else
+                             f"Removed {n} empty worktrees, sir, but git "
+                             f"wouldn't delete their branches, so I've kept "
+                             f"{_join(sorted(kept_branch))}.")
+            else:
+                parts.append(f"Removed {n} empty worktrees, sir, and "
+                             f"{n - kept} of their branches; git wouldn't "
+                             f"delete {_join(sorted(kept_branch))}, so I've "
+                             f"kept {'that' if kept == 1 else 'those'}.")
+            if kept:
+                parts.append("They're on screen." if kept > 1
+                             else "It's on screen.")
         if pruned:
             parts.append("Pruned one stale registration." if pruned == 1 else
                          f"Pruned {pruned} stale registrations.")
@@ -655,17 +955,27 @@ def _explains(entry: SurveyEntry, said: str) -> bool:
     silently ignored the rest of the instruction. A word explained by nothing
     here is a word this code did not understand, and consent is never inferred
     from that. Degrades safe: an unknown politeness costs one clarification, an
-    unknown destructive clause costs nothing at all."""
-    vocabulary = set(_POLITE)
-    vocabulary.add("worktree")
-    vocabulary.add("worktrees")
-    # Deliberately NOT the base commit: _words strips digits, so a sha
-    # contributes stray one- and two-letter tokens ("a", "b", "ed") that widen
-    # the whitelist for nothing — nobody names a worktree by its sha out loud.
+    unknown destructive clause costs nothing at all.
+
+    Explaining every word is necessary and NOT sufficient. The generic half of
+    the vocabulary — politeness, plus the word "worktree" itself — belongs to
+    every entry equally, so "remove the worktree for the", a plausible STT
+    truncation, used to tokenize to ["the"], match every entry alike, and
+    remove the only one whenever the survey held exactly one. So at least one
+    word must come from THIS entry's own identity: a name that names nothing
+    in particular names nothing at all."""
+    generic = set(_POLITE) | {"worktree", "worktrees"}
+    identity: set[str] = set()
+    # Deliberately NOT the base commit: a sha contributes stray one- and
+    # two-letter tokens ("a", "b", "ed") that widen the whitelist for nothing
+    # — nobody names a worktree by its sha out loud.
     for text in (entry.project, entry.branch, entry.label,
                  Path(entry.path).name):
-        vocabulary.update(_words(text or ""))
-    spoken = _words(said)
+        identity.update(_spoken_tokens(text or ""))
+    identity -= generic
+    spoken = _spoken_tokens(said)
     if not spoken:
         return False
-    return all(w in vocabulary for w in spoken)
+    if not any(w in identity for w in spoken):
+        return False
+    return all(w in generic or w in identity for w in spoken)
