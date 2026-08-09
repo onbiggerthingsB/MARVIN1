@@ -237,3 +237,53 @@ async def test_the_brain_survives_a_portfolio_explosion(monkeypatch):
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
+
+
+class PendingConfirm:
+    """An onboarding that is mid-question but does not understand the reply."""
+    awaiting = True
+    async def handle_reply(self, text):
+        return "ignored"
+
+
+async def test_a_pending_confirmation_owns_affirm_shaped_speech():
+    # "approved" is router-_AFFIRM but not onboarding-_YES. With a repo
+    # question pending AND a tool approval pending, it must be consumed by
+    # the confirmation gate — never resolve the approval, never reach the model.
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    router = Router()
+    router.open_approval("soccer", "npm test", now=time.time())
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=router, registry=confirmed_registry("soccer"),
+        onboarding=PendingConfirm()))
+    await asyncio.sleep(0)
+    bus.publish("command.received", {"text": "approved"})
+    await asyncio.sleep(0.05)
+    assert len(router.pending_approvals()) == 1      # approval untouched
+    assert butler.asked == []                        # model never consulted
+    assert any("yes or a no" in s for s in spk.spoke)
+    assert not task.done()
+    task.cancel()
+
+
+async def test_okay_answers_the_repo_question_not_the_tool_approval(tmp_path):
+    from server.discovery import Candidate as C
+    from server.onboarding import Onboarding
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    reg = Registry()
+    reg.merge_candidates([C(path="/p/soccer", name="soccer", sources=["t"])])
+    ob = Onboarding(bus, reg, tmp_path / "projects.json")
+    await ob.ask_next()                              # repo question now pending
+    router = Router()
+    router.open_approval("alethic", "rm -rf build", now=time.time())
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=router, registry=reg, onboarding=ob))
+    await asyncio.sleep(0)
+    bus.publish("command.received", {"text": "okay"})
+    await asyncio.sleep(0.05)
+    assert any(p.confirmed for p in reg.projects)    # the repo got its yes
+    assert len(router.pending_approvals()) == 1      # the approval did NOT
+    assert not task.done()
+    task.cancel()

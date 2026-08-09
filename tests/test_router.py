@@ -157,3 +157,14 @@ def test_unrelated_speech_after_expiry_is_not_reported_as_expired():
     router = Router()
     router.open_approval("soccer", "npm test", now=NOW)
     assert router.resolve_approval("what's the weather?", now=NOW + 601) == ("none", None)
+
+
+def test_bare_yes_no_is_shape_not_meaning():
+    from server.router import bare_yes_no
+    # bare affirmations and denials: owned by whichever question is pending
+    assert bare_yes_no("yes") and bare_yes_no("okay") and bare_yes_no("approved")
+    assert bare_yes_no("no, don't") and bare_yes_no("cancel that, please")
+    # addressed utterances name something and must keep flowing to the router
+    assert not bare_yes_no("approve soccer npm test")
+    assert not bare_yes_no("stop soccer")
+    assert not bare_yes_no("where did I leave the Tibet study?")

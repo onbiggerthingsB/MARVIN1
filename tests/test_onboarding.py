@@ -112,3 +112,22 @@ async def test_refresh_merges_and_reports_new(tmp_path, monkeypatch):
     monkeypatch.setattr("server.onboarding.discover", fake_discover)
     assert await ob.refresh(Path("/fake/home")) == 1
     assert any(p.name == "new" for p in r.projects)
+
+
+@pytest.mark.parametrize("said", ["okay", "sure", "go ahead", "do it"])
+async def test_router_affirmations_confirm_a_repo(tmp_path, said):
+    # Precondition 2: the router's _AFFIRM vocabulary and onboarding's _YES
+    # must agree, or an affirmation that only the router understands falls
+    # past the pending confirmation onto a pending tool approval.
+    ob, r = seeded(tmp_path)
+    await ob.ask_next()
+    assert await ob.handle_reply(said) == "confirmed"
+    assert any(p.confirmed for p in r.projects)
+
+
+async def test_refresh_survives_a_null_claude_json(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude.json").write_text("null", encoding="utf-8")
+    ob = Onboarding(EventBus(), Registry(), tmp_path / "projects.json")
+    assert await ob.refresh(home) == 0          # no raise, no candidates

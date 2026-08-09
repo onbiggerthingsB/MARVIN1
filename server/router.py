@@ -55,6 +55,16 @@ def _is_addressed(text: str) -> bool:
     return any(w not in _BARE_FILLER for w in _WORD.findall(text.lower()))
 
 
+def bare_yes_no(text: str) -> bool:
+    """A bare affirmation or denial that addresses nothing specific — the
+    shape a pending spoken question (repo confirm, data-source confirm) must
+    own TERMINALLY. Addressed utterances ("approve soccer npm test", "stop
+    soccer") keep flowing to the router: naming something is positive evidence
+    the speaker is not answering the pending question."""
+    t = (text or "").strip()
+    return bool((_AFFIRM.match(t) or _DENY.match(t)) and not _is_addressed(t))
+
+
 def _mentions_tool(tool: str, spoken_tokens: set[str]) -> bool:
     """Token-overlap tool match: every token of the tool appears in the
     utterance ("approve soccer npm test" mentions "npm test" but not

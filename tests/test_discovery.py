@@ -81,3 +81,22 @@ async def test_candidate_name_is_the_directory_name(tmp_path):
     (repo / ".git").mkdir(parents=True)
     home = fake_home(tmp_path, [str(repo)])
     assert (await discover(home))[0].name == "quant agent"
+
+
+def test_scan_claude_json_tolerates_valid_json_non_object(tmp_path):
+    # A bare null/list/string/number is valid JSON but not a census. The old
+    # code called .get on it and raised AttributeError straight out of
+    # discover(), which kills Onboarding.refresh() the first time Part 2
+    # actually calls it.
+    home = tmp_path / "h"
+    home.mkdir()
+    for bad in ("null", "[]", '"hello"', "3"):
+        (home / ".claude.json").write_text(bad, encoding="utf-8")
+        assert scan_claude_json(home) == []
+
+
+def test_scan_claude_json_tolerates_a_non_utf8_file(tmp_path):
+    home = tmp_path / "h"
+    home.mkdir()
+    (home / ".claude.json").write_bytes(b"\xff\xfe\x00{")
+    assert scan_claude_json(home) == []

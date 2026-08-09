@@ -43,9 +43,15 @@ def slug_for(path: str) -> str:
 
 
 def scan_claude_json(home: Path) -> list[str]:
+    """Paths recorded in ~/.claude.json. Tolerates EVERYTHING: a missing file,
+    broken JSON, non-UTF-8 bytes, and valid JSON that is not an object (null,
+    a list, a string). json.JSONDecodeError and UnicodeDecodeError are both
+    ValueError subclasses, so (OSError, ValueError) covers the lot."""
     try:
         raw = json.loads((Path(home) / ".claude.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
+        return []
+    if not isinstance(raw, dict):
         return []
     projects = raw.get("projects")
     return list(projects.keys()) if isinstance(projects, dict) else []

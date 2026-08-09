@@ -26,7 +26,8 @@ _CORRECTION = re.compile(
 # `right`/`correct` only count as a yes when they stand alone or follow
 # "that's" — bare `right\b` would confirm on filler like "right, hmm".
 _YES = re.compile(
-    r"^\s*(?:(?:yes|yeah|yep|confirm)\b"
+    r"^\s*(?:(?:yes|yeah|yep|yup|confirm|sure|ok|okay)\b"
+    r"|go\s+ahead\b|do\s+it\b"
     r"|that'?s\s+(?:it|right|correct)\b"
     r"|(?:right|correct)\s*[.!?]*\s*$)", re.I)
 _NO = re.compile(r"^\s*(?:no|nope|skip|not\s+(?:that|it)|wrong)\b", re.I)
@@ -44,6 +45,12 @@ class Onboarding:
         self.path = Path(registry_path)
         self._asking: Project | None = None
         self._rejected: set[str] = set()  # paths, not names — names can collide
+
+    @property
+    def awaiting(self) -> bool:
+        """True while a spoken confirmation is pending. The brain uses this to
+        make the pending question OWN every bare yes/no-shaped utterance."""
+        return self._asking is not None
 
     def _publish_counts(self) -> None:
         self.bus.publish("registry.updated", {

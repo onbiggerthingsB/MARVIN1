@@ -6,6 +6,7 @@ import time
 
 from server.butler import ButlerUnavailable
 from server.finance import TRADE_REFUSAL, find_finance_project, portfolio_brief
+from server.router import bare_yes_no
 from server.vault_paths import vault_root_from_env
 from server.vault_write import vault_capture
 
@@ -189,14 +190,27 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                     continue
 
                 # A pending confirmation owns the next utterance ("...right?").
+                # `awaiting` is read BEFORE handle_reply (which clears it on a
+                # terminal outcome), and inside the guard — it is a property on
+                # an injected object and can raise like anything else.
                 if onboarding is not None:
-                    outcome = "ignored"
+                    outcome, awaiting = "ignored", False
                     try:
+                        awaiting = bool(onboarding.awaiting)
                         outcome = await onboarding.handle_reply(text)
                     except Exception as e:  # noqa: BLE001 — onboarding must not kill the brain
                         bus.publish("butler.error", {"reason": f"onboarding failed: {e}"})
                     if outcome != "ignored":
                         await _speak("Noted, sir." if outcome != "rejected" else "Understood.")
+                        continue
+                    if awaiting and bare_yes_no(text):
+                        # Precondition 2 (Part 1 final review): the pending
+                        # question owns yes/no-shaped speech TERMINALLY. Without
+                        # this, any affirmation onboarding doesn't parse
+                        # ("approved" today; any future vocabulary drift) falls
+                        # through and resolves a pending TOOL approval Keke was
+                        # never read. Addressed utterances ("stop soccer") pass.
+                        await _speak("About the repo, sir — is that a yes or a no?")
                         continue
 
                 # Dangerous verbs are parsed deterministically, never by the model.
