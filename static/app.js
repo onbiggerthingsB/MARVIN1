@@ -20,7 +20,25 @@ function connectSSE() {
   // Deliberate: reconnect fresh (no Last-Event-ID). Replaying stale tts.start/
   // stt.utterance on a live-voice UI would double-trigger playback. Server-side
   // replay (ring buffer + bus.gap) stays ready for a future non-voice consumer.
+  //
+  // But "no replay" also meant "no resync": everything published during the
+  // gap was lost permanently, INCLUDING approval.request. The card never
+  // appeared, nothing re-fetched, and a worker could sit blocked for its full
+  // 600s TTL with no card and no spoken line. /fleet is the resync, and it
+  // runs on every (re)connect — onopen fires for the first connection too.
+  es.onopen = () => refreshFleet();
   es.onerror = () => { es.close(); setTimeout(connectSSE, 1000); };
+}
+
+// Tiles AND still-pending approval cards, from the one cookie-authed route.
+// Both renderers are idempotent — tiles keyed by worker, cards by nonce — so a
+// duplicate refresh cannot double-paint. Failure is silent by design: a missing
+// resync must not block the console coming online.
+function refreshFleet() {
+  fetch("/fleet").then((r) => r.json()).then((d) => {
+    (d.workers || []).forEach(renderFleetTile);
+    (d.approvals || []).forEach(renderApproval);
+  }).catch(() => {});
 }
 
 async function loadChime(name) {
@@ -53,14 +71,12 @@ $("#setup-btn").addEventListener("click", async () => {
     $("#setup-overlay").hidden = true;
     $("#console").hidden = false;
     connectSSE();
-    // Page load only. SSE carries every LATER tile, but it reconnects without
-    // a Last-Event-ID, so anything published before this browser existed —
-    // above all the restart ghosts, which are published once at boot — is
-    // only ever visible through this fetch. Failure is silent by design: a
-    // missing initial render must not block the console coming online.
-    fetch("/fleet").then((r) => r.json())
-      .then((d) => (d.workers || []).forEach(renderFleetTile))
-      .catch(() => {});
+    // Belt to connectSSE's onopen braces. SSE carries every LATER tile, but it
+    // reconnects without a Last-Event-ID, so anything published before this
+    // browser existed — above all the restart ghosts, published once at boot,
+    // and any approval already waiting — reaches the page only through this
+    // route. Idempotent, so running it here and on every connect is safe.
+    refreshFleet();
     window.jarvis.setStatus("online — hold to talk");
   } catch (err) {
     $("#setup-status").textContent = `setup failed: ${err.message} — fix and click again`;
@@ -388,6 +404,13 @@ window.jarvis.onEvent("fleet.message", (d) => {
 window.jarvis.onEvent("fleet.error", (d) => {
   window.jarvis.setStatus("fleet: " + (d.reason || "error"));
 });
+// A session JARVIS does not own POSTed a hook. Console only — never spoken:
+// it is not a worker of ours dying, and a misconfigured worktree could emit
+// these in a stream.
+window.jarvis.onEvent("fleet.unknown_session", (d) => {
+  window.jarvis.setStatus(
+    `unowned session: ${d.event || "hook"} from ${d.cwd || "?"}`);
+});
 window.jarvis.onEvent("fleet.transcript", (d) => {
   // #worker-transcript, NOT #transcript: that id is the live STT pane, and a
   // duplicate id would route these lines there (querySelector's first match).
@@ -407,12 +430,38 @@ window.jarvis.onEvent("fleet.handoff", (d) => {
   // textContent, never innerHTML: this string is a server-built shell command.
   tile.querySelector(".tile-resume").textContent = d.command || "";
 });
-window.jarvis.onEvent("approval.request", (d) => {
+// Every string below is WORKER-SUPPLIED — a tool name and its arguments, chosen
+// by a model in a disposable checkout. textContent everywhere, never innerHTML.
+function renderApproval(d) {
+  // Idempotent by nonce: /fleet replays pending cards on every SSE (re)connect
+  // and the live event may arrive too, but one request is one card.
+  if (document.querySelector(`#interrupts .interrupt[data-nonce="${
+      CSS.escape(d.nonce || "")}"]`)) return;
   const card = document.createElement("div");
   card.className = "interrupt";
+  // The card says what the SENTENCE says. `outside` first so `risky` wins the
+  // border when a command is both.
+  if (d.outside) card.classList.add("outside");
+  if (d.risk) card.classList.add("risky");
   card.dataset.nonce = d.nonce;
   const q = document.createElement("div");
-  q.textContent = `${d.project}: ${d.tool} — ${d.args}`;
+  q.className = "interrupt-head";
+  q.textContent = `${d.project}: ${d.tool}`;
+  // The two warnings used to exist ONLY in the spoken half, so a click
+  // approved something the console had never warned about.
+  const note = document.createElement("div");
+  note.className = "interrupt-note";
+  note.textContent = [d.risk, d.outside].filter(Boolean).join(" ");
+  // The full, UNELIDED argument. Speech cuts the middle out of a long shell
+  // line — the elided middle of a real 347-character command was an `rm -rf`
+  // on the vault — so this is the only surface in JARVIS that shows the exact
+  // thing being approved. Falls back to the spoken form for older payloads.
+  const full = document.createElement("pre");
+  full.className = "interrupt-args";
+  full.textContent = d.full_args || d.args || "";
+  const where = document.createElement("div");
+  where.className = "interrupt-where";
+  where.textContent = d.worktree ? `worktree: ${d.worktree}` : "";
   const send = (decision) => fetch("/approval", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ nonce: d.nonce, decision }),
@@ -428,9 +477,11 @@ window.jarvis.onEvent("approval.request", (d) => {
   const no = document.createElement("button");
   no.textContent = "Deny";
   no.addEventListener("click", () => send("deny"));
-  card.append(q, yes, no);
+  card.append(q, note, full, where, yes, no);
   $("#interrupts").appendChild(card);
-});
+  return card;
+}
+window.jarvis.onEvent("approval.request", renderApproval);
 window.jarvis.onEvent("approval.resolved", (d) => {
   // EVERY outcome removes the card — approved, denied, expired, cancelled,
   // and anything a later task adds. An unknown outcome must never leave a

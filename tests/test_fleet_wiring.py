@@ -321,6 +321,55 @@ async def test_approval_request_cards_are_spoken():
     task.cancel()
 
 
+async def test_a_worker_dying_is_spoken_once_and_only_once():
+    """`fleet.error` was never spoken at all, so a worker's stream dying, a
+    failed health probe and an unknown session were all SILENT — and because
+    UNKNOWN counts as live, the dead worker permanently blocked admission: a
+    project Keke was told is "queued at position 1" never started, and JARVIS
+    never mentioned it again.
+
+    THE RULE: an error that NAMES a worker is a fact about a project Keke
+    asked for, and gets exactly one sentence. Repeats for the same worker are
+    console-only (a dying stream can publish a storm), and errors carrying no
+    worker — a full disk, a tick fault, a spawn failure the spawn call already
+    spoke for — are never spoken at all."""
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    task = await brain(bus, butler, spk, router=Router(),
+                       registry=confirmed_registry("soccer"), fleet=FakeFleet())
+    bus.publish("fleet.error", {"worker": "w1", "project": "soccer",
+                                "reason": "worker stream died: boom"})
+    await asyncio.sleep(0.05)
+    assert len([s for s in spk.spoke if "soccer" in s]) == 1
+    said = next(s for s in spk.spoke if "soccer" in s)
+    assert "unknown" in said.lower() and "stop" in said.lower()
+    for i in range(5):                       # a storm from the SAME worker
+        bus.publish("fleet.error", {"worker": "w1", "project": "soccer",
+                                    "reason": f"health probe failed {i}"})
+    await asyncio.sleep(0.05)
+    assert len([s for s in spk.spoke if "soccer" in s]) == 1
+    bus.publish("fleet.error", {"worker": "w2", "project": "alethic",
+                                "reason": "health probe failed"})
+    await asyncio.sleep(0.05)
+    assert any("alethic" in s for s in spk.spoke)      # a different worker IS news
+    before = len(spk.spoke)
+    bus.publish("fleet.error", {"reason": "event log failed: disk full"})
+    bus.publish("fleet.error", {"reason": "tick failed: boom"})
+    await asyncio.sleep(0.05)
+    assert len(spk.spoke) == before                    # infrastructure stays quiet
+    assert not task.done()
+    task.cancel()
+
+
+async def test_the_brain_survives_a_poisoned_fleet_error():
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    task = await brain(bus, butler, spk, router=Router(),
+                       registry=confirmed_registry("soccer"), fleet=FakeFleet())
+    bus.publish("fleet.error", None)                   # data=None, no dict
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    task.cancel()
+
+
 async def test_the_brain_survives_a_fleet_explosion():
     class BoomFleet:
         workers = []                                       # parse stays sane

@@ -30,5 +30,22 @@ footer { opacity: 0.6; font-size: 0.8rem; }
   padding: 0.3rem; background: #101820; border: 1px solid #2e6da4;
   border-radius: 4px; user-select: text; overflow-wrap: anywhere; }
 #interrupts .interrupt { border: 1px solid #a63; border-radius: 8px; padding: 0.6rem; margin: 0.3rem 0; }
+/* A request that leaves the worktree — or one that can destroy things — must
+   not look like a routine `npm test`. .risky is declared LAST so it wins the
+   border when a command is both. */
+#interrupts .interrupt.outside { border-color: #e0a030; }
+#interrupts .interrupt.risky { border-color: #e0524d; background: #1e1012; }
+#interrupts .interrupt-head { font-weight: bold; }
+#interrupts .interrupt-note:not(:empty) { font-size: 0.8rem; color: #ffb3ae;
+  margin: 0.3rem 0; }
+/* The FULL command, unelided — the only surface in JARVIS that shows it.
+   Selectable so Keke can read or copy it, wrapped rather than clipped, and
+   height-capped so a huge argument cannot push the buttons off screen. */
+#interrupts .interrupt-args:not(:empty) { font-size: 0.75rem;
+  white-space: pre-wrap; overflow-wrap: anywhere; user-select: text;
+  max-height: 12rem; overflow-y: auto; margin: 0.3rem 0; padding: 0.3rem;
+  background: #101820; border: 1px solid #2e6da4; border-radius: 4px; }
+#interrupts .interrupt-where:not(:empty) { font-size: 0.7rem; opacity: 0.6;
+  overflow-wrap: anywhere; margin-bottom: 0.4rem; }
 #interrupts button { margin-right: 0.5rem; }
 #worker-transcript { max-height: 14rem; overflow-y: auto; font-size: 0.8rem; white-space: pre-wrap; }

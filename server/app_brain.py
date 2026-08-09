@@ -119,6 +119,11 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
     first portfolio ask names the output file and waits for a spoken yes.
     """
     cid, q = bus.subscribe()
+    # Worker ids whose failure has already been spoken. One sentence per
+    # worker, ever: a dying stream publishes fleet.error repeatedly and the
+    # speech queue must not become a megaphone for it. Bounded by the number
+    # of workers a session creates, which is what `self.workers` already is.
+    spoken_worker_failures: set[str] = set()
 
     def _reason(e) -> str:
         # asyncio.TimeoutError stringifies to "", which would publish a blank
@@ -265,6 +270,38 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                     text_out = ""
                 if text_out:
                     await _speak(text_out)
+                continue
+            if etype == "fleet.error":
+                # A worker dying was SILENT: the stream ending, a failed health
+                # probe, an unknown session — none of it was ever spoken. And
+                # UNKNOWN counts as `live`, so the corpse permanently blocks
+                # admission: a project Keke was told is "queued at position 1"
+                # never starts, and JARVIS never mentions it again.
+                #
+                # THE RULE, chosen to be honest without being chatty:
+                #   * an error that NAMES a worker is a fact about a project
+                #     Keke asked for — one sentence, once;
+                #   * every repeat for that same worker is console-only, so a
+                #     dying stream cannot flood the speech queue (the storm is
+                #     bounded by the number of workers, not by the number of
+                #     failures);
+                #   * an error with no worker — a full disk, a tick fault, a
+                #     spawn failure the spawn call already spoke for — is
+                #     never spoken. It has no project to name and nothing for
+                #     Keke to do.
+                # Guarded like every other handler: a malformed event costs
+                # this sentence, never the loop.
+                try:
+                    d = data if isinstance(data, dict) else {}
+                    worker = str(d.get("worker") or "")
+                    project = str(d.get("project") or "") or "A worker"
+                except Exception:  # noqa: BLE001
+                    worker, project = "", ""
+                if worker and worker not in spoken_worker_failures:
+                    spoken_worker_failures.add(worker)
+                    await _speak(f"Sir, {project} has stopped — I've marked it "
+                                 f"unknown. It still holds the slot until you "
+                                 f"stop it.")
                 continue
             if etype in ("stt.utterance", "command.received"):
                 if etype == "stt.utterance":
