@@ -172,6 +172,70 @@ async def test_voice_approval_is_delivered_to_the_fleet():
     task.cancel()
 
 
+async def test_a_mixed_polarity_answer_asks_and_leaves_the_approval_pending():
+    """"sure, cancel that" / "yeah, stop it" / "sure, stop soccer" used to
+    APPROVE the pending tool call (_AFFIRM anchors on the opener; _DENY never
+    sees the refusal). The brain must ask a clarifying question instead —
+    nothing resolved, nothing delivered, card still on screen."""
+    for said in ("sure, cancel that", "yeah, stop it", "sure, stop soccer"):
+        bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+        router, fleet = Router(), FakeFleet()
+        router.open_approval("soccer", "Bash: rm -rf build",
+                             now=time.time(), path="/p/soccer")
+        task = await brain(bus, butler, spk, router=router,
+                           registry=confirmed_registry("soccer"), fleet=fleet)
+        cid, q = bus.subscribe()
+        bus.publish("command.received", {"text": said})
+        await asyncio.sleep(0.05)
+        resolved = []
+        while not q.empty():
+            ev = q.get_nowait()
+            if ev and ev["type"] == "approval.resolved":
+                resolved.append(ev["data"])
+        bus.unsubscribe(cid)
+        assert resolved == [], said                        # nothing resolved
+        assert all(c[0] != "deliver" for c in fleet.calls), said
+        assert len(router.pending_approvals()) == 1, said  # card stays
+        assert any("yes and a no" in s for s in spk.spoke), said
+        assert "Approved, sir." not in spk.spoke, said
+        assert butler.asked == [], said                    # never the model's turn
+        task.cancel()
+
+
+async def test_a_deliver_failure_speaks_truth_and_publishes_nothing():
+    """Voice path, deliver_approval raises. Deliver runs FIRST (the /approval
+    order), so no approval.resolved goes out for a worker that never got the
+    decision — and the turn ends with a truthful failure sentence instead of
+    falling through to butler.ask("yes, go ahead")."""
+    class BoomDeliverFleet(FakeFleet):
+        def deliver_approval(self, nonce, approved):
+            raise RuntimeError("delivery broke")
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    router, fleet = Router(), BoomDeliverFleet()
+    router.open_approval("soccer", "Bash: npm test",
+                         now=time.time(), path="/p/soccer")
+    task = await brain(bus, butler, spk, router=router,
+                       registry=confirmed_registry("soccer"), fleet=fleet)
+    cid, q = bus.subscribe()
+    bus.publish("command.received", {"text": "yes, go ahead"})
+    await asyncio.sleep(0.05)
+    resolved, errors = [], []
+    while not q.empty():
+        ev = q.get_nowait()
+        if ev and ev["type"] == "approval.resolved":
+            resolved.append(ev["data"])
+        if ev and ev["type"] == "butler.error":
+            errors.append(ev["data"]["reason"])
+    bus.unsubscribe(cid)
+    assert resolved == []                      # no false "approved" announce
+    assert any("approval handling failed" in r for r in errors)
+    assert "Approved, sir." not in spk.spoke   # never claims success
+    assert any("failed" in s.lower() for s in spk.spoke)   # the truthful line
+    assert butler.asked == []                  # no unrelated vault answer
+    assert not task.done()                     # the brain survives
+    task.cancel()
+
+
 async def test_approval_request_cards_are_spoken():
     bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
     task = await brain(bus, butler, spk, router=Router(),

@@ -358,7 +358,12 @@ window.jarvis.onEvent("approval.request", (d) => {
   const send = (decision) => fetch("/approval", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ nonce: d.nonce, decision }),
-  }).then(() => card.remove());
+  }).then(() => card.remove())
+    // A network failure correctly KEEPS the card (the nonce is still live and
+    // the click can be retried) — but without a catch it is also an unhandled
+    // rejection. Say what happened instead.
+    .catch(() => window.jarvis.setStatus(
+      `approval ${decision} failed to send: ${d.project} — try again`));
   const yes = document.createElement("button");
   yes.textContent = "Approve";
   yes.addEventListener("click", () => send("approve"));

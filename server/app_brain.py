@@ -317,9 +317,12 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                 # project — "stop soccer" — is positive evidence of a fleet
                 # command and wins; an utterance that names no project ("yes",
                 # bare "no", bare "cancel") may answer a pending approval first.
-                # The affirm vocabulary never overlaps any verb pattern, so no
-                # reading of this tie can ever APPROVE something unintended —
-                # both residual misreadings are refusals, which fail safe.
+                # The affirm vocabulary DOES leak into this tie the other way:
+                # an affirm opener defeats the anchored verb patterns, so
+                # "sure, stop soccer" parses as no command and lands in
+                # resolve_approval carrying both polarities. The router fails
+                # closed on that shape ("unclear", below) — it never resolves,
+                # and the brain asks instead.
                 # EVERY router touch below sits inside ONE try: the pending
                 # check, the resolve call, and the dereference of the returned
                 # approval. Two shipped bugs came from expressions evaluated
@@ -329,27 +332,49 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                 # .tool / .nonce reads were the third instance — a router
                 # fault (or a contract-violating ("approved", None) return)
                 # raised straight out of the loop and killed the brain.
-                state, approval = "none", None
+                state, approval, resolving = "none", None, False
                 if router is not None:
                     try:
                         if (router.pending_approvals()
                                 and not (command is not None
                                          and (command.project
                                               or command.needs_disambiguation))):
+                            resolving = True
                             state, approval = router.resolve_approval(text, time.time())
                             if state in ("approved", "denied") and approval is not None:
-                                bus.publish("approval.resolved", {
-                                    "outcome": state, "project": approval.project,
-                                    "tool": approval.tool, "nonce": approval.nonce})
+                                # Deliver FIRST, publish second — the order
+                                # /approval already uses (take, deliver,
+                                # publish). Publish-first announced a
+                                # resolution the worker might never receive:
+                                # a raising deliver left the card removed,
+                                # the status reading "approved", and the
+                                # worker blocked until its TTL published a
+                                # contradicting "expired".
                                 if fleet is not None:
                                     # unblock the worker's can_use_tool future;
                                     # same try — a delivery fault is an approval
                                     # fault, handled by this guard.
                                     fleet.deliver_approval(approval.nonce,
                                                            state == "approved")
+                                bus.publish("approval.resolved", {
+                                    "outcome": state, "project": approval.project,
+                                    "tool": approval.tool, "nonce": approval.nonce})
                     except Exception as e:  # noqa: BLE001 — a router fault must never kill the brain
                         bus.publish("butler.error",
                                     {"reason": f"approval handling failed: {e}"})
+                        if resolving:
+                            # The utterance was consent-shaped enough to reach
+                            # the resolver, and resolution FAILED. Falling
+                            # through would hand "yes, go ahead" to the
+                            # butler, which answers some unrelated question
+                            # while the worker stays blocked. Speak the truth
+                            # and end the turn. (A pending_approvals() fault
+                            # keeps the M3.1 fall-through: the utterance was
+                            # never classified, so the butler still owns it.)
+                            await _speak("Sorry sir — approval handling "
+                                         "failed on my side; details are on "
+                                         "screen.")
+                            continue
                         state, approval = "none", None
                 if state in ("approved", "denied"):
                     await _speak("Approved, sir." if state == "approved"
@@ -358,6 +383,13 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                 if state == "ambiguous":
                     await _speak("More than one approval is pending, sir — "
                                  "name the project.")
+                    continue
+                if state == "unclear":
+                    # Mixed polarity ("sure, cancel that", "no, go ahead"):
+                    # the router refused to resolve. The approval is still
+                    # pending and the card is still on screen — ask.
+                    await _speak("Sir, that sounded like both a yes and a no "
+                                 "— approve or deny?")
                     continue
                 if state == "expired":
                     await _speak("That approval expired, sir.")

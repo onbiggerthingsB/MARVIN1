@@ -340,6 +340,34 @@ async def test_stop_rejects_pending_approvals_first(tmp_path, monkeypatch):
     assert w.machine.base == CLOSED
 
 
+async def test_stopping_a_worker_publishes_cancelled_for_its_pending_approval(tmp_path, monkeypatch):
+    """shutdown() rejects the pending future and sweeps the nonce, but only an
+    approval.resolved event removes the console card — without the publish,
+    "stop soccer" leaves the card on screen until a manual click 404s it or
+    the page reloads."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    path = repo(tmp_path)
+    await fleet.spawn("soccer", path, "task")
+    w = fleet.workers[0]
+    decision = asyncio.create_task(w._on_tool_request(
+        "Bash", {"command": "npm test"}, SimpleNamespace(title=None)))
+    await asyncio.sleep(0.05)
+    nonce = router.pending_approvals()[0].nonce
+    cid, q = bus.subscribe()
+    await fleet.stop(path)
+    await asyncio.wait_for(decision, 1)
+    resolved = []
+    while not q.empty():
+        ev = q.get_nowait()
+        if ev and ev["type"] == "approval.resolved":
+            resolved.append(ev["data"])
+    bus.unsubscribe(cid)
+    assert [r["outcome"] for r in resolved] == ["cancelled"]  # exactly once
+    assert resolved[0]["nonce"] == nonce                      # the card's key
+    assert resolved[0]["project"] == "soccer"
+    assert "npm test" in resolved[0]["tool"]
+
+
 # ---------- regression: the parked-forever WAITING_PERMISSION state ----------
 async def test_notification_after_permission_done_live_consumer(tmp_path, monkeypatch):
     """A stale Notification POST landing AFTER can_use_tool resolved must not

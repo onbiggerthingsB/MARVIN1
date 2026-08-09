@@ -31,6 +31,9 @@ from server.vault_read import vault_is_downloaded
 COOKIE = "jarvis_session"
 OPEN_PATHS = {"/health", "/bootstrap"}
 BEARER_PATHS = {"/wake", "/hooks"}
+# Fleet ticker cadence. Module-level so tests can shrink it and observe real
+# ticks — the only honest pin that the lifespan actually schedules the ticker.
+FLEET_TICK_S = 5.0
 
 
 def _existing_note_titles(titles, vault_root: Path) -> set:
@@ -197,7 +200,15 @@ def create_app(base_dir: Path) -> FastAPI:
     @app.post("/approval")
     async def approval(request: Request):
         # The console click path — same nonce discipline as the voice path.
-        body = await request.json()
+        # Body parsing is guarded for parity with /hooks: cookie-authed and
+        # unreachable from the shipped console, but a malformed body must be
+        # a 400, never a 500.
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "bad shape"}, status_code=400)
         nonce = str(body.get("nonce", ""))
         decision = body.get("decision")
         if decision not in ("approve", "deny") or not nonce:
@@ -339,20 +350,41 @@ def create_app(base_dir: Path) -> FastAPI:
             # QUIET is derived: someone must look at the clock. A tick fault
             # is reported and survived — the ticker must outlive any bug.
             while True:
-                await asyncio.sleep(5)
+                await asyncio.sleep(FLEET_TICK_S)
                 try:
                     await app.state.fleet.tick()
                 except Exception as e:  # noqa: BLE001
                     app.state.bus.publish("fleet.error",
                                           {"reason": f"tick failed: {e}"})
         ticker = asyncio.create_task(_fleet_ticker())
+
+        def _ticker_died(t):
+            # Same last resort as _brain_died: the loop above guards every
+            # tick, so reaching here means something escaped it — and a dead
+            # ticker is otherwise perfectly silent while both of its safety
+            # nets (the WAITING_PERMISSION rescue and the queue drain) go
+            # dark. Cancellation is the normal shutdown path.
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                app.state.bus.publish("fleet.error",
+                                      {"reason": f"fleet ticker died: {exc!r}"})
+
+        ticker.add_done_callback(_ticker_died)
         try:
             yield
         finally:
             ticker.cancel()
             task.cancel()
             for t in (ticker, task):
-                with contextlib.suppress(asyncio.CancelledError):
+                # suppress EVERYTHING, not just CancelledError: a task that
+                # already died with a real exception re-raises it from this
+                # await, and letting it out of the finally would skip
+                # close_all() (log flush, orderly worker shutdown) and
+                # butler.close(). The done-callbacks above have already
+                # reported any such exception — nothing is silenced here.
+                with contextlib.suppress(BaseException):
                     await t
             await app.state.fleet.close_all()
             await app.state.butler.close()

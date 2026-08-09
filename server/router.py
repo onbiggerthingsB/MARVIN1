@@ -33,6 +33,40 @@ _TRADE = re.compile(
 _AFFIRM = re.compile(r"^\s*(?:yes|yeah|yep|sure|ok|okay|go ahead|do it|approve[d]?)\b", re.I)
 _DENY = re.compile(r"^\s*(?:no|nope|deny|don'?t|stop|cancel|reject)\b", re.I)
 
+# Mixed-polarity guard (Task 8 review). _AFFIRM and _DENY anchor on the FIRST
+# word, so "sure, cancel that" reads as an affirmation while carrying a
+# refusal — and consent must never ride on the opener alone (the same rule
+# onboarding's _NEGATION already enforces for repo confirmation). These sets
+# are the SAME vocabulary the two prefix regexes anchor on, searched anywhere.
+_AFFIRM_WORDS = frozenset({"yes", "yeah", "yep", "sure", "ok", "okay",
+                           "approve", "approved"})
+_DENY_WORDS = frozenset({"no", "nope", "deny", "denied", "don't", "dont",
+                         "stop", "cancel", "reject"})
+# Affirm evidence is discounted when negated: "no, don't do it now" carries
+# "do it", but negated it is denial elaboration, not a second polarity.
+# "no" itself is NOT a negator here — "no, go ahead" is genuinely two-faced
+# and must stay a conflict, while "don't go ahead" is a plain denial.
+_AFFIRM_PHRASES = frozenset({("go", "ahead"), ("do", "it")})
+_NEGATORS = frozenset({"don't", "dont", "not", "never"})
+
+
+def _polarity_conflict(text: str) -> bool:
+    """True when one utterance carries BOTH consent polarities — "sure,
+    cancel that", "yeah, stop it", "no, go ahead". resolve_approval must
+    FAIL CLOSED on that shape: resolve nothing, let the brain ask."""
+    words = _WORD.findall(text.lower())
+    deny = any(w in _DENY_WORDS for w in words)
+    if not deny:
+        return False
+    for i, w in enumerate(words):
+        if i > 0 and words[i - 1] in _NEGATORS:
+            continue                       # "don't approve", "don't do it"
+        if w in _AFFIRM_WORDS:
+            return True
+        if i + 1 < len(words) and (w, words[i + 1]) in _AFFIRM_PHRASES:
+            return True
+    return False
+
 # Words that may appear in a BARE affirmation/denial without addressing
 # anything specific ("yes, go ahead", "no, don't do it now, please").
 # Any other alphabetic token means the utterance names something, and it
@@ -252,6 +286,17 @@ class Router:
         self._sweep(now)
         if not self._approvals:
             return ("expired", None) if had else ("none", None)
+
+        # Mixed polarity FAILS CLOSED: an affirm opener stapled to a refusal
+        # ("sure, cancel that", "yeah, stop it", "sure, stop soccer") — or the
+        # mirror ("no, go ahead") — must never resolve anything. The prefix
+        # regexes see only the first word; this check sees the whole
+        # utterance. "unclear" leaves every approval pending so the brain can
+        # ask a clarifying question and the card stays on screen. Checked
+        # AFTER the empty-pending returns above so unrelated conversation
+        # still cannot leak approval state.
+        if _polarity_conflict(text):
+            return ("unclear", None)
 
         lowered = text.lower()
         matched = [a for a in self._approvals if a.project.lower() in lowered]

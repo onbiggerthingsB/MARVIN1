@@ -101,6 +101,46 @@ def test_wake_requires_hook_bearer(tmp_path):
     assert r.status_code == 200
 
 
+def test_hooks_requires_bearer_and_rejects_the_session_cookie(tmp_path):
+    # /hooks is the worktree curl's lane: bearer-only. A session cookie must
+    # buy nothing here — the browser's credential never authorizes hook POSTs.
+    c = make_client(tmp_path)
+    payload = {"hook_event_name": "Stop", "session_id": "s-1", "cwd": "/x"}
+    assert c.post("/hooks", json=payload).status_code == 401
+    bootstrap(c)                                     # cookie now rides along
+    assert c.post("/hooks", json=payload).status_code == 401
+    hdrs = {"Authorization": f"Bearer {c.app.state.cfg.hook_bearer}"}
+    assert c.post("/hooks", json=payload, headers=hdrs).status_code == 200
+    # malformed payloads are 400s, never 500s
+    assert c.post("/hooks", content=b"not json", headers=hdrs).status_code == 400
+    assert c.post("/hooks", json=["not", "a", "dict"], headers=hdrs).status_code == 400
+
+
+def test_approval_requires_cookie_and_rejects_the_bearer(tmp_path):
+    # /approval is the console click's lane: cookie-only. The hook bearer —
+    # which lives in every worktree's settings file — must buy nothing here,
+    # or any worker with one approved curl could approve its own next tool.
+    c = make_client(tmp_path)
+    body = {"nonce": "deadbeef", "decision": "approve"}
+    assert c.post("/approval", json=body).status_code == 401
+    hdrs = {"Authorization": f"Bearer {c.app.state.cfg.hook_bearer}"}
+    assert c.post("/approval", json=body, headers=hdrs).status_code == 401
+    bootstrap(c)
+    assert c.post("/approval", json=body).status_code == 404     # stale nonce
+    # malformed bodies are 400s, never 500s (parity with /hooks)
+    assert c.post("/approval", content=b"{{{",
+                  headers={"Content-Type": "application/json"}).status_code == 400
+    assert c.post("/approval", json=["not", "a", "dict"]).status_code == 400
+    assert c.post("/approval",
+                  json={"nonce": "x", "decision": "maybe"}).status_code == 400
+    # a live nonce resolves and is consumed
+    a = c.app.state.router.open_approval("soccer", "Bash: npm test",
+                                         now=time_mod.time(), path="/p/soccer")
+    r = c.post("/approval", json={"nonce": a.nonce, "decision": "deny"})
+    assert r.status_code == 200
+    assert c.app.state.router.pending_approvals() == []
+
+
 def test_cross_origin_rejected(tmp_path):
     c = make_client(tmp_path)
     bootstrap(c)

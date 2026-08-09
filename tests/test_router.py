@@ -159,6 +159,50 @@ def test_unrelated_speech_after_expiry_is_not_reported_as_expired():
     assert router.resolve_approval("what's the weather?", now=NOW + 601) == ("none", None)
 
 
+# ---------- mixed polarity fails closed (Task 8 review) ----------
+# _AFFIRM anchors on the FIRST word, so an affirm opener stapled to a refusal
+# ("sure, cancel that") used to read as an approval — the fail-open direction
+# on a path that executes real tools. Both polarities in one utterance must
+# resolve NOTHING and leave the approval pending for a clarifying question.
+
+@pytest.mark.parametrize("said", [
+    "sure, cancel that",          # bare: every other token is filler
+    "yeah, stop it",
+    "sure, stop soccer",          # addressed: names the pending project
+])
+def test_an_affirm_prefixed_refusal_never_approves(said):
+    router = Router()
+    router.open_approval("soccer", "Bash: rm -rf build", now=NOW)
+    state, appr = router.resolve_approval(said, now=NOW + 5)
+    assert state == "unclear" and appr is None
+    assert len(router.pending_approvals()) == 1      # card stays on screen
+
+
+def test_a_deny_prefixed_affirmation_never_resolves():
+    # The mirror direction: "no, go ahead" is genuinely two-faced and must
+    # not be read as a denial (or an approval) on its opener alone.
+    router = Router()
+    router.open_approval("soccer", "Bash: npm test", now=NOW)
+    state, appr = router.resolve_approval("no, go ahead", now=NOW + 5)
+    assert state == "unclear" and appr is None
+    assert len(router.pending_approvals()) == 1
+
+
+def test_a_negated_affirm_phrase_is_still_a_plain_denial():
+    # "no, don't do it now, please" carries "do it" — but negated. It is the
+    # canonical bare denial from _BARE_FILLER's docstring and must stay one.
+    router = Router()
+    router.open_approval("soccer", "Bash: npm test", now=NOW)
+    state, appr = router.resolve_approval("no, don't do it now, please", now=NOW + 5)
+    assert state == "denied" and appr.project == "soccer"
+    assert router.pending_approvals() == []
+
+
+def test_mixed_polarity_with_nothing_pending_stays_none():
+    # The conflict check must not leak approval state into normal speech.
+    assert Router().resolve_approval("sure, cancel that", now=NOW) == ("none", None)
+
+
 def test_bare_yes_no_is_shape_not_meaning():
     from server.router import bare_yes_no
     # bare affirmations and denials: owned by whichever question is pending

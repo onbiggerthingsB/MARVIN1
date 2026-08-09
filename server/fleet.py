@@ -428,9 +428,26 @@ class Worker:
         verify the tasks actually ended."""
         self.locked = True
         for nonce, fut in list(self._futures.items()):
-            if not fut.done():
+            rejected = not fut.done()
+            if rejected:
                 fut.set_result(False)                 # reject, unblock the SDK
-            self._router.take_nonce(nonce, self._now())
+            taken = self._router.take_nonce(nonce, self._now())
+            if rejected:
+                # Shutdown IS the resolver for this nonce, so it must publish
+                # the resolution: nothing downstream will. The resumed
+                # _on_tool_request only applies permission_done (its normal
+                # path never publishes — the voice loop and /approval do),
+                # and the voice/click paths can no longer fire because the
+                # nonce is consumed. Without this event the console card
+                # stays on screen forever after "stop soccer" — until a
+                # manual click 404s it or the page reloads. An already-done
+                # future was resolved (and published) elsewhere; publishing
+                # again would overwrite a truthful "approved" status line
+                # with "cancelled".
+                self._bus.publish("approval.resolved", {
+                    "outcome": "cancelled", "project": self.project,
+                    "tool": taken.tool if taken is not None else "",
+                    "nonce": nonce})
         if interrupt_first and self._client is not None:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self._client.interrupt(), 10)
