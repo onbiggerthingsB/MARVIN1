@@ -14,7 +14,7 @@ function connectSSE() {
    "confirm.result", "registry.updated", "finance.brief",
    "fleet.update", "fleet.message", "fleet.error", "fleet.transcript",
    "fleet.unknown_session", "fleet.spoken", "fleet.recovered",
-   "fleet.handoff", "approval.request",
+   "fleet.handoff", "approval.request", "worktrees.survey",
    "approval.resolved"].forEach((t) =>
     es.addEventListener(t, dispatch(t)));
   // Deliberate: reconnect fresh (no Last-Event-ID). Replaying stale tts.start/
@@ -26,7 +26,7 @@ function connectSSE() {
   // appeared, nothing re-fetched, and a worker could sit blocked for its full
   // 600s TTL with no card and no spoken line. /fleet is the resync, and it
   // runs on every (re)connect — onopen fires for the first connection too.
-  es.onopen = () => refreshFleet();
+  es.onopen = () => { refreshFleet(); refreshWorktrees(); };
   es.onerror = () => { es.close(); setTimeout(connectSSE, 1000); };
 }
 
@@ -77,6 +77,7 @@ $("#setup-btn").addEventListener("click", async () => {
     // and any approval already waiting — reaches the page only through this
     // route. Idempotent, so running it here and on every connect is safe.
     refreshFleet();
+    refreshWorktrees();
     window.jarvis.setStatus("online — hold to talk");
   } catch (err) {
     $("#setup-status").textContent = `setup failed: ${err.message} — fix and click again`;
@@ -490,3 +491,85 @@ window.jarvis.onEvent("approval.resolved", (d) => {
     .forEach((el) => el.remove());
   window.jarvis.setStatus(`approval ${d.outcome}: ${d.project}`);
 });
+
+// ---- what the fleet leaves behind ---------------------------------------
+// Every task ever run leaves a disposable worktree and a jarvis/* branch, on
+// purpose — the worktree holds a diff a human may still want to merge back —
+// and until this pane there was no way to see the pile. Read-only: removal is
+// a SPOKEN instruction, never a click, so there is no button here to
+// accidentally press. The order below is the order of danger: what is still
+// live first, then what would be lost, then what is safe to clear.
+const WORKTREE_ORDER = ["live", "holds-work", "empty", "stale-registration",
+                        "unrecognized"];
+const WORKTREE_WORDS = {
+  "live": "in use — a worker or a terminal owns this",
+  "holds-work": "holds work",
+  "empty": "did nothing worth keeping",
+  "stale-registration": "registration only — the directory is gone",
+  "unrecognized": "not mine — I will not touch it",
+};
+
+function worktreeHolds(w) {
+  const bits = [];
+  if (w.ahead) bits.push(`${w.ahead} commit${w.ahead === 1 ? "" : "s"}`);
+  if (w.dirty) bits.push(`${w.dirty} modified`);
+  if (w.untracked) bits.push(`${w.untracked} untracked`);
+  return bits.join(" · ");
+}
+
+function renderWorktrees(d) {
+  const box = $("#worktrees");
+  if (!box) return;
+  box.textContent = "";               // full repaint: the survey is the truth
+  const list = (d.worktrees || []).slice().sort(
+    (a, b) => WORKTREE_ORDER.indexOf(a.kind) - WORKTREE_ORDER.indexOf(b.kind));
+  if (d.error) {
+    const err = document.createElement("div");
+    err.className = "wt-error";
+    // An empty list and a failed survey must never look alike.
+    err.textContent = d.error;
+    box.appendChild(err);
+  }
+  if (!list.length) return;
+  const head = document.createElement("div");
+  head.className = "wt-head";
+  head.textContent = `worktrees: ${list.length}`;
+  box.appendChild(head);
+  list.forEach((w) => {
+    const row = document.createElement("div");
+    row.className = "wt";
+    row.dataset.kind = w.kind || "";
+    // EVERY string below is derived from a branch name, a directory name or a
+    // worker's own project label — all of them chosen inside a disposable
+    // checkout. textContent everywhere, never innerHTML.
+    const name = document.createElement("div");
+    name.className = "wt-name";
+    name.textContent = `${w.project || (w.path || "").split("/").pop() || "?"}`;
+    const kind = document.createElement("div");
+    kind.className = "wt-kind";
+    kind.textContent = `${w.kind || "?"} — ${WORKTREE_WORDS[w.kind] || ""}`;
+    const holds = document.createElement("div");
+    holds.className = "wt-holds";
+    holds.textContent = worktreeHolds(w);
+    const meta = document.createElement("div");
+    meta.className = "wt-meta";
+    const days = Math.floor((w.age_s || 0) / 86400);
+    meta.textContent = [w.branch, (w.base_commit || "").slice(0, 7),
+                        days ? `${days}d old` : "", w.note]
+      .filter(Boolean).join(" · ");
+    const where = document.createElement("div");
+    where.className = "wt-where";
+    where.textContent = w.path || "";
+    row.append(name, kind, holds, meta, where);
+    box.appendChild(row);
+  });
+}
+
+// The voice verb publishes the same payload it spoke, so the screen and the
+// sentence describe one survey. Idempotent — a full repaint, so the SSE event
+// and a concurrent fetch cannot double-paint.
+window.jarvis.onEvent("worktrees.survey", renderWorktrees);
+
+function refreshWorktrees() {
+  fetch("/worktrees").then((r) => r.json()).then(renderWorktrees).catch(() => {});
+}

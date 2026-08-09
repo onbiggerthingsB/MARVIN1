@@ -22,6 +22,11 @@
     <div id="finance"></div>
     <div id="fleet"></div>
     <div id="interrupts"></div>
+    <!-- What the fleet has left behind. Deliberately BUTTONLESS: removal is a
+         spoken instruction ("remove the empty worktrees", "remove the worktree
+         for <name>"), never a click, so this pane is purely the surfacing
+         half — it shows what each one holds so the instruction is informed. -->
+    <div id="worktrees"></div>
     <!-- The worker transcript pane. NOT id="transcript": that id already names
          the live STT pane above, and a duplicate id would send fleet.transcript
          lines into it (querySelector returns the first match). -->

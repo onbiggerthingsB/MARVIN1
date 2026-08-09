@@ -31,6 +31,10 @@ UNAVAILABLE_DEFAULT = "I can't reach my brain just now, sir."
 # other failure.
 ASK_TIMEOUT_S = 120
 FLEET_TIMEOUT_S = 90   # spawn = worktree + connect + first query; generous but bounded
+# The worktree survey shells out to git once per worktree (each of those has
+# its own 30s ceiling in worktrees._git). Bounded like every other await here:
+# a hung git must cost this turn, never the loop.
+WORKTREE_TIMEOUT_S = 90
 # Same argument, applied to every other await in the loop. The loop is SERIAL:
 # one await that never returns is one JARVIS that never answers again. A TTS
 # socket that connects and then goes quiet, or an ElevenLabs pre-warm against a
@@ -109,13 +113,20 @@ async def _brief_and_publish(bus, project) -> str:
 
 async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=None,
                            router=None, registry=None, onboarding=None, finance=None,
-                           fleet=None):
+                           fleet=None, cleanup=None):
     """Subscribe to the bus and drive the butler. Never raises out of the loop.
 
     `validate_citations` is an optional async callable taking the model's list of
     cited titles and returning the subset that resolves to real vault notes.
     None (the default) means no validation, which keeps this loop importable and
     testable without a vault behind it; server/app.py passes the real one.
+
+    `cleanup` takes the WorktreeCleanup gate. It is deliberately NOT a fourth
+    yes/no gate: its three verbs are destructive instructions no affirmation
+    vocabulary can produce, so it is not arbitrated against onboarding, finance
+    or the approval resolver at all — it lands in the command dispatch below
+    like any other deterministic verb, and a yes said anywhere in this loop can
+    never reach it.
 
     `router`/`registry`/`onboarding` wire in M3's deterministic layer: dangerous
     verbs are parsed BEFORE the model ever sees an utterance, and a pending
@@ -693,6 +704,30 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                                         "project": command.project,
                                         "lines": fleet.transcript(target)})
                                     spoken = fleet.one_breath(target)
+                            await _speak(spoken)
+                        elif command.verb in ("worktree_survey",
+                                              "worktree_remove_empty",
+                                              "worktree_remove_named") \
+                                and cleanup is not None:
+                            # Worktree housekeeping. The SURVEY verb only ever
+                            # looks and speaks — it never acts on the utterance
+                            # that asked for it — and the two removing verbs
+                            # are separate instructions that may only redeem
+                            # what that survey said out loud. All three sit
+                            # inside the surrounding dispatch try, so a git
+                            # fault costs this turn ("that command failed") and
+                            # never the loop; the gate itself already returns a
+                            # sentence for every failure it can see.
+                            if command.verb == "worktree_survey":
+                                spoken = await asyncio.wait_for(
+                                    cleanup.report(), WORKTREE_TIMEOUT_S)
+                            elif command.verb == "worktree_remove_empty":
+                                spoken = await asyncio.wait_for(
+                                    cleanup.remove_empty(), WORKTREE_TIMEOUT_S)
+                            else:
+                                spoken = await asyncio.wait_for(
+                                    cleanup.remove_named(command.argument or ""),
+                                    WORKTREE_TIMEOUT_S)
                             await _speak(spoken)
                         else:
                             # No fleet injected (tests, degraded boot): honest.

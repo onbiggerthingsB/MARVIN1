@@ -28,6 +28,7 @@ from server.stt import SttRelay
 from server.vault_mcp import build_vault_server
 from server.vault_paths import vault_root_from_env
 from server.vault_read import vault_is_downloaded
+from server.worktree_survey import WorktreeCleanup
 
 COOKIE = "jarvis_session"
 OPEN_PATHS = {"/health", "/bootstrap"}
@@ -137,6 +138,11 @@ def create_app(base_dir: Path) -> FastAPI:
         protected=((str(Path(vault_root).resolve()), "your Obsidian vault"),
                    (str(Path(base_dir).resolve()), "the JARVIS repo itself")),
         hook_port=cfg.port, hook_bearer=cfg.hook_bearer)
+    # Surfacing + consented cleanup for the worktrees the fleet leaves behind.
+    # NOT a fourth yes/no gate: its verbs are destructive instructions no
+    # affirmation can produce, so nothing here is arbitrated against the
+    # onboarding confirm, the finance source confirm, or a fleet approval.
+    app.state.cleanup = WorktreeCleanup(bus=app.state.bus, fleet=app.state.fleet)
 
     @app.middleware("http")
     async def guard(request: Request, call_next):
@@ -203,6 +209,33 @@ def create_app(base_dir: Path) -> FastAPI:
             approvals = []
         return {"workers": live + list(app.state.fleet.ghosts),
                 "approvals": approvals}
+
+    @app.get("/worktrees")
+    async def worktrees_view():
+        # The pile nothing has ever surfaced: every task ever run leaves a
+        # disposable worktree and a jarvis/* branch behind, on purpose (the
+        # worktree holds a diff a human may still want to merge back), and
+        # until now there was no way to see them short of `ls state/worktrees`.
+        #
+        # READ-ONLY, and it arms NOTHING: WorktreeCleanup.entries() surveys
+        # without creating an offer, because a page render is not a sentence
+        # Keke heard and only a heard sentence may authorise a removal. There
+        # is no companion POST — removal is a spoken instruction, so this route
+        # cannot destroy anything even if a browser is hostile.
+        #
+        # Cookie-authed by the middleware, the same lane as /fleet and
+        # deliberately NOT widened to the hook bearer: that token is written
+        # into every worktree's settings.local.json, so a worker holding it
+        # must not be able to enumerate its siblings.
+        try:
+            entries = await app.state.cleanup.entries()
+        except Exception as e:  # noqa: BLE001 — a git fault must not 500 the page
+            # An `error` FIELD rather than a status code: the console renders
+            # the rest of itself either way, and a survey that FAILED must
+            # never look like a worktrees directory that is empty.
+            return {"worktrees": [], "error": f"survey failed: {e}"}
+        from dataclasses import asdict
+        return {"worktrees": [asdict(w) for w in entries], "error": ""}
 
     @app.get("/bootstrap")
     async def bootstrap(token: str = ""):
@@ -394,7 +427,8 @@ def create_app(base_dir: Path) -> FastAPI:
                              registry=app.state.registry,
                              onboarding=app.state.onboarding,
                              finance=app.state.source_gate,
-                             fleet=app.state.fleet))
+                             fleet=app.state.fleet,
+                             cleanup=app.state.cleanup))
 
         def _brain_died(t):
             # Last resort. run_butler_brain guards every await, so reaching here

@@ -811,6 +811,49 @@ class Fleet:
         return [w for w in self.workers
                 if w.machine.base not in (CLOSED, DETACHED)]
 
+    def live_worktree_paths(self) -> set[str]:
+        """Worktrees no cleanup may touch, whatever anybody consents to.
+
+        Wider than `self.live` on purpose, in BOTH directions this cares about:
+
+          * a DETACHED worker is excluded from `live` (its slot is free) but a
+            human is driving that session in a real terminal right now, so its
+            checkout is the last thing on this machine that may be deleted;
+          * a DETACHED restart GHOST is not a Worker at all — recover() keeps
+            it out of self.workers deliberately — but the same terminal
+            argument applies, and its `claude --resume` command is on its tile.
+
+        Only CLOSED workers and INTERRUPTED ghosts are left out, and both are
+        provably dead: CLOSED is final, and an interrupted ghost's process,
+        stream and callbacks died with the old server. Their worktrees are
+        still classified on content, so anything they left behind is protected
+        as holds-work rather than as live."""
+        paths = {w.worktree.path for w in self.workers
+                 if w.machine.base != CLOSED and w.worktree is not None}
+        paths |= {str(g.get("worktree") or "") for g in self.ghosts
+                  if g.get("state") == DETACHED}
+        return {p for p in paths if p}
+
+    def known_repos(self) -> set[str]:
+        """Real checkouts this session has touched. The worktree survey needs
+        them to find registrations whose DIRECTORY is gone — those cannot be
+        discovered by walking the worktrees directory, because the thing that
+        would have named the repo is what went missing."""
+        return {p for p in ({w.path for w in self.workers}
+                            | {str(g.get("path") or "") for g in self.ghosts})
+                if p}
+
+    def worktree_projects(self) -> dict[str, str]:
+        """worktree path -> spoken project name, for labelling the survey.
+        Decoration: a missing entry costs a nicer word, never a decision."""
+        out = {w.worktree.path: w.project for w in self.workers
+               if w.worktree is not None and w.project}
+        for g in self.ghosts:
+            wt, project = str(g.get("worktree") or ""), str(g.get("project") or "")
+            if wt and project and wt not in out:
+                out[wt] = project
+        return out
+
     def _find(self, path: str) -> Worker | None:
         hits = [w for w in self.workers
                 if w.path == path or w.worktree.path == path]

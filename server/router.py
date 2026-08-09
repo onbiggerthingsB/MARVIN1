@@ -45,6 +45,46 @@ _DISCOVER = re.compile(
     r"(?:\s+(?:my|all|the))*"
     r"\s+(?:projects?|repos?|repositor(?:y|ies))"
     r"(?:\s+again)?\s*[.!?]*\s*$", re.I)
+# Worktree housekeeping. THREE verbs, and not one of them is a yes.
+#
+# Every task ever run leaves a disposable worktree and a `jarvis/*` branch
+# behind — nothing in server/ has ever removed one, because "the worktree holds
+# the diff a human may still want to merge back". These verbs surface the pile
+# and offer a narrow, consented way to clear the part of it that is provably
+# worthless.
+#
+# WHY VERBS AND NOT A YES/NO GATE. Three questions can already be pending at
+# once (onboarding's repo confirm, the §16 finance source confirm, and a fleet
+# tool approval) and all three resolve on a yes-shaped utterance, arbitrated by
+# call order in the brain. A fourth yes-gate would have to be arbitrated
+# against those three — and arbitration is exactly where this codebase's six
+# consent fail-opens came from. None of the phrasings below can be produced by
+# any affirmation or denial vocabulary in the system (pinned by a test), so
+# this gate can neither steal a yes nor have its instruction stolen, and a yes
+# said anywhere in JARVIS removes no worktree, ever.
+#
+# WHY THESE PHRASINGS. "clean up / tidy up the worktrees" is what a person
+# actually says about accumulated clutter, and it is the phrasing the task's
+# own framing uses. The looking verbs (check, review, go through) are included
+# because the survey is READ-ONLY — widening a verb that only looks costs
+# nothing — while the two removing verbs are kept deliberately narrow and
+# literal: "the EMPTY worktrees" names the bucket it may touch, and "the
+# worktree FOR <name>" cannot be said by accident. Each pattern is anchored on
+# both ends over a closed vocabulary, the same "explain every word or do
+# nothing" rule _DISCOVER and the consent gates use, so ordinary conversation
+# ("clean up my room", "the worktrees are piling up") matches nothing.
+_WT = r"work\s*trees?"
+_WORKTREE_SURVEY = re.compile(
+    r"^\s*(?:(?:clean|tidy)(?:\s+up)?|check|review|survey|go\s+through)"
+    r"(?:\s+(?:my|the|all|of))*"
+    r"\s+" + _WT + r"(?:\s+again)?\s*[.!?]*\s*$", re.I)
+_WORKTREE_REMOVE_EMPTY = re.compile(
+    r"^\s*(?:clear\s+out|clear|remove|delete|get\s+rid\s+of|purge)"
+    r"(?:\s+(?:the|all|my))*"
+    r"\s+empty\s+" + _WT + r"\s*[.!?]*\s*$", re.I)
+_WORKTREE_REMOVE_NAMED = re.compile(
+    r"^\s*(?:remove|delete|drop)(?:\s+(?:the|that))*"
+    r"\s+" + _WT + r"\s+for\s+(?P<name>.+?)\s*[.!?]*\s*$", re.I)
 _STATUS = re.compile(r"^\s*(?:what'?s|what is)\s+(?:running|the fleet|going on)\b.*$", re.I)
 _PULL_IT = re.compile(r"^\s*pull\s+(?:it|that)\s+up\s*[.!?]*\s*$", re.I)
 _PORTFOLIO = re.compile(
@@ -335,7 +375,22 @@ class Router:
         if _DISCOVER.match(text):
             return Command(verb="discover")
 
-        for pattern, verb, arg_group in ((_SPAWN, "spawn", "task"), (_STEER, "steer", "task")):
+        # Same placement argument as _DISCOVER, and the same shape: anchored on
+        # the whole utterance, closed vocabulary, no project to resolve. Checked
+        # before the project-resolving verbs because those return None the
+        # moment their project does not resolve — an overlap there would be
+        # swallowed silently rather than mis-routed loudly. AFTER _TRADE, which
+        # outranks everything.
+        if _WORKTREE_SURVEY.match(text):
+            return Command(verb="worktree_survey")
+        if _WORKTREE_REMOVE_EMPTY.match(text):
+            return Command(verb="worktree_remove_empty")
+        m = _WORKTREE_REMOVE_NAMED.match(text)
+        if m:
+            return Command(verb="worktree_remove_named",
+                           argument=m.group("name").strip())
+
+        for pattern, verb, arg_group in((_SPAWN, "spawn", "task"), (_STEER, "steer", "task")):
             m = pattern.match(text)
             if m:
                 proj, ambiguous = self._resolve(m.group("project"), registry)

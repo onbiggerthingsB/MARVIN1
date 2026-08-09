@@ -604,3 +604,133 @@ def test_a_leading_okay_on_a_refusal_still_fails_closed():
     # polarities and must still refuse to resolve.
     router = one_pending()
     assert router.resolve_approval("okay, cancel that", now=NOW + 5) == ("unclear", None)
+
+
+# ---------- worktree housekeeping: three verbs, none of them a yes ----------
+@pytest.mark.parametrize("said", [
+    "clean up the worktrees",
+    "clean up the work trees",
+    "tidy up the worktrees",
+    "tidy the worktrees",
+    "clean up my worktrees",
+    "go through the worktrees",
+    "review the worktrees.",
+    "check my work trees",
+])
+def test_the_survey_verb_is_parsed(said):
+    c = Router().parse(said, reg("soccer"))
+    assert c is not None and c.verb == "worktree_survey"
+
+
+@pytest.mark.parametrize("said", [
+    "remove the empty worktrees",
+    "delete the empty worktrees",
+    "clear the empty work trees",
+    "clear out the empty worktrees",
+    "get rid of the empty worktrees",
+    "remove all empty worktrees.",
+])
+def test_the_batch_removal_verb_is_parsed(said):
+    c = Router().parse(said, reg("soccer"))
+    assert c is not None and c.verb == "worktree_remove_empty"
+
+
+@pytest.mark.parametrize("said,name", [
+    ("remove the worktree for soccer", "soccer"),
+    ("delete the worktree for the login fix", "the login fix"),
+    ("drop the work tree for jarvis in desktop", "jarvis in desktop"),
+])
+def test_the_per_item_removal_verb_carries_the_name(said, name):
+    c = Router().parse(said, reg("soccer"))
+    assert c is not None and c.verb == "worktree_remove_named"
+    assert c.argument == name
+
+
+@pytest.mark.parametrize("said", [
+    "where did I leave the Tibet study?",
+    "clean up my room",
+    "what's running",
+    "can you tidy the kitchen",
+    "remove the empty calories from my diet",
+    "delete that note about worktrees",
+    "the worktrees are piling up",
+    "tell soccer to clean up the worktrees",
+])
+def test_ordinary_speech_never_fires_a_worktree_verb(said):
+    c = Router().parse(said, reg("soccer"), has_fleet=True)
+    assert c is None or not c.verb.startswith("worktree")
+
+
+def test_a_worktree_verb_is_never_an_affirmation_or_a_denial():
+    """THE reason this gate is a verb and not a yes. Three questions can
+    already be pending at once (onboarding's repo confirm, the finance source
+    confirm, a fleet tool approval) and every one of them resolves on a
+    yes-shaped utterance. A fourth yes-gate would need arbitrating against
+    those three, and arbitration is where the previous six fail-opens came
+    from. None of these phrasings can be produced by, or mistaken for, any
+    consent vocabulary in the system."""
+    from server.onboarding import _NO, _YES
+    from server.router import _AFFIRM, _DENY, bare_yes_no, is_addressed
+    for said in ("clean up the worktrees", "tidy up the worktrees",
+                 "remove the empty worktrees", "delete the empty work trees",
+                 "remove the worktree for soccer"):
+        assert not _AFFIRM.match(said), said
+        assert not _DENY.match(said), said
+        assert not _YES.match(said), said
+        assert not _NO.match(said), said
+        assert not bare_yes_no(said), said
+        assert is_addressed(said), said    # never owned by a pending yes/no
+
+
+def test_a_worktree_verb_never_collides_with_another_verb():
+    """Every other deterministic verb must decline these utterances, so the
+    new ones can never shadow (or be shadowed by) a spawn, steer, stop,
+    pull-up, capture, discovery, status, portfolio or trade."""
+    from server.router import (_CAPTURE, _DISCOVER, _PORTFOLIO, _PULL_IT,
+                               _PULL_UP, _SPAWN, _STATUS, _STEER, _STOP,
+                               _TRADE)
+    for said in ("clean up the worktrees", "tidy up the worktrees",
+                 "go through the work trees", "remove the empty worktrees",
+                 "clear out the empty worktrees",
+                 "remove the worktree for soccer"):
+        for pattern in (_SPAWN, _STEER, _PULL_UP, _STOP, _CAPTURE, _DISCOVER,
+                        _STATUS, _PULL_IT):
+            assert not pattern.match(said), (pattern.pattern, said)
+        for pattern in (_PORTFOLIO, _TRADE):
+            assert not pattern.search(said), (pattern.pattern, said)
+
+
+def test_a_trade_still_outranks_a_worktree_verb():
+    # _TRADE is checked first and searches anywhere: an utterance carrying a
+    # trade must never be routed onward, whatever else it also says.
+    c = Router().parse("sell NVDA and clean up the worktrees", reg("soccer"))
+    assert c.verb == "refuse_trade"
+
+
+def test_no_affirmation_vocabulary_can_ever_OPEN_a_worktree_verb():
+    """The mirror of the test above, and the one that catches the fail-open
+    shape directly rather than by implication.
+
+    The other test asserts that these PHRASINGS are not affirmations. This one
+    asserts the reverse — that an affirmation cannot match these PATTERNS —
+    because that is the edit a future hand actually makes: widening an opener
+    alternation by one friendly token ("|yes|sure") to make a natural sentence
+    work. That single token would make a pending "yes" removable-shaped, which
+    is the seventh instance of this codebase's oldest bug. An affirmative
+    OPENER carrying a real request is not consent anywhere else in JARVIS
+    either (onboarding._bare_affirmation, finance_gate._bare_rejection); it
+    costs one re-ask here and it is the whole safety argument for this gate.
+    """
+    from server.router import _AFFIRM_WORDS, _DENY_WORDS
+    router, registry = Router(), reg("soccer")
+    tails = ["", " the empty worktrees", " the worktrees", " worktrees",
+             " the worktree for soccer", ", the empty worktrees",
+             ", remove the empty worktrees", " remove the empty worktrees",
+             " clean up the worktrees", ", clean up the worktrees",
+             " delete the worktree for soccer"]
+    vocabulary = sorted(_AFFIRM_WORDS | _DENY_WORDS | {"go ahead", "do it"})
+    for word in vocabulary:
+        for tail in tails:
+            said = word + tail
+            c = router.parse(said, registry)
+            assert c is None or not c.verb.startswith("worktree"), said

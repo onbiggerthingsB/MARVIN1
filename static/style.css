@@ -49,3 +49,21 @@ footer { opacity: 0.6; font-size: 0.8rem; }
   overflow-wrap: anywhere; margin-bottom: 0.4rem; }
 #interrupts button { margin-right: 0.5rem; }
 #worker-transcript { max-height: 14rem; overflow-y: auto; font-size: 0.8rem; white-space: pre-wrap; }
+/* What the fleet leaves behind. No buttons by design: removal is a spoken
+   instruction, so this pane only has to make the decision informed — which
+   bucket, what would be lost, and where. */
+#worktrees .wt-head { font-size: 0.8rem; opacity: 0.7; margin-top: 0.6rem; }
+#worktrees .wt-error:not(:empty) { font-size: 0.8rem; color: #ffb3ae; }
+#worktrees .wt { border-left: 3px solid #446; padding: 0.3rem 0.6rem;
+  margin: 0.3rem 0; }
+#worktrees .wt[data-kind="live"] { border-left-color: #2e6da4; }
+#worktrees .wt[data-kind="holds-work"] { border-left-color: #e0a030; }
+#worktrees .wt[data-kind="empty"] { border-left-color: #4a4; opacity: 0.75; }
+#worktrees .wt[data-kind="stale-registration"] { border-left-color: #666; opacity: 0.6; }
+#worktrees .wt[data-kind="unrecognized"] { border-left-color: #e0524d; }
+#worktrees .wt-name { font-weight: bold; font-size: 0.9rem; }
+#worktrees .wt-kind { font-size: 0.75rem; opacity: 0.8; }
+#worktrees .wt-holds:not(:empty) { font-size: 0.75rem; color: #e0a030; }
+#worktrees .wt-meta { font-size: 0.7rem; opacity: 0.6; overflow-wrap: anywhere; }
+#worktrees .wt-where { font-size: 0.65rem; opacity: 0.45; overflow-wrap: anywhere;
+  user-select: text; }
