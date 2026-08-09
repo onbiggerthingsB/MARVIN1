@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import shlex
 import time
 import uuid
 import warnings
@@ -70,6 +72,20 @@ def _risk_note(tool: str, args) -> str:
     blob = f"{tool} {args}".lower()
     return ("Careful, sir — this one can destroy things. "
             if any(w in blob for w in _RISKY) else "")
+
+
+async def _default_open_terminal(cmd: str) -> None:
+    """Open Terminal.app running `cmd`. json.dumps produces a double-quoted
+    escaped literal that AppleScript accepts (same \" and \\ escapes; the
+    command never contains newlines)."""
+    script = f'tell application "Terminal" to do script {json.dumps(cmd)}'
+    proc = await asyncio.create_subprocess_exec(
+        "osascript", "-e", script,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.DEVNULL)
+    await asyncio.wait_for(proc.wait(), 10)
+    if proc.returncode != 0:
+        raise RuntimeError(f"osascript exited {proc.returncode}")
 
 
 def _shield_bearer(wt_path: Path) -> None:
@@ -174,6 +190,7 @@ class Worker:
         self.session_id: str | None = None
         self.transcript: deque[dict] = deque(maxlen=TRANSCRIPT_KEEP)
         self.locked = False               # handoff lockout: no more input
+        self.handoff_in_flight = False    # a lockout sequence is mid-flight
         self.stop_requested = False       # a stop that landed mid-start, deferred
         # Set by _spawn around its own await of start(), cleared the moment
         # that await returns — the ONLY thing that may mean "starting".
@@ -341,9 +358,22 @@ class Worker:
             # silently dropped if the spawn fails. Refuse honestly instead.
             return (f"{self.project} is still starting, sir — "
                     f"give it a moment.")
+        if self.handoff_in_flight:
+            # Mid-lockout: "spawn it again" below would be bad advice about a
+            # session that is seconds from being alive in a terminal.
+            return (f"I'm handing {self.project} over to a terminal right "
+                    f"now, sir — one moment.")
         if self.locked:
-            return (f"{self.project} is detached, sir — "
-                    f"steer it from its terminal.")
+            if self.machine.base == DETACHED:
+                return (f"{self.project} is detached, sir — "
+                        f"steer it from its terminal.")
+            # `locked` is set by EVERY shutdown() — stop, close_all, and a
+            # FAILED handoff — and it is never cleared. Only a confirmed
+            # handoff opens a terminal, so sending Keke to one here would name
+            # a window that does not exist. Refuse without claiming where it
+            # went; the state that matters was already spoken by stop().
+            return (f"{self.project} isn't taking input any more, sir — "
+                    f"spawn it again if you need more work there.")
         try:
             self._inbox.put_nowait(text)
         except asyncio.QueueFull:
@@ -491,7 +521,7 @@ class Fleet:
         self._client_factory = client_factory
         self._worktree_factory = worktree_factory
         self._settings_writer = settings_writer
-        self._open_terminal = open_terminal   # Task 9 wires the default
+        self._open_terminal = open_terminal or _default_open_terminal
 
     # ---------- lookup ----------
     @property
@@ -675,6 +705,15 @@ class Fleet:
             return "Nothing is running there, sir."
         if w.machine.base == DETACHED:
             return f"{w.project} is detached, sir — stop it from its terminal."
+        if w.handoff_in_flight:
+            # A stop inside the lockout would tear the session down under the
+            # handoff: two concurrent shutdowns, session_end lands first, and
+            # the handoff's "detached" bounces off CLOSED — leaving "Stopped
+            # X" and "X is yours in the terminal" both spoken about one
+            # worker. The handoff finishes in seconds; a stop after it is
+            # answered honestly by the DETACHED branch above.
+            return (f"I'm handing {w.project} over to a terminal right now, "
+                    f"sir — one moment.")
         if w.starting:
             # Early registration makes a half-started worker visible here
             # while start() is still awaited. Tearing it down NOW would
@@ -706,6 +745,91 @@ class Fleet:
         except Exception as e:  # noqa: BLE001 — a dirty stop is reported, not raised
             w._apply("lost", {"reason": f"stop failed: {e}"})
             return False
+
+    async def handoff(self, path: str) -> dict:
+        """Spec §5 lockout: stop input → reject pending approvals → interrupt
+        → close the SDK subprocess → verify exit → lock → `claude --resume`.
+        DETACHED only after the session is provably closed on our side; any
+        failure leaves the worker UNKNOWN and returns NO resume command —
+        two drivers on one session interleave messages."""
+        w = self._find(path)
+        if w is None:
+            return {"ok": False, "spoken": "Nothing is running there, sir."}
+        if w.machine.base == DETACHED:
+            # DETACHED is a one-way door: the terminal owns this session now,
+            # and a second window on it is the exact accident this prevents.
+            return {"ok": False,
+                    "spoken": f"{w.project} is already detached, sir."}
+        if w.machine.base == CLOSED:
+            # Tiles are never removed, so a stopped worker keeps its button.
+            # CLOSED is final — "detached" bounces off it — so going on would
+            # open a terminal and claim a handoff the tile flatly contradicts.
+            return {"ok": False,
+                    "spoken": (f"{w.project}'s session is already closed, "
+                               f"sir — there's nothing to hand over.")}
+        if w.handoff_in_flight:
+            # Reserved synchronously below, before the first await: the button
+            # has no debounce and the lockout takes seconds, so both clicks
+            # would otherwise clear the DETACHED gate and open two windows on
+            # ONE session — two drivers, exactly what this method prevents.
+            return {"ok": False,
+                    "spoken": f"I'm already handing {w.project} over, sir."}
+        if w.starting:
+            # Early registration makes a half-started worker visible here, and
+            # the SessionStart hook can already have handed us a session id
+            # while _spawn is still awaiting start(). Detaching under that
+            # await would rebuild a consumer and pump on a disconnected client
+            # and end in a spawn-failure sentence contradicting this one.
+            return {"ok": False,
+                    "spoken": (f"{w.project} is still starting, sir — "
+                               f"give it a moment.")}
+        if not w.session_id:
+            # Nothing to resume: `claude --resume` needs an id the CLI has not
+            # reported yet. Detaching here would strand the worker forever —
+            # the machine bounces everything but session_end off DETACHED.
+            return {"ok": False,
+                    "spoken": (f"{w.project} has no resumable session yet, "
+                               f"sir — give it a moment.")}
+        w.handoff_in_flight = True        # reserved BEFORE the first await
+        try:
+            try:
+                # lock input + reject approvals + interrupt + close + verify exit
+                await asyncio.wait_for(w.shutdown(interrupt_first=True),
+                                       STOP_TIMEOUT_S)
+                for t in (w.consumer, w.pump):
+                    if t is not None and not t.done():
+                        raise RuntimeError("worker tasks still running")
+            except Exception as e:  # noqa: BLE001 — a half-dead session must never detach
+                w._apply("lost", {"reason": f"handoff failed: {e}"})
+                # Through the writer, like every other append: it never raises
+                # and never blocks the loop, and handoff_failed is an fsync
+                # kind the next boot reads.
+                self._log_writer.append("handoff_failed",
+                                        {"worker": w.id, "path": w.path,
+                                         "reason": str(e)})
+                return {"ok": False,
+                        "spoken": (f"The handoff failed, sir — {w.project} is "
+                                   f"marked unknown, and I did not open a "
+                                   f"terminal on it.")}
+            w._apply("detached", {"session_id": w.session_id})
+            cmd = (f"cd {shlex.quote(w.worktree.path)} && "
+                   f"claude --resume {shlex.quote(w.session_id)}")
+            # Published BEFORE the launch: if osascript hangs or is missing,
+            # the command must already be on screen for Keke to run by hand.
+            self._bus.publish("fleet.handoff",
+                              {"worker": w.id, "project": w.project,
+                               "path": w.path, "command": cmd})
+            try:
+                await self._open_terminal(cmd)
+                spoken = f"{w.project} is yours in the terminal, sir."
+            except Exception:  # noqa: BLE001 — the session is detached either way
+                spoken = (f"{w.project} is detached, sir — I couldn't open a "
+                          f"terminal, so run the command on screen to pick "
+                          f"it up.")
+            await self._admit_next()      # DETACHED freed the slot
+            return {"ok": True, "command": cmd, "spoken": spoken}
+        finally:
+            w.handoff_in_flight = False
 
     async def _admit_next(self) -> None:
         # No await between this capacity check, the pop, and _spawn's own
@@ -796,7 +920,16 @@ class Fleet:
         now = self._now() if now is None else now
         for w in self.workers:
             state = w.machine.state(now)
-            consumer_dead = w.consumer is None or w.consumer.done()
+            # A LOCKED worker's consumer is dead by our own hand — shutdown()
+            # cancelled it — so its "probe failure" is not news, it is the
+            # teardown we asked for. It also lands mid-handoff: the ticker
+            # fires every 5s and the lockout awaits an interrupt for up to 10,
+            # so escalating here would shout a false alarm on the console and
+            # drag the worker to UNKNOWN in the middle of the sequence. Every
+            # locked path (stop, close_all, a failed handoff) already ends in
+            # an honest state of its own.
+            consumer_dead = (not w.locked
+                             and (w.consumer is None or w.consumer.done()))
             if state == QUIET and consumer_dead:
                 state = w.machine.probe_failed(now)
                 self._bus.publish("fleet.error", {

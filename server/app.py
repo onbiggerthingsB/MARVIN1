@@ -223,6 +223,27 @@ def create_app(base_dir: Path) -> FastAPI:
             "project": taken.project, "tool": taken.tool, "nonce": nonce})
         return {"ok": True}
 
+    @app.post("/handoff")
+    async def handoff(request: Request):
+        # The console button's lane: cookie-authed like /approval, NEVER the
+        # hook bearer — that token lives in every worktree, and a worker must
+        # not be able to hand its own session to a terminal.
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "bad shape"}, status_code=400)
+        path = str(body.get("path", ""))
+        if not path:
+            return JSONResponse({"error": "path required"}, status_code=400)
+        result = await app.state.fleet.handoff(path)
+        if result.get("spoken"):
+            # the brain speaks fleet.spoken texts (Task 8), so the click path
+            # gets the same voice line the voice path would
+            app.state.bus.publish("fleet.spoken", {"text": result["spoken"]})
+        return result
+
     @app.post("/command")
     async def command(request: Request):
         body = await request.json()

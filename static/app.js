@@ -328,6 +328,14 @@ function renderFleetTile(d) {
       el.className = cls;
       tile.appendChild(el);
     });
+    const handoff = document.createElement("button");
+    handoff.textContent = "Open in Terminal";
+    handoff.addEventListener("click", () => fetch("/handoff", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: tile.dataset.path }),
+    }).catch(() => window.jarvis.setStatus(
+      "handoff failed to send — try again")));
+    tile.appendChild(handoff);
     $("#fleet").appendChild(tile);
     fleetTiles.set(d.worker, tile);
   }
@@ -348,6 +356,9 @@ window.jarvis.onEvent("fleet.transcript", (d) => {
   // duplicate id would route these lines there (querySelector's first match).
   $("#worker-transcript").textContent = (d.lines || [])
     .map((l) => `${l.who}: ${l.text}`).join("\n\n");
+});
+window.jarvis.onEvent("fleet.handoff", (d) => {
+  window.jarvis.setStatus(`handed off: ${d.command}`);
 });
 window.jarvis.onEvent("approval.request", (d) => {
   const card = document.createElement("div");
