@@ -280,6 +280,7 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                     try:
                         bus.publish("router.command", {
                             "verb": command.verb, "project": command.project,
+                            "path": command.path,
                             "argument": command.argument,
                             "needs_disambiguation": command.needs_disambiguation})
                         if command.verb == "refuse_trade":

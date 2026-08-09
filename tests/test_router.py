@@ -168,3 +168,63 @@ def test_bare_yes_no_is_shape_not_meaning():
     assert not bare_yes_no("approve soccer npm test")
     assert not bare_yes_no("stop soccer")
     assert not bare_yes_no("where did I leave the Tibet study?")
+
+
+def dual_registry():
+    """Two real directories both named jarvis — this machine's actual shape."""
+    r = Registry()
+    r.merge_candidates([
+        Candidate(path="/Users/likerun/jarvis", name="jarvis", sources=["t"]),
+        Candidate(path="/Users/likerun/Desktop/jarvis", name="jarvis", sources=["t"])])
+    for p in r.projects:
+        p.confirmed = True
+    return r
+
+
+def test_commands_carry_the_project_path():
+    c = Router().parse("pull up soccer", reg("soccer"))
+    assert c.path == "/p/soccer"
+
+
+def test_spawn_carries_the_path():
+    c = Router().parse("start work in soccer: fix the login redirect", reg("soccer"))
+    assert c.verb == "spawn" and c.path == "/p/soccer"
+
+
+def test_twin_basenames_never_read_back_as_the_same_label():
+    c = Router().parse("pull up jarvis", dual_registry())
+    assert c.project is None and c.path is None
+    assert len(c.needs_disambiguation) == 2
+    # the whole point: the two labels must be distinguishable when spoken
+    assert c.needs_disambiguation[0] != c.needs_disambiguation[1]
+
+
+def test_extra_location_words_narrow_a_twin():
+    c = Router().parse("pull up jarvis in desktop", dual_registry())
+    assert c.path == "/Users/likerun/Desktop/jarvis"
+    assert c.needs_disambiguation == []
+
+
+def test_approvals_carry_a_path():
+    router = Router()
+    a = router.open_approval("soccer", "npm test", now=NOW, path="/p/soccer")
+    assert a.path == "/p/soccer"
+    state, appr = router.resolve_approval("yes", now=NOW + 1)
+    assert state == "approved" and appr.path == "/p/soccer"
+
+
+def test_take_nonce_consumes_exactly_that_approval():
+    router = Router()
+    a = router.open_approval("soccer", "npm test", now=NOW, path="/p/soccer")
+    b = router.open_approval("alethic", "pip install", now=NOW, path="/p/alethic")
+    taken = router.take_nonce(a.nonce, now=NOW + 1)
+    assert taken is a
+    assert [x.nonce for x in router.pending_approvals()] == [b.nonce]
+
+
+def test_take_nonce_unknown_or_expired_is_none():
+    router = Router()
+    assert router.take_nonce("deadbeef", now=NOW) is None
+    a = router.open_approval("soccer", "npm test", now=NOW)
+    assert router.take_nonce(a.nonce, now=NOW + 601) is None   # swept, not taken
+    assert router.pending_approvals() == []

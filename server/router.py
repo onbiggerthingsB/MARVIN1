@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import secrets
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 
 APPROVAL_TTL_S = 600.0
 
@@ -81,10 +82,34 @@ def _mentions_tool(tool: str, spoken_tokens: set[str]) -> bool:
     return bool(tool_tokens) and all(t in spoken_tokens for t in tool_tokens)
 
 
+def _distinct_path_tokens(p, matches) -> set[str]:
+    """Tokens of p's path that appear in NO other match's path — the words that
+    can single it out ("desktop" for /Users/likerun/Desktop/jarvis)."""
+    mine = set(_TOKEN.findall(p.path.lower()))
+    for other in matches:
+        if other is not p:
+            mine -= set(_TOKEN.findall(other.path.lower()))
+    return mine
+
+
+def _label(p, matches) -> str:
+    """Spoken disambiguation label. Twins by name are told apart by location:
+    'jarvis in likerun' vs 'jarvis in Desktop'. If even the parents collide,
+    fall back to the full path — ugly to hear, but never ambiguous."""
+    twins = [m for m in matches if m is not p and m.name == p.name]
+    if not twins:
+        return p.name
+    parent = PurePosixPath(p.path).parent.name
+    if parent and all(PurePosixPath(t.path).parent.name != parent for t in twins):
+        return f"{p.name} in {parent}"
+    return f"{p.name} at {p.path}"
+
+
 @dataclass
 class Command:
     verb: str
-    project: str | None = None
+    project: str | None = None       # spoken name, for readback
+    path: str | None = None          # the REAL key — names collide on this machine
     argument: str | None = None
     needs_disambiguation: list[str] = field(default_factory=list)
 
@@ -95,6 +120,7 @@ class Approval:
     project: str
     tool: str
     created: float
+    path: str = ""                   # which checkout this approval belongs to
 
 
 class Router:
@@ -102,12 +128,23 @@ class Router:
         self._approvals: list[Approval] = []
 
     # ---------- verbs ----------
-    def _resolve(self, spoken_project: str, registry) -> tuple[str | None, list[str]]:
+    def _resolve(self, spoken_project: str, registry):
+        """-> (Project | None, ambiguous_labels). Path-keyed: the whole Project
+        comes back so callers get name AND path. When several match, extra
+        spoken words are tried against each candidate's DISTINCT path tokens
+        ("jarvis in desktop" singles out the Desktop twin); if that fails, the
+        caller gets location-qualified labels and asks."""
         matches = registry.match(spoken_project)
-        if len(matches) == 1:
-            return matches[0].name, []
         if len(matches) > 1:
-            return None, [m.name for m in matches]
+            q_tokens = set(_TOKEN.findall(spoken_project.lower()))
+            narrowed = [m for m in matches
+                        if q_tokens & _distinct_path_tokens(m, matches)]
+            if len(narrowed) == 1:
+                matches = narrowed
+        if len(matches) == 1:
+            return matches[0], []
+        if len(matches) > 1:
+            return None, [_label(m, matches) for m in matches]
         return None, []
 
     def parse(self, spoken: str, registry) -> Command | None:
@@ -123,20 +160,25 @@ class Router:
         for pattern, verb, arg_group in ((_SPAWN, "spawn", "task"), (_STEER, "steer", "task")):
             m = pattern.match(text)
             if m:
-                name, ambiguous = self._resolve(m.group("project"), registry)
-                if name is None and not ambiguous:
+                proj, ambiguous = self._resolve(m.group("project"), registry)
+                if proj is None and not ambiguous:
                     return None            # unknown/unconfirmed project → not a command
-                return Command(verb=verb, project=name,
+                return Command(verb=verb,
+                               project=proj.name if proj else None,
+                               path=proj.path if proj else None,
                                argument=m.group(arg_group).strip(),
                                needs_disambiguation=ambiguous)
 
         for pattern, verb in ((_PULL_UP, "pull_up"), (_STOP, "stop")):
             m = pattern.match(text)
             if m:
-                name, ambiguous = self._resolve(m.group("project"), registry)
-                if name is None and not ambiguous:
+                proj, ambiguous = self._resolve(m.group("project"), registry)
+                if proj is None and not ambiguous:
                     return None
-                return Command(verb=verb, project=name, needs_disambiguation=ambiguous)
+                return Command(verb=verb,
+                               project=proj.name if proj else None,
+                               path=proj.path if proj else None,
+                               needs_disambiguation=ambiguous)
 
         if _PORTFOLIO.search(text):
             return Command(verb="portfolio")
@@ -150,13 +192,25 @@ class Router:
     def _sweep(self, now: float) -> None:
         self._approvals = [a for a in self._approvals if now - a.created <= APPROVAL_TTL_S]
 
-    def open_approval(self, project: str, tool: str, now: float) -> Approval:
-        a = Approval(nonce=secrets.token_hex(8), project=project, tool=tool, created=now)
+    def open_approval(self, project: str, tool: str, now: float, path: str = "") -> Approval:
+        a = Approval(nonce=secrets.token_hex(8), project=project, tool=tool,
+                     created=now, path=path)
         self._approvals.append(a)
         return a
 
     def pending_approvals(self) -> list[Approval]:
         return list(self._approvals)
+
+    def take_nonce(self, nonce: str, now: float) -> Approval | None:
+        """Consume one specific approval — the console click path, the worker
+        timeout, and the handoff rejection all resolve by nonce, never by
+        position. Expiry is swept FIRST so a click on a stale card can no
+        longer approve anything."""
+        self._sweep(now)
+        a = next((x for x in self._approvals if x.nonce == nonce), None)
+        if a is not None:
+            self._approvals.remove(a)
+        return a
 
     def resolve_approval(self, spoken: str, now: float) -> tuple[str, Approval | None]:
         text = (spoken or "").strip()
