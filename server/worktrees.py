@@ -76,7 +76,31 @@ async def create_worktree(repo: Path, task: str, worktrees_dir: Path) -> Worktre
 
 async def remove_worktree(wt: Worktree) -> None:
     """Explicit cleanup only — NEVER called automatically. The worktree holds
-    the diff a human may still want to merge back."""
+    the diff a human may still want to merge back.
+
+    Guard before the destructive call: `worktree remove --force` deletes ANY
+    registered linked worktree (untracked files included) — git only protects
+    the MAIN working tree. A Worktree is a plain dataclass anyone can forge or
+    rehydrate stale from disk, so refuse anything JARVIS did not create:
+      1. the recorded branch must live in JARVIS's own jarvis/ namespace;
+      2. the checkout actually at wt.path must have that exact branch checked
+         out RIGHT NOW — this is what stops a stale record from aiming the
+         removal at somebody else's directory."""
+    if not wt.branch.startswith("jarvis/"):
+        raise WorktreeError(
+            f"refusing to remove {wt.path}: branch {wt.branch!r} is outside "
+            f"the jarvis/ namespace, so JARVIS did not create it")
+    try:
+        checked_out = await _git(Path(wt.path), "rev-parse", "--abbrev-ref",
+                                 "HEAD")
+    except WorktreeError as e:
+        raise WorktreeError(
+            f"refusing to remove {wt.path}: cannot confirm what is checked "
+            f"out there ({e})") from e
+    if checked_out != wt.branch:
+        raise WorktreeError(
+            f"refusing to remove {wt.path}: it has {checked_out!r} checked "
+            f"out, not the recorded {wt.branch!r} — stale or forged record")
     await _git(Path(wt.repo), "worktree", "remove", "--force", wt.path)
 
 
@@ -116,7 +140,10 @@ def proxy_problem(env=os.environ) -> str | None:
         return ("HTTPS_PROXY is not set — a spawned worker cannot reach "
                 "Anthropic from this network")
     no_proxy = (env.get("NO_PROXY") or env.get("no_proxy") or "")
-    if "127.0.0.1" not in no_proxy and "localhost" not in no_proxy:
+    # BOTH hosts required: hook POSTs go to http://127.0.0.1:<port>/hooks and
+    # curl matches NO_PROXY against the literal URL host without resolving it,
+    # so `localhost` alone still sends hook traffic through the proxy.
+    if "127.0.0.1" not in no_proxy or "localhost" not in no_proxy:
         return ("NO_PROXY must include localhost,127.0.0.1 or the worker's "
                 "hooks cannot reach me")
     return None

@@ -59,6 +59,50 @@ async def test_remove_worktree_deletes_the_checkout(tmp_path):
     assert not Path(wt.path).exists()
 
 
+async def test_remove_worktree_refuses_a_branch_outside_the_jarvis_namespace(tmp_path):
+    # A record with a foreign branch must be refused BEFORE any git call —
+    # `worktree remove --force` would happily delete a real linked checkout.
+    repo = make_repo(tmp_path)
+    forged = Worktree(repo=str(repo), path=str(repo), branch="main",
+                      base_commit="deadbeef")
+    with pytest.raises(WorktreeError, match="jarvis/"):
+        await remove_worktree(forged)
+    assert repo.exists() and (repo / "README.md").exists()
+
+
+async def test_remove_worktree_refuses_a_stale_record_on_the_wrong_checkout(tmp_path):
+    # Stale/forged record: a legitimate jarvis/ branch name, but the path
+    # points at a checkout that is NOT on that branch. Refuse; leave it alone.
+    repo = make_repo(tmp_path)
+    wt_a = await create_worktree(repo, "task alpha", tmp_path / "wts")
+    wt_b = await create_worktree(repo, "task beta", tmp_path / "wts")
+    try:
+        forged = Worktree(repo=str(repo), path=wt_b.path, branch=wt_a.branch,
+                          base_commit=wt_a.base_commit)
+        with pytest.raises(WorktreeError, match="refus"):
+            await remove_worktree(forged)
+        assert Path(wt_b.path).exists()             # the target survived
+        assert (Path(wt_b.path) / "README.md").exists()
+    finally:
+        await remove_worktree(wt_a)
+        await remove_worktree(wt_b)
+
+
+async def test_remove_worktree_refuses_a_jarvis_record_aimed_at_the_main_checkout(tmp_path):
+    # The nightmare case: a corrupted record wearing a jarvis/ branch but
+    # pointing at the user's real checkout (which is on main, not the branch).
+    repo = make_repo(tmp_path)
+    wt = await create_worktree(repo, "task", tmp_path / "wts")
+    try:
+        forged = Worktree(repo=str(repo), path=str(repo), branch=wt.branch,
+                          base_commit=wt.base_commit)
+        with pytest.raises(WorktreeError):
+            await remove_worktree(forged)
+        assert repo.exists() and (repo / "README.md").exists()
+    finally:
+        await remove_worktree(wt)
+
+
 def test_hook_settings_cover_all_seven_events(tmp_path):
     out = write_hook_settings(tmp_path, port=7777, bearer="tok123")
     body = json.loads(out.read_text(encoding="utf-8"))
@@ -94,3 +138,13 @@ def test_proxy_problem_accepts_a_good_environment_or_the_skip_switch():
     good = {"HTTPS_PROXY": "http://proxy:8080", "NO_PROXY": "localhost,127.0.0.1"}
     assert proxy_problem(good) is None
     assert proxy_problem({"JARVIS_SKIP_PROXY_CHECK": "1"}) is None
+
+
+def test_proxy_problem_requires_both_no_proxy_hosts():
+    # Hooks POST to http://127.0.0.1:<port>/hooks and curl matches NO_PROXY
+    # against the literal URL host without resolving it — so `localhost`
+    # alone still routes hook traffic through the proxy. Both must be listed.
+    proxy = {"HTTPS_PROXY": "http://proxy:8080"}
+    assert "NO_PROXY" in proxy_problem({**proxy, "NO_PROXY": "localhost"})
+    assert "NO_PROXY" in proxy_problem({**proxy, "NO_PROXY": "127.0.0.1"})
+    assert proxy_problem({**proxy, "NO_PROXY": "127.0.0.1,localhost"}) is None
