@@ -205,6 +205,34 @@ def test_extra_location_words_narrow_a_twin():
     assert c.needs_disambiguation == []
 
 
+def test_every_twin_has_a_label_that_actually_selects_it():
+    r = dual_registry()
+    router = Router()
+    labels = router.parse("pull up jarvis", r).needs_disambiguation
+    assert len(labels) == 2 and labels[0] != labels[1]
+    # every offered label must resolve to exactly one project when spoken back
+    for label in labels:
+        c = router.parse(f"pull up {label}", r)
+        assert c.path is not None, f"label {label!r} is a dead end — it re-asks forever"
+        assert not c.needs_disambiguation
+
+
+def test_bare_name_is_still_ambiguous_for_twins():
+    c = Router().parse("pull up jarvis", dual_registry())
+    assert c.path is None and len(c.needs_disambiguation) == 2
+
+
+def test_same_name_approvals_for_different_repos_are_ambiguous_by_voice():
+    router = Router()
+    a = router.open_approval("jarvis", "npm test", now=NOW, path="/Users/likerun/jarvis")
+    b = router.open_approval("jarvis", "npm test", now=NOW, path="/Users/likerun/Desktop/jarvis")
+    state, appr = router.resolve_approval("approve jarvis npm test", now=NOW + 5)
+    assert state == "ambiguous" and appr is None
+    assert len(router.pending_approvals()) == 2      # neither consumed
+    # the console can still resolve precisely by nonce
+    assert router.take_nonce(b.nonce, now=NOW + 5) is b
+
+
 def test_approvals_carry_a_path():
     router = Router()
     a = router.open_approval("soccer", "npm test", now=NOW, path="/p/soccer")

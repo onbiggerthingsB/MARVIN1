@@ -93,15 +93,25 @@ def _distinct_path_tokens(p, matches) -> set[str]:
 
 
 def _label(p, matches) -> str:
-    """Spoken disambiguation label. Twins by name are told apart by location:
-    'jarvis in likerun' vs 'jarvis in Desktop'. If even the parents collide,
-    fall back to the full path — ugly to hear, but never ambiguous."""
+    """Spoken disambiguation label. Twins by name are told apart by a location
+    word the resolver can actually match back — a qualifier drawn from this
+    project's DISTINCT path tokens ('jarvis in Desktop'). A parent name alone
+    is not enough: 'likerun' also appears in /Users/likerun/Desktop/jarvis, so
+    'jarvis in likerun' would re-ask forever. A twin with NO distinct tokens
+    gets its full path — ugly to hear, but _resolve selects on a spoken or
+    clicked full path, so every offered label round-trips to a selection."""
     twins = [m for m in matches if m is not p and m.name == p.name]
     if not twins:
         return p.name
-    parent = PurePosixPath(p.path).parent.name
-    if parent and all(PurePosixPath(t.path).parent.name != parent for t in twins):
-        return f"{p.name} in {parent}"
+    distinct = _distinct_path_tokens(p, matches)
+    if distinct:
+        # Prefer a whole path component that is distinct on its own — the way
+        # a person names a place ("Desktop"), scanning from the parent upward.
+        for part in reversed(PurePosixPath(p.path).parent.parts):
+            tokens = set(_TOKEN.findall(part.lower()))
+            if tokens and tokens <= distinct:
+                return f"{p.name} in {part}"
+        return f"{p.name} in {sorted(distinct)[0]}"
     return f"{p.name} at {p.path}"
 
 
@@ -136,11 +146,19 @@ class Router:
         caller gets location-qualified labels and asks."""
         matches = registry.match(spoken_project)
         if len(matches) > 1:
-            q_tokens = set(_TOKEN.findall(spoken_project.lower()))
-            narrowed = [m for m in matches
-                        if q_tokens & _distinct_path_tokens(m, matches)]
-            if len(narrowed) == 1:
-                matches = narrowed
+            lowered = spoken_project.lower()
+            # A spoken (or clicked) FULL PATH is the one qualifier every twin
+            # has — even one whose every path token also appears in its
+            # double's path, whose distinct-token set is therefore empty.
+            by_path = [m for m in matches if m.path.lower() in lowered]
+            if len(by_path) == 1:
+                matches = by_path
+            else:
+                q_tokens = set(_TOKEN.findall(lowered))
+                narrowed = [m for m in matches
+                            if q_tokens & _distinct_path_tokens(m, matches)]
+                if len(narrowed) == 1:
+                    matches = narrowed
         if len(matches) == 1:
             return matches[0], []
         if len(matches) > 1:
@@ -236,6 +254,12 @@ class Router:
             narrowed = [a for a in matched if _mentions_tool(a.tool, spoken_tokens)]
             if len(narrowed) == 1:
                 matched = narrowed
+        if len(matched) > 1:
+            # Twin checkouts: same project name AND same tool. Only an
+            # explicit full path in the utterance may tell them apart.
+            by_path = [a for a in matched if a.path and a.path.lower() in lowered]
+            if len(by_path) == 1:
+                matched = by_path
 
         if _is_addressed(text):
             # FIX 1: an utterance that names something specific may only
@@ -244,7 +268,10 @@ class Router:
             if not matched:
                 return ("none", None)
             if len(matched) > 1:
-                # Fail closed: still cannot tell which one was meant.
+                # Fail closed: still cannot tell which one was meant. Two
+                # pending "jarvis npm test" approvals in different checkouts
+                # must never resolve by voice guesswork — the console resolves
+                # precisely by nonce (take_nonce); voice refuses.
                 return ("ambiguous", None)
             target = matched[0]
         else:
