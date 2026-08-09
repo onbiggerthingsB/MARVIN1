@@ -293,9 +293,16 @@ def check_beat1(wired: bool, projects: list) -> Check:
         "running server) and write it up as an M3P2 finding")
 
 
-def summarize_registry(projects: list, loaded: bool) -> list[Check]:
+def summarize_registry(projects: list, loaded: bool, wired: bool = False) -> list[Check]:
     """Beat 2 needs a confirmed repo; beat 8 needs a confirmed FINANCE project
-    whose source has NOT been pinned yet."""
+    whose source has NOT been pinned yet.
+
+    `wired` changes what "nothing confirmed" MEANS. With discovery wired, an
+    empty registry is the CORRECT starting state — beat 1 is the beat that
+    fills it, live and out loud. Calling that a blocker would push Keke to
+    hand-seed the registry and so skip the very beat being gated on. Only
+    when discovery is unreachable is an empty registry a real blocker,
+    because then nothing else can ever fill it."""
     out: list[Check] = []
     if not loaded:
         out.append(Check(
@@ -310,7 +317,14 @@ def summarize_registry(projects: list, loaded: bool) -> list[Check]:
     confirmed = [p for p in projects if p.confirmed]
     pinned = [p for p in projects if getattr(p, "data_source", None)]
     finance = [p for p in confirmed if p.kind == "finance"]
-    if not confirmed:
+    if not confirmed and wired:
+        out.append(Check(
+            "registry", OK,
+            f"no confirmed repo yet ({len(projects)} discovered) — which is "
+            f"the CORRECT state to start from. Beat 1 is what fills this: "
+            f"JARVIS asks, you say yes, and beat 2 then has a repo to name. "
+            f"Do NOT hand-seed the registry; that would skip beat 1."))
+    elif not confirmed:
         out.append(Check(
             "registry", ERROR,
             f"no CONFIRMED repo ({len(projects)} discovered). "
@@ -329,6 +343,15 @@ def summarize_registry(projects: list, loaded: bool) -> list[Check]:
         out.append(Check("finance project", OK,
                          f"beat 8 has a confirmed finance project: "
                          f"{', '.join(p.name for p in finance)}"))
+    elif wired:
+        out.append(Check(
+            "finance project", OK,
+            "no confirmed finance project yet — expected before beat 1. "
+            "Onboarding upgrades a repo to kind=\"finance\" on confirmation "
+            "when its name or path looks like finance (quant/stock/trad/"
+            "invest/portfolio/finance), so say yes to your stock repo during "
+            "beat 1 and beat 8 has its project. If yours matches none of "
+            "those words, beat 8 is the one to hand-seed — see below."))
     else:
         out.append(Check(
             "finance project", ERROR,
@@ -654,7 +677,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
     report.checks.append(check_beat1(discovery_wired(sources), projects))
 
-    for c in summarize_registry(projects, loaded):
+    for c in summarize_registry(projects, loaded, wired=discovery_wired(sources)):
         report.checks.append(c)
 
     # --- worktrees ---------------------------------------------------------
