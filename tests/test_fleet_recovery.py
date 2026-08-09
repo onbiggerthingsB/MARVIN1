@@ -1,5 +1,4 @@
 import asyncio
-from pathlib import Path
 from types import SimpleNamespace
 
 from server.app_brain import run_butler_brain
@@ -88,6 +87,94 @@ def test_a_torn_log_still_recovers_the_prefix(tmp_path):
     assert len(reports) == 1 and reports[0]["torn_log"] is True
 
 
+def test_a_torn_log_with_nothing_left_to_report_still_says_so(tmp_path):
+    """A tear early enough to swallow every record leaves reports == [] — no
+    tile, no fleet.recovered, and, before this, nothing spoken: a boot
+    indistinguishable from a clean one with no workers. That is the exact
+    silence create_app's exception path refuses ("silence is indistinguishable
+    from all clear"); torn_on_open is known at boot regardless of how many
+    reports came out of it."""
+    (tmp_path / "fleet.jsonl").write_bytes(b'{"v": 1, "seq"')   # nothing usable
+    bus = EventBus()
+    fleet = fresh_fleet(tmp_path, bus=bus)
+    assert fleet._log.torn_on_open is True
+    cid, q = bus.subscribe()
+    assert fleet.recover() == []                   # nothing survived the tear
+    events = []
+    while not q.empty():
+        ev = q.get_nowait()
+        if ev:
+            events.append((ev["type"], ev["data"]))
+    spoken = [d["text"] for t, d in events if t == "fleet.spoken"]
+    assert any("log was damaged" in s for s in spoken)
+    assert any(t == "fleet.error" for t, _ in events)
+
+
+def test_a_ghost_survives_a_clean_shutdown_that_spawns_nothing(tmp_path):
+    """Run 1 crashes with a worker live; run 2 boots, reports the ghost, spawns
+    nothing and shuts down CLEANLY. close_all compacts — the ghost's records go
+    to `.jsonl.1`, which recover() never reads — so without carrying the ghost
+    into the snapshot, run 3 says nothing at all about a worktree that still
+    holds uncommitted work."""
+    wt = tmp_path / "wt-a"
+    wt.mkdir()                                     # the evidence, still on disk
+    seed_log(tmp_path,
+             ("spawned", {**W1, "worktree": str(wt), "state": "IDLE_AT_PROMPT"}),
+             ("prompt", {**W1, "worktree": str(wt), "state": "ACTIVE_TURN"}))
+    run2 = fresh_fleet(tmp_path)
+    assert len(run2.recover()) == 1
+    asyncio.run(run2.close_all())                  # compaction rotates the log
+
+    run3 = fresh_fleet(tmp_path)
+    reports = run3.recover()
+    assert len(reports) == 1 and reports[0]["worker"] == "w1"
+    assert reports[0]["state"] == UNKNOWN and reports[0]["worktree"] == str(wt)
+
+
+def test_a_ghost_is_retired_once_its_worktree_is_gone(tmp_path):
+    """The worktree IS the evidence, so it is also the retirement rule: seeded
+    ghosts that persisted forever with no way to clear them would be the
+    opposite failure. Delete the directory (merge-back, or plain cleanup) and
+    the next compaction stops carrying it."""
+    wt = tmp_path / "wt-a"
+    wt.mkdir()
+    seed_log(tmp_path,
+             ("spawned", {**W1, "worktree": str(wt), "state": "IDLE_AT_PROMPT"}))
+    run2 = fresh_fleet(tmp_path)
+    assert len(run2.recover()) == 1
+    wt.rmdir()                                     # the human cleaned it up
+    asyncio.run(run2.close_all())
+    assert fresh_fleet(tmp_path).recover() == []
+
+
+def test_a_detached_ghost_keeps_the_command_that_rejoins_it(tmp_path):
+    """The session id lives nowhere but the log, and `claude --resume` is the
+    one thing that would let Keke rejoin that session. Folding it into the slot
+    and then dropping it from the report leaves the console's .tile-resume line
+    empty and the ghost-handoff refusal with nothing to offer."""
+    seed_log(tmp_path,
+             ("spawned", {**W1, "state": "IDLE_AT_PROMPT"}),
+             ("detached", {**W1, "state": "DETACHED", "session_id": "s-1"}))
+    fleet = fresh_fleet(tmp_path)
+    report = fleet.recover()[0]
+    assert report["state"] == DETACHED
+    assert "claude --resume s-1" in report["command"]
+    assert "/wt/soccer-1" in report["command"]
+    result = asyncio.run(fleet.handoff("/p/soccer"))
+    assert result["ok"] is False                   # still never a second driver
+    assert "claude --resume s-1" in result["command"]
+
+
+def test_an_interrupted_ghost_is_offered_no_resume_command(tmp_path):
+    """UNKNOWN means nobody knows what became of it — a resume command would
+    invite Keke to drive something JARVIS just said it cannot vouch for."""
+    seed_log(tmp_path,
+             ("spawned", {**W1, "state": "IDLE_AT_PROMPT",
+                          "session_id": "s-9"}))
+    report = fresh_fleet(tmp_path).recover()[0]
+    assert report["state"] == UNKNOWN and "command" not in report
+
+
 async def test_a_ghost_is_refused_a_terminal_by_name(tmp_path):
     """A ghost is not a Worker, so _find cannot see it and handoff's every
     gate (spawn_in_flight, session_id, DETACHED) is aimed at live workers.
@@ -139,7 +226,7 @@ def test_get_fleet_serves_live_workers_and_ghosts_to_a_cookie(tmp_path):
         # display state, so a worker gone QUIET renders quiet — never .base.
         c.app.state.fleet.workers.append(SimpleNamespace(
             id="live-1", project="tibet", path="/p/tibet", task_text="chart it",
-            worktree=SimpleNamespace(path="/wt/tibet"),
+            worktree=SimpleNamespace(path="/wt/tibet"), starting=False,
             machine=SimpleNamespace(state=lambda now: "ACTIVE_TURN")))
         try:
             body = c.get("/fleet").json()
@@ -154,6 +241,28 @@ def test_get_fleet_serves_live_workers_and_ghosts_to_a_cookie(tmp_path):
     assert "interrupted" not in live                # only ghosts carry it
     assert ghost["state"] == UNKNOWN and ghost["interrupted"] is True
     assert ghost["project"] == "soccer"
+
+
+def test_get_fleet_never_paints_a_starting_worker_unknown(tmp_path):
+    """`base` is UNKNOWN until start() applies `spawned`, and the spawn window
+    is up to 60 seconds long. _spawn pre-seeds published_state, and both
+    status_line() and one_breath() special-case w.starting, precisely because
+    "unknown" is an alarm word reserved for failed probes — a page load
+    mid-spawn must not paint a healthy worker as an UNKNOWN tile with a live
+    handoff button."""
+    from tests.test_app_auth import bootstrap, make_client
+    c = make_client(tmp_path)
+    bootstrap(c)
+    with c:
+        c.app.state.fleet.workers.append(SimpleNamespace(
+            id="live-2", project="soccer", path="/p/soccer", task_text="fix it",
+            worktree=SimpleNamespace(path="/wt/soccer"), starting=True,
+            machine=SimpleNamespace(state=lambda now: UNKNOWN)))
+        try:
+            body = c.get("/fleet").json()
+        finally:
+            c.app.state.fleet.workers.clear()
+    assert body["workers"][0]["state"] == "STARTING"
 
 
 def test_boot_recovery_runs_in_the_lifespan(tmp_path):

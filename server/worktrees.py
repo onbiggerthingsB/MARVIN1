@@ -2,9 +2,18 @@
 spawn needs (spec §5).
 
 Worktree-per-task is v1, not v2: every worker runs in a checkout cut from a
-RECORDED commit, so untracked files in the real checkout are safe by
-construction and the blast radius is a disposable directory. Merge-back is a
-human act — nothing here ever merges, commits to, or deletes the real repo.
+RECORDED commit, so the real checkout's working tree and untracked files are
+safe by construction. Merge-back is a human act — nothing here ever merges,
+commits to, or deletes the real repo.
+
+A worktree is NOT a sandbox, and nothing here should be read as claiming one.
+`cwd` is the worktree, but Write, Edit and Bash all take absolute paths: in the
+live smoke the real worker's FIRST tool call was `Write /tmp/DONE.txt`, and
+neither this module nor git can stop that. The blast radius is the whole
+filesystem the CLI process can reach. The actual containment is the SPOKEN
+APPROVAL in Worker._on_tool_request — every non-read tool call is read aloud
+and blocked until Keke answers — which is why that sentence must name the
+target truthfully, tail included, and say when the target is outside here.
 
 The hook settings go into the WORKTREE's .claude/settings.local.json:
   - local settings are never tracked, so the human's merge-back diff stays

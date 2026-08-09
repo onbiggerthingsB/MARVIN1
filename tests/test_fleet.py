@@ -9,7 +9,8 @@ import pytest
 from claude_agent_sdk import CanUseToolShadowedWarning
 
 from server.bus import EventBus
-from server.fleet import APPROVAL_WAIT_S, Fleet, Worker
+from server.fleet import (APPROVAL_WAIT_S, Fleet, Worker, _risk_note,
+                          _short_args)
 from server.fleet_log import FleetLog
 from server.fleet_state import (ACTIVE_TURN, CLOSED, IDLE_AT_PROMPT, UNKNOWN,
                                 WAITING_PERMISSION)
@@ -1084,8 +1085,17 @@ async def test_spawn_steer_stop_leaves_an_untorn_ordered_log(tmp_path, monkeypat
     # file holds it.
     assert fleet._log.replay() == ([], False)         # the post-compaction tail
     rotated = fleet._log.path.with_suffix(".jsonl.1")
-    records = [json.loads(line) for line in
-               rotated.read_text(encoding="utf-8").splitlines() if line.strip()]
+    # Read the rotated generation through a REAL FleetLog, never bare
+    # json.loads: replay() verifies `v == SCHEMA_VERSION` and
+    # `sum == _checksum(seq, ts, kind, data)` on EVERY record and stops at the
+    # first bad one, and tamper detection is the entire point of the checksum —
+    # a test named "untorn" that parses the file by hand would pass over a
+    # record whose sum was rewritten. torn_on_open is asserted too because the
+    # constructor REPAIRS a torn file, after which replay() honestly reports
+    # the repaired remainder clean.
+    verified = FleetLog(rotated)
+    records, torn = verified.replay()
+    assert verified.torn_on_open is False and torn is False
     assert fleet._log.load_snapshot() is not None     # ...and it is compacted
     seqs = [r["seq"] for r in records]
     assert seqs == list(range(1, len(seqs) + 1))      # untorn, gapless, ordered
@@ -1110,5 +1120,78 @@ async def test_a_worker_free_session_does_not_erase_the_last_one(tmp_path,
     assert "spawned" in history
 
     quiet, *_ = make_fleet(tmp_path, monkeypatch)     # session 2, same log path
+    # Session 1's compaction RENAMED fleet.jsonl away, so without this line the
+    # guard under test is never reached at all: FleetLog.snapshot already skips
+    # the rotation when the log file is absent, and the test would pass with
+    # Fleet.snapshot's size check deleted. A 0-byte log on disk is the case
+    # that genuinely destroys the previous generation — an empty file rotates
+    # perfectly happily — so put one there and pin the guard that stops it.
+    quiet._log.path.write_bytes(b"")
+    assert quiet._log.path.stat().st_size == 0
     await quiet.close_all()
     assert rotated.read_text(encoding="utf-8") == history
+
+
+# ---------- the spoken readback IS the containment (spec §5) ----------
+def test_the_readback_elides_the_middle_and_keeps_a_commands_tail():
+    """A trailing cut removes exactly the dangerous half of a shell line — and
+    _risk_note scans the FULL blob, so JARVIS would say "Careful, sir" and then
+    read out a sentence with the thing it is warning about missing."""
+    cmd = ("npm run build -- --verbose " + "--flag=value " * 20
+           + "&& rm -rf /tmp/scratch-repo")
+    spoken = _short_args({"command": cmd})
+    assert _risk_note("Bash", {"command": cmd})        # the warning fires...
+    assert "rm -rf /tmp/scratch-repo" in spoken        # ...and names its target
+    assert spoken.startswith("npm run build")          # the head still identifies it
+    assert "…" in spoken and len(spoken) < len(cmd)
+
+
+def test_the_readback_keeps_a_paths_distinguishing_suffix():
+    """Two worktrees for the same task differ ONLY in the `-<timestamp>` tail;
+    the live smoke read both aloud as the same truncated prefix."""
+    p = ("/Users/keke/jarvis/state/worktrees/scratch-repo-create-a-file-named-"
+         "done-txt-containing-exactly-the-word-done-20260808-141523/DONE.txt")
+    spoken = _short_args({"file_path": p})
+    assert spoken.endswith("20260808-141523/DONE.txt")
+    assert spoken.startswith("/Users/keke/jarvis")
+    assert "…" in spoken and len(spoken) < len(p)
+
+
+def test_a_short_argument_is_spoken_verbatim():
+    assert _short_args({"command": "npm test"}) == "npm test"
+    assert _short_args({"file_path": "/a/b.txt"}) == "/a/b.txt"
+
+
+async def test_an_approval_says_when_the_target_is_outside_the_worktree(
+        tmp_path, monkeypatch):
+    """cwd is the worktree, but Write/Edit/Bash take absolute paths — the live
+    smoke's very first real tool call was `Write /tmp/DONE.txt`. The worktree
+    is not a sandbox, so the spoken line has to say when the blast lands
+    outside it."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    await fleet.spawn("soccer", repo(tmp_path), "task")
+    w = fleet.workers[0]
+    inside = str(Path(w.worktree.path) / "sub" / "DONE.txt")
+    cid, q = bus.subscribe()
+    try:
+        for tool, args in (("Write", {"file_path": "/tmp/DONE.txt"}),
+                           ("Write", {"file_path": inside}),
+                           ("Bash", {"command": "cat /etc/hosts"}),
+                           ("Bash", {"command": "npm test && rm -rf build"})):
+            t = asyncio.create_task(w._on_tool_request(
+                tool, args, SimpleNamespace(title=None)))
+            await asyncio.sleep(0.05)
+            fleet.deliver_approval(router.pending_approvals()[0].nonce, False)
+            await asyncio.wait_for(t, 1)
+        questions = []
+        while not q.empty():
+            ev = q.get_nowait()
+            if ev and ev["type"] == "approval.request":
+                questions.append(ev["data"]["question"].lower())
+        assert len(questions) == 4
+        assert "outside its worktree" in questions[0]      # absolute escape
+        assert "outside its worktree" not in questions[1]  # inside, no noise
+        assert "outside its worktree" in questions[2]      # a command's target
+        assert "outside its worktree" not in questions[3]  # relative, still inside
+    finally:
+        await cleanup(fleet)

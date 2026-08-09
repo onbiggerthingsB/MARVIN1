@@ -372,6 +372,13 @@ function renderFleetTile(d) {
   // a session id and is genuinely handoff-able.
   tile.querySelector(".tile-open").hidden =
     FLEET_FINAL.has(d.state) || d.interrupted === true;
+  // A restart ghost that was DETACHED before the restart carries the command
+  // that rejoins its session — the id lives nowhere but the fleet log, so this
+  // is the only copy Keke will ever see. Set ONLY when present: a later
+  // fleet.update for the same worker must not blank a command the fleet.handoff
+  // handler (or an earlier /fleet fetch) already parked here. textContent,
+  // never innerHTML: this string is a server-built shell command.
+  if (d.command) tile.querySelector(".tile-resume").textContent = d.command;
   return tile;
 }
 window.jarvis.onEvent("fleet.update", renderFleetTile);

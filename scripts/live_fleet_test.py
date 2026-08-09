@@ -22,6 +22,12 @@ PASS criteria, printed at the end:
      appeared in the WORKTREE and NOT in the origin repo
   3. steer produced a second turn that appended to DONE.txt
   4. stop closed the session and the worktree survives
+
+None of that is a sandbox check, and this script must never imply one. The
+worktree is cwd, not a jail: Write/Edit/Bash take absolute paths, and a real
+run of this script had the worker's first tool call write /tmp/DONE.txt. The
+containment is the SPOKEN approval, so the summary also prints every approval
+whose readback said the target was outside the worktree.
 """
 import asyncio
 import subprocess
@@ -88,6 +94,7 @@ async def main() -> int:
     states: list[str] = []
     tools: list[str] = []
     approvals: list[str] = []
+    outside: list[str] = []        # approvals that named a target outside the worktree
 
     pending: set[asyncio.Task] = set()
 
@@ -123,6 +130,10 @@ async def main() -> int:
                 print(f"  [worker] {text[:120]}")
             if kind == "approval.request":
                 approvals.append(f"{data.get('tool')}: {data.get('args')}")
+                if "outside its worktree" in str(data.get("question", "")).lower():
+                    # The real containment report: what the approval SAID out
+                    # loud about targets beyond the disposable directory.
+                    outside.append(f"{data.get('tool')}: {data.get('args')}")
                 print(f"  [APPROVAL] {data['question']}")
                 # In its OWN task: the round-trip delay must not stop this
                 # pump draining the bus. A blocked pump overflows the
@@ -149,9 +160,16 @@ async def main() -> int:
         ok &= await wait_for(lambda: (wt / "DONE.txt").exists(), 240, "DONE.txt")
         ok &= await wait_for(lambda: w.machine.base == IDLE_AT_PROMPT, 120,
                              "idle at prompt")
-        untouched = not (repo / "DONE.txt").exists()   # origin repo untouched
-        ok &= untouched
-        print(f"[check] DONE.txt in the worktree only: {untouched}")
+        # NOT a sandbox check, and it must not be printed as one. This compares
+        # the ORIGIN REPO and nothing else: cwd is the worktree, but Write,
+        # Edit and Bash take absolute paths, and the run that produced this
+        # script's first transcript wrote /tmp/DONE.txt — while this line
+        # printed True. The only honest containment claim is the spoken
+        # approval, and the `outside` tally below is what reports on it.
+        clean_origin = not (repo / "DONE.txt").exists()
+        ok &= clean_origin
+        print(f"[check] DONE.txt NOT in the origin repo: {clean_origin} "
+              f"(says nothing about the rest of the filesystem)")
 
         print(f"[steer] {fleet.steer_path(str(repo), 'Append a second line to DONE.txt that says: and dusted')}")
         ok &= await wait_for(
@@ -175,6 +193,10 @@ async def main() -> int:
     print(f"states:    {' -> '.join(states) or '(none)'}")
     print(f"tools:     {', '.join(tools) or '(none)'}")
     print(f"approvals: {'; '.join(approvals) or '(none — nothing needed one)'}")
+    # Observed, never a PASS gate: whether the model reaches for an absolute
+    # path is its own choice, and failing the smoke on it would make the smoke
+    # flaky. What must hold is that the spoken line SAID so before the yes.
+    print(f"outside:   {'; '.join(outside) or '(none — every target named was inside the worktree)'}")
     if approvals and not tools:
         print("NOTE: an approval was asked but no tool call was streamed.")
     print("\nRESULT:", "PASS" if ok else "FAIL")

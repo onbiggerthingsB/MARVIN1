@@ -170,9 +170,17 @@ def create_app(base_dir: Path) -> FastAPI:
         # Cookie-authed by the middleware like the rest of the console — NOT
         # the hook bearer, which lives in every worktree.
         now = time.time()
+        # A worker mid-spawn reads STARTING, never the machine's pre-spawned
+        # UNKNOWN: `base` stays UNKNOWN until start() applies `spawned`, and
+        # that window is up to SPAWN_TIMEOUT_S long. _spawn pre-seeds
+        # published_state so a tick cannot publish a spurious UNKNOWN tile, and
+        # status_line()/one_breath() both special-case w.starting, because
+        # "unknown" is an alarm word reserved for failed probes. Without the
+        # same treatment here, a page load during the spawn paints a perfectly
+        # healthy worker as UNKNOWN with a live handoff button.
         live = [{"worker": w.id, "project": w.project, "path": w.path,
-                 "state": w.machine.state(now), "task": w.task_text,
-                 "worktree": w.worktree.path}
+                 "state": "STARTING" if w.starting else w.machine.state(now),
+                 "task": w.task_text, "worktree": w.worktree.path}
                 for w in app.state.fleet.workers]
         return {"workers": live + list(app.state.fleet.ghosts)}
 

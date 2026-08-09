@@ -45,6 +45,11 @@ STOP_TIMEOUT_S = 15.0
 # can_use_tool entirely (spec §5).
 WORKER_ALLOWED_TOOLS = ["Read", "Grep", "Glob"]
 
+# Spoken-readback budgets, in characters. Generous, because this sentence is
+# the ONLY thing standing between a worker and the filesystem.
+ARGS_BUDGET = 120        # a path, a pattern, a URL
+COMMAND_BUDGET = 200     # a shell line: two ends that both matter
+
 _RISKY = ("rm ", "rm -", "mv ", "sudo", "--force", "--hard", "sed -i",
           "chmod", "chown", "curl", "git push")
 
@@ -59,19 +64,106 @@ _HOOK_KINDS = {
 }
 
 
-def _short_args(args, limit: int = 120) -> str:
+def _elide(text: str, limit: int) -> str:
+    """Shorten for SPEECH by cutting the MIDDLE, never the tail.
+
+    The tail is the half that identifies things. Two worktrees for the same
+    task differ only in their `-<timestamp>` suffix (the live smoke read both
+    aloud as the same truncated prefix), and a shell command's destructive
+    clause is almost always at the end: `… && rm -rf …`, `… && git push
+    --force`. Cutting there reads Keke a sentence with exactly the dangerous
+    part removed — and _risk_note scans the FULL blob, so JARVIS would say
+    "Careful, sir" about a danger the very same sentence then declines to
+    name."""
+    limit = max(int(limit), 8)
+    if len(text) <= limit:
+        return text
+    head = (limit - 1) * 55 // 100        # a little more head than tail
+    tail = limit - 1 - head
+    return f"{text[:head]}…{text[-tail:]}"
+
+
+def _short_args(args, limit: int = ARGS_BUDGET) -> str:
     if not isinstance(args, dict):
-        return str(args)[:limit]
+        return _elide(str(args), limit)
     for key in ("command", "file_path", "path", "pattern", "url"):
         if args.get(key):
-            return str(args[key])[:limit]
-    return str(args)[:limit]
+            # A command gets a bigger budget than a path: a shell line packs
+            # more meaning per character, and both of its ends carry weight —
+            # the head says what it is, the tail says what it destroys.
+            return _elide(str(args[key]),
+                          COMMAND_BUDGET if key == "command" else limit)
+    return _elide(str(args), limit)
 
 
 def _risk_note(tool: str, args) -> str:
     blob = f"{tool} {args}".lower()
     return ("Careful, sir — this one can destroy things. "
             if any(w in blob for w in _RISKY) else "")
+
+
+def _named_paths(args) -> list[str]:
+    """Filesystem targets a tool request names, for the worktree check.
+
+    Explicit path arguments are exact. A Bash `command` is only SCANNED, for
+    tokens SHAPED like a path — `/…`, `~/…`, `../…` after shell splitting —
+    which is where false positives are cheapest to avoid: a quoted commit
+    message is one token starting with a letter, `sed -i s/a/b/` does not start
+    with a slash either, and a URL starts with its scheme. A warning nobody
+    believes is worse than no warning."""
+    if not isinstance(args, dict):
+        return []
+    out = [str(args[k]) for k in ("file_path", "path", "notebook_path")
+           if args.get(k)]
+    if args.get("command"):
+        text = str(args["command"])
+        try:
+            tokens = shlex.split(text)
+        except ValueError:                # unbalanced quotes — still worth a look
+            tokens = text.split()
+        out += [t for t in tokens
+                if t.startswith(("/", "~/", "../"))]
+    return out
+
+
+def _outside_note(args, worktree_path: str) -> str:
+    """Spoken warning when a tool's target resolves OUTSIDE the worktree.
+
+    The worktree is not a sandbox (see worktrees.py): cwd is set, but Write,
+    Edit and Bash all take absolute paths, and the live smoke's first real tool
+    call was `Write /tmp/DONE.txt`. The spoken approval is the only containment
+    there is, so it has to say when the blast lands outside the disposable
+    directory. Advisory, never a refusal — the answer is still Keke's."""
+    try:
+        root = Path(worktree_path).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return ""
+    for raw in _named_paths(args):
+        try:
+            p = Path(raw).expanduser()
+            p = (p if p.is_absolute() else root / p).resolve()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if p != root and root not in p.parents:
+            return "Outside its worktree, sir. "
+    return ""
+
+
+def _resume_command(info: dict) -> str:
+    """`claude --resume` for a DETACHED ghost, or "".
+
+    ONLY for DETACHED. That session is genuinely still there — another driver
+    owns it — and this one line is the only way Keke rejoins it, because the
+    session id exists nowhere but the fleet log. An INTERRUPTED ghost gets
+    nothing: its state is UNKNOWN precisely because nobody knows what became of
+    it, and offering a resume command would invite Keke to drive a session
+    JARVIS has just said it cannot vouch for."""
+    if info.get("state") != DETACHED:
+        return ""
+    sid, wt = info.get("session_id") or "", info.get("worktree") or ""
+    if not sid or not wt:
+        return ""
+    return f"cd {shlex.quote(wt)} && claude --resume {shlex.quote(sid)}"
 
 
 async def _default_open_terminal(cmd: str) -> None:
@@ -451,14 +543,23 @@ class Worker:
         self._apply("permission_wait",
                     {"nonce": approval.nonce, "tool": tool_name,
                      "args": _short_args(tool_input)})
-        title = getattr(context, "title", None) or (
-            f"{self.project} wants {tool_name}")
+        # Capped, and the ONLY unbounded part of the sentence: the brain
+        # truncates a spoken question at 400 characters — from the END — so an
+        # SDK-supplied title long enough to blow that budget would cut off the
+        # readback's own tail and "Approve or deny, sir?" with it. Risk note +
+        # outside note + this + COMMAND_BUDGET + the closing clause all fit.
+        title = str(getattr(context, "title", None) or
+                    f"{self.project} wants {tool_name}")[:80]
+        # The worktree confines nothing on its own — cwd is set, absolute paths
+        # ignore it. If the target is outside, Keke hears that BEFORE the yes.
+        outside = _outside_note(tool_input, self.worktree.path)
         self._bus.publish("approval.request", {
             "nonce": approval.nonce, "worker": self.id,
             "project": self.project, "path": self.path, "tool": tool_name,
             "args": _short_args(tool_input),
-            "question": (f"{_risk_note(tool_name, tool_input)}{title} — "
-                         f"{_short_args(tool_input)}. Approve or deny, sir?")})
+            "question": (f"{_risk_note(tool_name, tool_input)}{outside}"
+                         f"{title} — {_short_args(tool_input)}. "
+                         f"Approve or deny, sir?")})
         approved = False
         try:
             approved = bool(await asyncio.wait_for(fut, APPROVAL_WAIT_S))
@@ -835,9 +936,18 @@ class Fleet:
                 return {"ok": False, "spoken": "Nothing is running there, sir."}
             project = ghost.get("project") or "That worker"
             if ghost.get("state") == DETACHED:
-                return {"ok": False,
-                        "spoken": (f"{project} was already detached before the "
-                                   f"restart, sir — it has its own terminal.")}
+                spoken = (f"{project} was already detached before the restart, "
+                          f"sir — it has its own terminal.")
+                cmd = ghost.get("command") or ""
+                if cmd:
+                    # Still ok=False — JARVIS opens no window and takes no
+                    # session back. But refusing with NOTHING actionable, over
+                    # a session that provably still exists, wastes the one fact
+                    # only the log has.
+                    return {"ok": False, "command": cmd,
+                            "spoken": (f"{spoken} The command to rejoin it is "
+                                       f"on its tile.")}
+                return {"ok": False, "spoken": spoken}
             return {"ok": False,
                     "spoken": (f"{project} didn't survive the restart, sir — I "
                                f"don't hold its session any more, so there's "
@@ -1109,7 +1219,8 @@ class Fleet:
 
     # ---------- restart honesty ----------
     def snapshot(self) -> None:
-        """Compaction point: current worker facts through the durable log.
+        """Compaction point: current worker facts — plus this boot's unretired
+        ghosts — through the durable log.
 
         Called ONCE per server lifetime, from close_all. FleetLog.snapshot
         ROTATES the log and keeps exactly ONE generation (`.jsonl.1`), so each
@@ -1139,6 +1250,33 @@ class Fleet:
                           "worktree": w.worktree.path,
                           "session_id": w.session_id or ""}
                    for w in self.workers}
+        # Ghosts from THIS boot are carried into the snapshot, or one clean
+        # shutdown after a crash erases the very evidence restart honesty
+        # exists to keep: the compaction rotates their records into `.jsonl.1`,
+        # which recover() never reads, so the NEXT boot would say nothing at
+        # all about a worktree that still holds uncommitted work.
+        #
+        # The retirement rule is the worktree itself. A ghost is carried only
+        # while its directory is still on disk, because that directory IS the
+        # thing being remembered — once the human merges it back or deletes it
+        # there is nothing left to be told about. That is what keeps "seeded
+        # forever with no way to clear them" from being the new failure, and it
+        # needs no clock: the owner's own cleanup is the off switch. A live
+        # worker with the same id always wins; it is the fresher fact.
+        for g in self.ghosts:
+            wid, wt = g.get("worker"), g.get("worktree") or ""
+            if not wid or wid in workers or not wt:
+                continue
+            try:
+                if not Path(wt).exists():
+                    continue
+            except OSError:
+                continue
+            workers[wid] = {"worker": wid, "project": g.get("project", "?"),
+                            "path": g.get("path", ""),
+                            "state": g.get("state", UNKNOWN),
+                            "task": g.get("task", ""), "worktree": wt,
+                            "session_id": g.get("session_id", "")}
         self._log_writer.snapshot({"workers": workers})
 
     def recover(self) -> list[dict]:
@@ -1166,9 +1304,23 @@ class Fleet:
         session mid-flight reads as closed rather than as a terminal somebody
         owns. Nothing here re-runs the state machine: replaying a
         WAITING_PERMISSION verbatim would resurrect a state that never decays,
-        waiting on a future that died with the process."""
+        waiting on a future that died with the process.
+
+        Two things are said out loud that no individual report can carry: a
+        DAMAGED log (torn tail, or a snapshot file that will not verify) is
+        announced on its own, because a tear early enough to swallow every
+        record leaves nothing else to speak; and a DETACHED ghost keeps the
+        `claude --resume` command that rejoins it, which is the one fact only
+        this log holds."""
         folded: dict[str, dict] = {}
         snap = self._log.load_snapshot()
+        # A snapshot file that EXISTS but does not verify is damage of exactly
+        # the same kind as a torn tail: the compacted history it held — every
+        # worker carried across the last rotation — is unreadable, and
+        # load_snapshot returns None for that and for "no snapshot at all"
+        # alike. Only the file's existence tells the two apart.
+        snap_unreadable = snap is None and self._log.path.with_suffix(
+            ".snap").exists()
         if snap:
             for wid, info in (snap.get("state", {}).get("workers", {}) or {}).items():
                 if isinstance(info, dict):
@@ -1179,7 +1331,8 @@ class Fleet:
         # log remembers that it was torn when this process opened it; without
         # that, recovery would report a whole log as verified when its last
         # records are sitting in a `.torn-*` file nobody read.
-        torn = bool(torn or getattr(self._log, "torn_on_open", False))
+        torn = bool(torn or getattr(self._log, "torn_on_open", False)
+                    or snap_unreadable)
         for rec in records:
             data = rec.get("data", {})
             wid = data.get("worker")
@@ -1196,15 +1349,41 @@ class Fleet:
             if last == CLOSED:
                 continue
             state = DETACHED if last == DETACHED else UNKNOWN
+            # `worktree` and `session_id` live on the REPORT, not just on the
+            # publish: GET /fleet serves these dicts verbatim to a browser that
+            # missed the boot-time SSE, and a ghost tile without the worktree
+            # disagreed with the live tiles beside it and with its own
+            # fleet.update. session_id is the durable fact (it survives the
+            # next compaction through Fleet.snapshot); `command` below is the
+            # line derived from it for the console and the voice.
             report = {"worker": wid, "project": info.get("project", "?"),
                       "path": info.get("path", ""), "state": state,
                       "task": info.get("task", ""),
+                      "worktree": info.get("worktree", ""),
+                      "session_id": info.get("session_id", ""),
                       "interrupted": last != DETACHED, "torn_log": torn}
+            cmd = _resume_command(report)
+            if cmd:
+                report["command"] = cmd
             reports.append(report)
-            self._bus.publish("fleet.update",
-                              {**report, "worktree": info.get("worktree", "")})
+            self._bus.publish("fleet.update", dict(report))
         interrupted = sum(1 for r in reports if r["interrupted"])
         if interrupted:
             self._bus.publish("fleet.recovered", {"count": interrupted})
+        if torn:
+            # Known at boot regardless of how many reports came out of it. A
+            # tear early enough to swallow every record leaves reports == [] —
+            # no tile, no fleet.recovered, nothing spoken — a boot
+            # indistinguishable from a clean one with no workers. That is the
+            # exact silence create_app's exception path refuses; refuse it here
+            # too, and say it even when reports DID survive, because a tear
+            # means there may be more than what is on screen.
+            self._bus.publish("fleet.error", {
+                "reason": ("fleet log was damaged — the unreadable part is "
+                           "quarantined beside it")})
+            self._bus.publish("fleet.spoken", {"text": (
+                "Sir, my fleet log was damaged — I've reported what I could "
+                "still read, but there may be workers from the last run I "
+                "can't tell you about.")})
         self.ghosts = reports
         return reports
