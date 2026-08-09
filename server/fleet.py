@@ -18,13 +18,16 @@ import asyncio
 import contextlib
 import time
 import uuid
+import warnings
 from collections import deque
 from pathlib import Path
 
-from claude_agent_sdk import (ClaudeAgentOptions, ClaudeSDKClient,
-                              PermissionResultAllow, PermissionResultDeny)
+from claude_agent_sdk import (CanUseToolShadowedWarning, ClaudeAgentOptions,
+                              ClaudeSDKClient, PermissionResultAllow,
+                              PermissionResultDeny)
 
-from server.fleet_state import (CLOSED, DETACHED, QUIET, WorkerStateMachine)
+from server.fleet_state import (CLOSED, DETACHED, QUIET, WAITING_PERMISSION,
+                                WorkerStateMachine)
 from server.worktrees import (WorktreeError, create_worktree, proxy_problem,
                               write_hook_settings)
 
@@ -218,8 +221,17 @@ class Worker:
         )
 
     async def start(self) -> None:
-        self._client = self._client_factory(self.options())
-        await self._client.connect()
+        # The installed SDK warns (CanUseToolShadowedWarning, on connect) that
+        # allowed_tools=["Read","Grep","Glob"] shadows can_use_tool for those
+        # tools. Here the shadowing is INTENTIONAL: reads proceed without a
+        # voice approval, everything else falls through to can_use_tool (spec
+        # §5). Suppress exactly that category at this construction site only —
+        # a production spawn must not open with an alarming warning — while
+        # any OTHER warning the SDK raises still surfaces.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", CanUseToolShadowedWarning)
+            self._client = self._client_factory(self.options())
+            await self._client.connect()
         self._apply("spawned", {"base_commit": self.worktree.base_commit,
                                 "branch": self.worktree.branch})
         self.consumer = asyncio.create_task(
@@ -266,6 +278,20 @@ class Worker:
                         "worker": self.id, "project": self.project,
                         "path": self.path, **line})
                 self._apply("activity")
+            # The stream ended WITHOUT an exception: the CLI process exited
+            # (session limit, /exit, clean crash). Returning silently here
+            # would park the worker at its last state forever — still counted
+            # live, still blocking the queue, with steer reporting success
+            # into a dead client — and tick could never catch it (only QUIET
+            # is probed, and IDLE_AT_PROMPT never derives QUIET). Apply
+            # "lost" instead; if the SessionEnd hook already landed the
+            # machine is CLOSED and this is a clean, expected end — apply
+            # would bounce off CLOSED anyway, so skip the error noise too.
+            if self.machine.base not in (CLOSED, DETACHED):
+                self._bus.publish("fleet.error", {
+                    "worker": self.id, "project": self.project,
+                    "reason": "worker stream ended — the CLI process exited"})
+                self._apply("lost")
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — a dead stream must say so on the tile
@@ -332,6 +358,22 @@ class Worker:
             self._bus.publish("approval.resolved", {
                 "outcome": "expired", "project": self.project,
                 "tool": approval.tool, "nonce": approval.nonce})
+        except asyncio.CancelledError:
+            # The SDK tore down its callback task — a disconnect or interrupt
+            # OUTSIDE stop()'s path (close_all, an SDK-initiated abort).
+            # Without repair the router card would linger until TTL and the
+            # base state would sit on WAITING_PERMISSION, which never decays.
+            # Sweep the nonce, repair the state, and RE-RAISE: cancellation
+            # is never swallowed.
+            self._router.take_nonce(approval.nonce, self._now())
+            self._futures.pop(approval.nonce, None)
+            self._bus.publish("approval.resolved", {
+                "outcome": "cancelled", "project": self.project,
+                "tool": approval.tool, "nonce": approval.nonce})
+            self._apply("permission_done",
+                        {"nonce": approval.nonce, "approved": False,
+                         "cancelled": True})
+            raise
         finally:
             self._futures.pop(approval.nonce, None)
         self._apply("permission_done",
@@ -390,6 +432,11 @@ class Fleet:
         self.queue: deque[tuple[str, str, str]] = deque()
         self.ghosts: list[dict] = []      # restart reports (Task 10)
         self.max_workers = max_workers
+        # Spawns that have RESERVED a slot but not yet registered a worker.
+        # Counted into every admission check so two overlapping spawns can
+        # never both pass while the first is still awaiting its worktree —
+        # max_workers=1 is the invariant this class exists to enforce.
+        self._pending_spawns = 0
         self.worktrees_dir = Path(worktrees_dir)
         self.forbidden = tuple(str(Path(f).resolve()) for f in forbidden)
         self.hook_port = hook_port
@@ -423,6 +470,10 @@ class Fleet:
 
     # ---------- commands (every failure is a sentence) ----------
     async def spawn(self, project: str, path: str, task: str) -> str:
+        return await self._spawn(project, path, task, requeue_front=False)
+
+    async def _spawn(self, project: str, path: str, task: str,
+                     requeue_front: bool) -> str:
         try:
             resolved = str(Path(path).resolve())
             for bad in self.forbidden:
@@ -434,29 +485,53 @@ class Fleet:
                 return f"I can't spawn safely, sir: {problem}."
             if not (task or "").strip():
                 return "Spawn it to do what, sir?"
-            if len(self.live) >= self.max_workers:
-                self.queue.append((project, path, task))
+            # Admission is decided and RESERVED synchronously — no await
+            # between this check and the increment below — so overlapping
+            # spawns (HTTP route + voice loop, Task 8) can never both admit.
+            if len(self.live) + self._pending_spawns >= self.max_workers:
+                if requeue_front:
+                    # A queue head popped by _admit_next that bounced off
+                    # capacity goes back to the FRONT — it must never be
+                    # demoted behind later arrivals.
+                    self.queue.appendleft((project, path, task))
+                    position = 1
+                else:
+                    self.queue.append((project, path, task))
+                    position = len(self.queue)
                 self._log_writer.append("queued", {"project": project,
                                                    "path": path, "task": task})
                 return (f"The fleet is at capacity, sir — {project} is queued "
-                        f"at position {len(self.queue)}.")
-            wt = await self._worktree_factory(Path(path), task,
-                                              self.worktrees_dir)
-            self._settings_writer(Path(wt.path), self.hook_port,
-                                  self.hook_bearer)
-            _shield_bearer(Path(wt.path))   # before the CLI can ever git add
-            worker = Worker(project=project, path=path, task_text=task, wt=wt,
-                            bus=self._bus, router=self._router,
-                            log=self._log_writer,
-                            client_factory=self._client_factory, now=self._now)
+                        f"at position {position}.")
+            self._pending_spawns += 1
             try:
-                await asyncio.wait_for(worker.start(), SPAWN_TIMEOUT_S)
-            except BaseException:
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(
-                        worker.shutdown(interrupt_first=False), 5)
-                raise
-            self.workers.append(worker)
+                wt = await self._worktree_factory(Path(path), task,
+                                                  self.worktrees_dir)
+                self._settings_writer(Path(wt.path), self.hook_port,
+                                      self.hook_bearer)
+                _shield_bearer(Path(wt.path))  # before the CLI can ever git add
+                worker = Worker(project=project, path=path, task_text=task,
+                                wt=wt, bus=self._bus, router=self._router,
+                                log=self._log_writer,
+                                client_factory=self._client_factory,
+                                now=self._now)
+                # Register BEFORE start(): the CLI's SessionStart hook can
+                # POST during connect(), and an unregistered worker would be
+                # published as fleet.unknown_session. published_state is
+                # pre-seeded so a tick firing mid-connect does not publish a
+                # spurious UNKNOWN tile for a healthy spawning worker.
+                worker.published_state = worker.machine.base
+                self.workers.append(worker)
+                try:
+                    await asyncio.wait_for(worker.start(), SPAWN_TIMEOUT_S)
+                except BaseException:
+                    if worker in self.workers:   # failed spawn: deregister
+                        self.workers.remove(worker)
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(
+                            worker.shutdown(interrupt_first=False), 5)
+                    raise
+            finally:
+                self._pending_spawns -= 1
             # Spec §3 acknowledgment honesty: "On it" ONLY now — the worktree
             # exists, the client connected, the task is in the session.
             return (f"On it, sir — {project} is working in a fresh worktree "
@@ -503,10 +578,15 @@ class Fleet:
         return spoken
 
     async def _admit_next(self) -> None:
-        if not self.queue or len(self.live) >= self.max_workers:
+        # No await between this capacity check, the pop, and _spawn's own
+        # synchronous slot reservation — so a tick firing during stop's
+        # _admit_next cannot pop and spawn a second queued item: whichever
+        # runs second sees the reserved slot and returns without popping.
+        if not self.queue or (len(self.live) + self._pending_spawns
+                              >= self.max_workers):
             return
         project, path, task = self.queue.popleft()
-        spoken = await self.spawn(project, path, task)
+        spoken = await self._spawn(project, path, task, requeue_front=True)
         self._bus.publish("fleet.spoken",
                           {"text": f"Next in the queue, sir: {spoken}"})
 
@@ -555,16 +635,18 @@ class Fleet:
             return
         if sid and not w.session_id:
             w.session_id = sid            # hooks can learn the id before the stream
-        if kind == "permission_wait" and (w.consumer is not None
-                                          and not w.consumer.done()):
-            # SDK-owned session: can_use_tool is the ONLY permission source.
-            # permission_wait arrives on two independent layers, and a slow
-            # Notification POST landing AFTER can_use_tool already applied
-            # permission_done would park the tile on WAITING_PERMISSION
-            # forever (it never decays). Dropping the hook copy for sessions
-            # whose consumer is alive makes that parked state impossible; a
-            # worker without a live consumer (detached, stream lost) keeps
-            # the hook as its only remaining signal.
+        if kind == "permission_wait":
+            # Fleet-owned worker: can_use_tool is the ONLY permission source,
+            # so a hook-sourced Notification is dropped UNCONDITIONALLY. It
+            # can land after permission_done — a stale POST that raced a
+            # stream death, or a dead stream with a live CLI hitting a real
+            # prompt — and would park the tile on WAITING_PERMISSION forever:
+            # the state never decays because only a real approval's TTL
+            # delivers permission_done, and a hook-only wait has no router
+            # card, no future, and no TTL. A dead-consumer worker is rescued
+            # by tick()'s probe, never by trusting this POST. (Post-handoff
+            # the machine bounces everything but session_end off DETACHED,
+            # so keeping the hook there bought nothing anyway.)
             return
         if kind:
             w._apply(kind)
@@ -576,11 +658,23 @@ class Fleet:
         now = self._now() if now is None else now
         for w in self.workers:
             state = w.machine.state(now)
-            if state == QUIET and (w.consumer is None or w.consumer.done()):
+            consumer_dead = w.consumer is None or w.consumer.done()
+            if state == QUIET and consumer_dead:
                 state = w.machine.probe_failed(now)
                 self._bus.publish("fleet.error", {
                     "worker": w.id, "project": w.project,
                     "reason": "health probe failed — worker marked unknown"})
+            elif (w.machine.base == WAITING_PERMISSION and consumer_dead
+                  and not any(not f.done() for f in w._futures.values())):
+                # A permission wait NOTHING can resolve: the consumer is
+                # dead and no approval future is pending, so no TTL will
+                # ever deliver permission_done and the state never decays.
+                # Only a failed probe may honestly reclassify it.
+                state = w.machine.probe_failed(now)
+                self._bus.publish("fleet.error", {
+                    "worker": w.id, "project": w.project,
+                    "reason": ("health probe failed — permission wait had "
+                               "no resolver; worker marked unknown")})
             if state != w.published_state:
                 w.published_state = state
                 self._bus.publish("fleet.update", {

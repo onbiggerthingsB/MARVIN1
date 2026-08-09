@@ -1,7 +1,11 @@
 import asyncio
 import time
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
+from claude_agent_sdk import CanUseToolShadowedWarning
 
 from server.bus import EventBus
 from server.fleet import APPROVAL_WAIT_S, Fleet, Worker
@@ -334,3 +338,275 @@ async def test_stop_rejects_pending_approvals_first(tmp_path, monkeypatch):
     assert result.behavior == "deny"                  # the callback was unblocked
     assert router.pending_approvals() == []           # and the router swept
     assert w.machine.base == CLOSED
+
+
+# ---------- regression: the parked-forever WAITING_PERMISSION state ----------
+async def test_notification_after_permission_done_live_consumer(tmp_path, monkeypatch):
+    """A stale Notification POST landing AFTER can_use_tool resolved must not
+    park the tile on WAITING_PERMISSION (which never decays)."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    await fleet.spawn("soccer", repo(tmp_path), "task")
+    w = fleet.workers[0]
+    decision = asyncio.create_task(w._on_tool_request(
+        "Bash", {"command": "npm test"}, SimpleNamespace(title=None)))
+    try:
+        await asyncio.sleep(0.05)
+        nonce = router.pending_approvals()[0].nonce
+        assert fleet.deliver_approval(nonce, True) is True
+        await asyncio.wait_for(decision, 1)
+        assert w.machine.base == ACTIVE_TURN          # permission_done applied
+        fleet.handle_hook({"hook_event_name": "Notification",
+                           "cwd": w.worktree.path})   # the slow POST lands now
+        assert w.machine.base == ACTIVE_TURN          # NOT parked
+    finally:
+        await cleanup(fleet)
+
+
+async def test_notification_with_dead_consumer_cannot_park_waiting(tmp_path, monkeypatch):
+    """Dead stream, live CLI: the CLI hits a real permission prompt and POSTs
+    Notification — with no router card, no future, and no TTL. Applying it
+    would park WAITING_PERMISSION forever; it must be dropped."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    await fleet.spawn("soccer", repo(tmp_path), "task")
+    w = fleet.workers[0]
+    try:
+        clients[0].stream.put_nowait(RuntimeError("transport died"))
+        await asyncio.sleep(0.05)
+        assert w.machine.base == UNKNOWN and w.consumer.done()
+        fleet.handle_hook({"hook_event_name": "Notification",
+                           "cwd": w.worktree.path})
+        assert w.machine.base == UNKNOWN              # NEVER WAITING_PERMISSION
+    finally:
+        await cleanup(fleet)
+
+
+async def test_tick_rescues_a_parked_permission_wait(tmp_path, monkeypatch):
+    """Defense in depth: if WAITING_PERMISSION is ever reached with a dead
+    consumer and no pending approval future, nothing can deliver
+    permission_done — tick's probe must reclassify it, not skip it."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    await fleet.spawn("soccer", repo(tmp_path), "task")
+    w = fleet.workers[0]
+    try:
+        clients[0].stream.put_nowait(RuntimeError("transport died"))
+        await asyncio.sleep(0.05)
+        w._apply("permission_wait")       # the leak, however it happened
+        assert w.machine.base == WAITING_PERMISSION
+        assert w.consumer.done() and not w._futures
+        await fleet.tick()
+        assert w.machine.base == UNKNOWN  # rescued — a stop can now clear it
+    finally:
+        await cleanup(fleet)
+
+
+async def test_tick_leaves_a_real_permission_wait_alone(tmp_path, monkeypatch):
+    """A pending approval future has a TTL that WILL deliver permission_done —
+    tick must not reclassify that wait even when the consumer is dead."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    await fleet.spawn("soccer", repo(tmp_path), "task")
+    w = fleet.workers[0]
+    decision = asyncio.create_task(w._on_tool_request(
+        "Bash", {"command": "npm test"}, SimpleNamespace(title=None)))
+    try:
+        await asyncio.sleep(0.05)
+        w.consumer.cancel()
+        await asyncio.sleep(0)
+        await fleet.tick()
+        assert w.machine.base == WAITING_PERMISSION   # the TTL owns this one
+        nonce = router.pending_approvals()[0].nonce
+        fleet.deliver_approval(nonce, True)
+        await asyncio.wait_for(decision, 1)
+    finally:
+        await cleanup(fleet)
+
+
+# ---------- regression: atomic admission (max_workers=1 under concurrency) ----------
+async def test_two_concurrent_spawns_admit_exactly_one(tmp_path, monkeypatch):
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    inner = fleet._worktree_factory
+
+    async def slow_factory(repo_path, task, wtdir):
+        await asyncio.sleep(0.01)     # a REAL suspension, like the git subprocess
+        return await inner(repo_path, task, wtdir)
+
+    fleet._worktree_factory = slow_factory
+    s1, s2 = await asyncio.gather(
+        fleet.spawn("soccer", repo(tmp_path, "soccer"), "task one"),
+        fleet.spawn("alethic", repo(tmp_path, "alethic"), "task two"))
+    try:
+        assert len(fleet.workers) == 1                # EXACTLY one admitted
+        assert len(fleet.queue) == 1                  # the other queued
+        assert sum("On it" in s for s in (s1, s2)) == 1
+        assert sum("queued" in s.lower() for s in (s1, s2)) == 1
+    finally:
+        await cleanup(fleet)
+
+
+# ---------- regression: a cleanly-ended stream is not silent task death ----------
+async def test_a_cleanly_ended_stream_is_marked_lost(tmp_path, monkeypatch):
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    await fleet.spawn("soccer", repo(tmp_path), "task")
+    w = fleet.workers[0]
+    cid, q = bus.subscribe()
+    try:
+        clients[0].stream.put_nowait(None)            # generator returns cleanly
+        await asyncio.sleep(0.05)
+        assert w.machine.base == UNKNOWN              # not parked, not "live"
+        reasons = []
+        while not q.empty():
+            ev = q.get_nowait()
+            if ev and ev["type"] == "fleet.error":
+                reasons.append(ev["data"]["reason"])
+        assert any("stream ended" in r for r in reasons)
+    finally:
+        await cleanup(fleet)
+
+
+async def test_a_stream_ending_after_session_end_stays_closed_quietly(tmp_path, monkeypatch):
+    """CLOSED is final: when the SessionEnd hook already landed, the stream
+    ending is the EXPECTED end — no lost, no error noise."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    await fleet.spawn("soccer", repo(tmp_path), "task")
+    w = fleet.workers[0]
+    cid, q = bus.subscribe()
+    try:
+        fleet.handle_hook({"hook_event_name": "SessionEnd",
+                           "cwd": w.worktree.path})
+        assert w.machine.base == CLOSED
+        clients[0].stream.put_nowait(None)
+        await asyncio.sleep(0.05)
+        assert w.machine.base == CLOSED
+        while not q.empty():
+            ev = q.get_nowait()
+            assert not (ev and ev["type"] == "fleet.error")
+    finally:
+        await cleanup(fleet)
+
+
+# ---------- regression: cancellation must not leak the router card ----------
+async def test_cancelled_tool_request_sweeps_card_and_repairs_state(tmp_path, monkeypatch):
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    await fleet.spawn("soccer", repo(tmp_path), "task")
+    w = fleet.workers[0]
+    decision = asyncio.create_task(w._on_tool_request(
+        "Bash", {"command": "npm test"}, SimpleNamespace(title=None)))
+    try:
+        await asyncio.sleep(0.05)
+        assert w.machine.base == WAITING_PERMISSION
+        assert len(router.pending_approvals()) == 1
+        decision.cancel()                 # the SDK tearing down its callback
+        with pytest.raises(asyncio.CancelledError):
+            await decision                # never swallowed
+        assert router.pending_approvals() == []       # card swept, no TTL wait
+        assert w.machine.base != WAITING_PERMISSION   # state repaired
+        assert w._futures == {}
+    finally:
+        await cleanup(fleet)
+
+
+# ---------- regression: spawn plumbing the constraints demanded ----------
+async def test_spawn_writes_the_bearer_shield(tmp_path, monkeypatch):
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    await fleet.spawn("soccer", repo(tmp_path), "task")
+    try:
+        gi = Path(fleet.workers[0].worktree.path) / ".claude" / ".gitignore"
+        lines = gi.read_text(encoding="utf-8").splitlines()
+        # keeps .claude/settings.local.json (the bearer) out of `git add -A`,
+        # and hides the shield itself
+        assert "settings.local.json" in lines
+        assert ".gitignore" in lines
+    finally:
+        await cleanup(fleet)
+
+
+async def test_a_worktree_timeout_speaks_and_registers_nothing(tmp_path, monkeypatch):
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+
+    async def timing_out(repo_path, task, wtdir):
+        raise asyncio.TimeoutError("git hung")
+
+    fleet._worktree_factory = timing_out
+    spoken = await fleet.spawn("soccer", repo(tmp_path), "task")
+    assert "timed out" in spoken
+    assert fleet.workers == []
+    assert fleet._pending_spawns == 0                 # the reservation released
+
+
+async def test_session_start_during_connect_is_not_an_unknown_session(tmp_path, monkeypatch):
+    """The CLI's SessionStart hook can POST while connect() is still awaited;
+    the fleet's own spawn must never be published as fleet.unknown_session."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    inner = fleet._client_factory
+
+    def hooking_factory(options):
+        c = inner(options)
+        orig_connect = c.connect
+
+        async def connect():
+            await orig_connect()
+            fleet.handle_hook({"hook_event_name": "SessionStart",
+                               "session_id": "boot-1", "cwd": options.cwd})
+        c.connect = connect
+        return c
+
+    fleet._client_factory = hooking_factory
+    cid, q = bus.subscribe()
+    await fleet.spawn("soccer", repo(tmp_path), "task")
+    try:
+        unknown = []
+        while not q.empty():
+            ev = q.get_nowait()
+            if ev and ev["type"] == "fleet.unknown_session":
+                unknown.append(ev["data"])
+        assert unknown == []                          # our own spawn, matched
+        assert fleet.workers[0].session_id == "boot-1"
+    finally:
+        await cleanup(fleet)
+
+
+async def test_connect_suppresses_the_shadowed_callback_warning(tmp_path, monkeypatch):
+    """allowed_tools intentionally shadows can_use_tool for Read/Grep/Glob;
+    the SDK's CanUseToolShadowedWarning must not surface on a real connect."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    inner = fleet._client_factory
+
+    def warning_factory(options):
+        c = inner(options)
+        orig_connect = c.connect
+
+        async def connect():
+            warnings.warn(                    # what the real SDK does on connect
+                "can_use_tool will not be invoked for: Read, Grep, Glob",
+                CanUseToolShadowedWarning, stacklevel=2)
+            await orig_connect()
+        c.connect = connect
+        return c
+
+    fleet._client_factory = warning_factory
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        await fleet.spawn("soccer", repo(tmp_path), "task")
+    try:
+        assert not [c for c in caught
+                    if issubclass(c.category, CanUseToolShadowedWarning)]
+    finally:
+        await cleanup(fleet)
+
+
+# ---------- regression: the durable log survives a whole life, in order ----------
+async def test_spawn_steer_stop_leaves_an_untorn_ordered_log(tmp_path, monkeypatch):
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    path = repo(tmp_path)
+    await fleet.spawn("soccer", path, "fix the tests")
+    assert "Told soccer" in fleet.steer_path(path, "also lint")
+    await asyncio.sleep(0.05)                         # let the pump run
+    await fleet.stop(path)
+    await fleet.close_all()                           # flushes the log writer
+    records, torn = fleet._log.replay()
+    assert torn is False
+    seqs = [r["seq"] for r in records]
+    assert seqs == list(range(1, len(seqs) + 1))      # untorn, gapless, ordered
+    kinds = [r["kind"] for r in records]
+    assert kinds[0] == "spawned"
+    assert kinds.count("prompt") == 2                 # the task, then the steer
+    assert kinds[-1] == "session_end"
