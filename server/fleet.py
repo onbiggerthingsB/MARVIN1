@@ -175,6 +175,9 @@ class Worker:
         self.transcript: deque[dict] = deque(maxlen=TRANSCRIPT_KEEP)
         self.locked = False               # handoff lockout: no more input
         self.stop_requested = False       # a stop that landed mid-start, deferred
+        # Set by _spawn around its own await of start(), cleared the moment
+        # that await returns — the ONLY thing that may mean "starting".
+        self.spawn_in_flight = False
         self.published_state: str | None = None
         self.consumer: asyncio.Task | None = None
         self.pump: asyncio.Task | None = None
@@ -189,11 +192,18 @@ class Worker:
 
     @property
     def starting(self) -> bool:
-        """True while start() has not yet built the session's tasks: the
+        """True while a LIVE _spawn has not yet built the session's tasks: the
         client may be absent or half-connected and there is no pump. Early
-        registration makes this window visible to _find, so stop() and
-        steer() must not treat it as a running session."""
-        return self.consumer is None
+        registration makes this window visible to _find, so stop() and steer()
+        must not treat it as a running session.
+
+        Gated on the explicit flag, never on `consumer is None` alone: stop()
+        answers this window with a PROMISE that only _spawn's post-start()
+        check redeems, so a worker registered by any other path (Task 10's
+        restart registration) must not look like one — that promise would
+        never be redeemed, stop() would be a permanent no-op, and steer()
+        would refuse forever."""
+        return self.spawn_in_flight and self.consumer is None
 
     # ---------- state plumbing ----------
     def _apply(self, kind: str, extra: dict | None = None) -> None:
@@ -518,6 +528,7 @@ class Fleet:
                 return (f"The fleet is at capacity, sir — {project} is queued "
                         f"at position {position}.")
             self._pending_spawns += 1
+            worker = None
             try:
                 wt = await self._worktree_factory(Path(path), task,
                                                   self.worktrees_dir)
@@ -535,6 +546,10 @@ class Fleet:
                 # pre-seeded so a tick firing mid-connect does not publish a
                 # spurious UNKNOWN tile for a healthy spawning worker.
                 worker.published_state = worker.machine.base
+                # THIS spawn owns the start below, so it — and only it — can
+                # redeem the promise stop() makes to a starting worker. The
+                # finally clears the flag the moment that await returns.
+                worker.spawn_in_flight = True
                 self.workers.append(worker)
                 try:
                     await asyncio.wait_for(worker.start(), SPAWN_TIMEOUT_S)
@@ -547,6 +562,8 @@ class Fleet:
                     raise
             finally:
                 self._pending_spawns -= 1
+                if worker is not None:
+                    worker.spawn_in_flight = False
             if worker.stop_requested:
                 # A stop landed while start() was awaited; stop() deferred it
                 # to us. Execute it now that the client, consumer and pump
@@ -562,18 +579,53 @@ class Fleet:
                               f"wouldn't stop cleanly — treat it as unknown.")
                 await self._admit_next()
                 return spoken
-            if worker.machine.base == CLOSED:
-                # The machine closed under the in-flight start without a
-                # deferred stop: a stop() in the query window (consumer
-                # already existed, normal teardown ran) or a SessionEnd hook
-                # (the CLI itself exited). Either way the tile is CLOSED —
-                # "On it" would be a false success over it. Best-effort
-                # cleanup, then say what actually happened.
-                with contextlib.suppress(Exception):
+            if worker.machine.base == CLOSED or worker.locked:
+                # The worker was torn down under the in-flight start without a
+                # deferred stop: a stop() in the query window (the consumer
+                # already existed, so stop took the normal teardown path) or a
+                # SessionEnd hook (the CLI itself exited). CLOSED alone is not
+                # enough to see that: a DIRTY stop applies "lost" (UNKNOWN),
+                # and nothing bounces off UNKNOWN, so the resuming start()'s
+                # _apply("prompt") drives it to ACTIVE_TURN and "On it" would
+                # contradict the "couldn't stop cleanly" Keke just heard.
+                # `locked` is set ONLY by shutdown(), so it covers the clean
+                # stop, the dirty stop and close_all, while CLOSED still
+                # covers the hook case (no shutdown ran there).
+                torn_down = True
+                try:
                     await asyncio.wait_for(
                         worker.shutdown(interrupt_first=False), 5)
-                return (f"{project} was stopped while it was starting, sir — "
-                        f"nothing is running there.")
+                except Exception as e:  # noqa: BLE001 — reported, never silent
+                    # Speaking "nothing is running there" over a client that
+                    # would not tear down would be a flat assertion of a dead
+                    # worker on top of a live one — and on a CLOSED machine
+                    # _apply("lost") bounces, so this publish is the only
+                    # place the failure can be recorded at all.
+                    torn_down = False
+                    self._bus.publish("fleet.error", {
+                        "worker": worker.id, "project": project,
+                        "reason": f"teardown after a mid-start stop failed: {e}"})
+                if worker.machine.base != CLOSED:
+                    # A dirty stop left UNKNOWN and the resumed start() pushed
+                    # it back to ACTIVE_TURN — a lie over a cancelled consumer
+                    # and pump. Say so on the tile too; UNKNOWN keeps counting
+                    # live, so admission stays blocked until Keke stops it.
+                    worker._apply("lost", {"reason": "stopped while starting"})
+                if torn_down:
+                    # The belt must drain the queue exactly like the deferred
+                    # branch above: stop()'s own _admit_next was refused
+                    # because _pending_spawns still counted THIS spawn, so
+                    # without this the queued project waits behind zero live
+                    # workers — forever, until tick() is wired. _admit_next
+                    # re-reads self.live, so the UNKNOWN of a dirty stop still
+                    # blocks it: never admit beside a live subprocess.
+                    await self._admit_next()
+                if torn_down and worker.machine.base == CLOSED:
+                    return (f"{project} was stopped while it was starting, "
+                            f"sir — nothing is running there.")
+                return (f"{project} was stopped while it was starting, sir, "
+                        f"but it wouldn't shut down cleanly — treat it as "
+                        f"unknown.")
             # Spec §3 acknowledgment honesty: "On it" ONLY now — the worktree
             # exists, the client connected, the task is in the session.
             return (f"On it, sir — {project} is working in a fresh worktree "
@@ -674,7 +726,11 @@ class Fleet:
         w = self._find(path)
         if w is None:
             return "Nothing is running there, sir."
-        state = w.machine.state(self._now()).replace("_", " ").lower()
+        # Same treatment as status_line: a worker mid-start reads "starting",
+        # never the machine's pre-spawned UNKNOWN — "unknown" is an alarm word
+        # reserved for failed probes, and this line is spoken aloud.
+        state = ("starting" if w.starting
+                 else w.machine.state(self._now()).replace("_", " ").lower())
         last = (w.transcript[-1]["text"][:80] if w.transcript
                 else "nothing yet")
         return f"{w.project} is {state}. Last activity: {last}."

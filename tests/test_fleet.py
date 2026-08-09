@@ -642,7 +642,15 @@ async def test_stop_during_connect_defers_and_never_leaves_a_zombie(tmp_path, mo
 async def test_stop_in_the_query_window_is_not_spoken_over_by_on_it(tmp_path, monkeypatch):
     """After connect() the consumer/pump exist, so a stop during the awaited
     query() takes the NORMAL teardown path — but start() then returns into
-    _spawn, which must not announce "On it" over the already-CLOSED tile."""
+    _spawn, which must not announce "On it" over the already-CLOSED tile.
+
+    DIVERGENCE, deliberate: FakeClient.query() succeeds on a disconnected
+    client, whereas the real ClaudeSDKClient.query() after disconnect() raises.
+    Production therefore usually exits this interleaving through _spawn's
+    failure path — covered by the variant test two below, which pins that
+    sentence. Both shapes are real (a stop can also land between query() and
+    _apply("prompt")), and this one is the only one that reaches the belt, so
+    it stays as the belt's revert detector."""
     fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
     path = repo(tmp_path, "soccer")
     gate = asyncio.Event()
@@ -681,6 +689,292 @@ async def test_stop_in_the_query_window_is_not_spoken_over_by_on_it(tmp_path, mo
         gate.set()
         spawn_task.cancel()
         await asyncio.gather(spawn_task, return_exceptions=True)
+        await cleanup(fleet)
+
+
+async def test_a_dirty_stop_in_the_query_window_is_not_spoken_over_by_on_it(tmp_path, monkeypatch):
+    """The belt cannot key on CLOSED alone. When the stop's disconnect fails,
+    _stop_worker applies "lost" — UNKNOWN, not CLOSED — and the resumed
+    start() drives UNKNOWN → ACTIVE_TURN, so _spawn used to fall through to
+    "On it, sir" one sentence after "I couldn't stop soccer cleanly", over a
+    worker whose consumer and pump are already cancelled."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    path = repo(tmp_path, "soccer")
+    gate = asyncio.Event()
+    inner = fleet._client_factory
+
+    def wedged_factory(options):
+        c = inner(options)
+        orig_query = c.query
+
+        async def query(text):
+            if not c.queries:             # first query: the spawn task text
+                await gate.wait()         # a REAL suspension inside start()
+            await orig_query(text)
+
+        async def disconnect():           # the failure _stop_worker exists for
+            c.disconnected = True
+            raise RuntimeError("transport is wedged")
+        c.query, c.disconnect = query, disconnect
+        return c
+
+    fleet._client_factory = wedged_factory
+    spawn_task = asyncio.create_task(fleet.spawn("soccer", path, "task one"))
+    try:
+        for _ in range(100):              # park inside the gated query()
+            if fleet.workers and fleet.workers[0].consumer is not None:
+                break
+            await asyncio.sleep(0)
+        w = fleet.workers[0]
+        assert w.consumer is not None     # past connect: the normal stop path
+        queued = await fleet.spawn("alethic", repo(tmp_path, "alethic"),
+                                   "task two")
+        assert "queued" in queued.lower()
+        stop_spoken = await fleet.stop(path)
+        assert "couldn't stop soccer cleanly" in stop_spoken
+        assert w.machine.base == UNKNOWN
+        gate.set()                                    # query() resumes now
+        spawn_spoken = await asyncio.wait_for(spawn_task, 5)
+        assert not spawn_spoken.startswith("On it")   # no contradictory success
+        assert "unknown" in spawn_spoken.lower()      # agrees with the stop
+        assert w.machine.base == UNKNOWN              # and so does the tile
+        # Fail closed: a client that would not disconnect may still hold a
+        # subprocess, so UNKNOWN keeps counting live and the queue waits.
+        assert len(fleet.live) == 1 and len(fleet.queue) == 1
+    finally:
+        gate.set()
+        spawn_task.cancel()
+        await asyncio.gather(spawn_task, return_exceptions=True)
+        await cleanup(fleet)
+
+
+async def test_a_stop_in_the_query_window_drains_the_queue(tmp_path, monkeypatch):
+    """stop()'s own _admit_next is refused while _pending_spawns still counts
+    the in-flight spawn, so the belt branch owns the drain. Without it a
+    queued project waits forever behind ZERO live workers — and permanently,
+    since tick() is not wired yet."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    path = repo(tmp_path, "soccer")
+    gate = asyncio.Event()
+    events: list[str] = []
+    inner = fleet._client_factory
+
+    def gated_factory(options):
+        c = inner(options)
+        idx = len(clients)
+        orig_connect, orig_query, orig_disconnect = (c.connect, c.query,
+                                                     c.disconnect)
+
+        async def connect():
+            events.append(f"connect-{idx}")
+            await orig_connect()
+
+        async def query(text):
+            if idx == 1 and not c.queries:
+                await gate.wait()         # a REAL suspension inside start()
+            await orig_query(text)
+
+        async def disconnect():
+            events.append(f"disconnect-{idx}")
+            await orig_disconnect()
+        c.connect, c.query, c.disconnect = connect, query, disconnect
+        return c
+
+    fleet._client_factory = gated_factory
+    spawn_task = asyncio.create_task(fleet.spawn("soccer", path, "task one"))
+    try:
+        for _ in range(100):              # park inside the gated query()
+            if fleet.workers and fleet.workers[0].consumer is not None:
+                break
+            await asyncio.sleep(0)
+        queued = await fleet.spawn("alethic", repo(tmp_path, "alethic"),
+                                   "task two")
+        assert "queued" in queued.lower()
+        assert "Stopped soccer" in await fleet.stop(path)
+        assert len(fleet.queue) == 1      # stop could not admit: spawn in flight
+        gate.set()                                    # query() resumes now
+        spawn_spoken = await asyncio.wait_for(spawn_task, 5)
+        assert not spawn_spoken.startswith("On it")
+        assert len(fleet.queue) == 0                  # the belt drained it
+        alethic = next(w for w in fleet.workers if w.project == "alethic")
+        assert alethic.machine.base == ACTIVE_TURN
+        assert len(fleet.live) == 1                   # exactly one real worker
+        # And only AFTER the stopped CLI was actually gone.
+        assert events.index("disconnect-1") < events.index("connect-2")
+    finally:
+        gate.set()
+        spawn_task.cancel()
+        await asyncio.gather(spawn_task, return_exceptions=True)
+        await cleanup(fleet)
+
+
+async def test_a_failed_teardown_after_a_mid_start_stop_is_not_silent(tmp_path, monkeypatch):
+    """Mid-start SessionEnd: the CLI's own hook closes the machine while the
+    client is still connected. If the belt's teardown then fails, the fleet
+    must not speak absolutely — and since the machine is already CLOSED,
+    _apply("lost") bounces, so fleet.error is the ONLY place that failure can
+    be recorded. It must also not admit the queue beside a client it could
+    not prove dead."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    path = repo(tmp_path, "soccer")
+    gate = asyncio.Event()
+    inner = fleet._client_factory
+
+    def wedged_factory(options):
+        c = inner(options)
+        orig_query = c.query
+
+        async def query(text):
+            if not c.queries:
+                await gate.wait()         # a REAL suspension inside start()
+            await orig_query(text)
+
+        async def disconnect():
+            c.disconnected = True
+            raise RuntimeError("transport is wedged")
+        c.query, c.disconnect = query, disconnect
+        return c
+
+    fleet._client_factory = wedged_factory
+    spawn_task = asyncio.create_task(fleet.spawn("soccer", path, "task one"))
+    cid, q = bus.subscribe()
+    try:
+        for _ in range(100):
+            if fleet.workers and fleet.workers[0].consumer is not None:
+                break
+            await asyncio.sleep(0)
+        w = fleet.workers[0]
+        queued = await fleet.spawn("alethic", repo(tmp_path, "alethic"),
+                                   "task two")
+        assert "queued" in queued.lower()
+        fleet.handle_hook({"hook_event_name": "SessionEnd",   # the CLI exited
+                           "cwd": w.worktree.path})
+        assert w.machine.base == CLOSED
+        gate.set()
+        spawn_spoken = await asyncio.wait_for(spawn_task, 5)
+        assert not spawn_spoken.startswith("On it")
+        assert "nothing is running" not in spawn_spoken       # never absolute
+        reasons = []
+        while not q.empty():
+            ev = q.get_nowait()
+            if ev and ev["type"] == "fleet.error":
+                reasons.append(ev["data"]["reason"])
+        assert any("teardown" in r and "wedged" in r for r in reasons)
+        assert len(fleet.queue) == 1      # not admitted over a live client
+    finally:
+        gate.set()
+        spawn_task.cancel()
+        await asyncio.gather(spawn_task, return_exceptions=True)
+        await cleanup(fleet)
+
+
+async def test_stop_in_the_query_window_when_the_client_rejects_a_late_query(tmp_path, monkeypatch):
+    """The production shape of the interleaving above: the real
+    ClaudeSDKClient.query() raises once disconnect() has run, so start() dies
+    and _spawn exits through its FAILURE path. What matters is the same —
+    no false "On it", no zombie, no phantom worker left counting live."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    path = repo(tmp_path, "soccer")
+    gate = asyncio.Event()
+    inner = fleet._client_factory
+
+    def realistic_factory(options):
+        c = inner(options)
+        orig_query = c.query
+
+        async def query(text):
+            if not c.queries:
+                await gate.wait()         # a REAL suspension inside start()
+            if c.disconnected:            # what the real SDK does here
+                raise RuntimeError("client is not connected")
+            await orig_query(text)
+        c.query = query
+        return c
+
+    fleet._client_factory = realistic_factory
+    spawn_task = asyncio.create_task(fleet.spawn("soccer", path, "task one"))
+    try:
+        for _ in range(100):
+            if fleet.workers and fleet.workers[0].consumer is not None:
+                break
+            await asyncio.sleep(0)
+        w = fleet.workers[0]
+        assert "Stopped soccer" in await fleet.stop(path)
+        assert w.machine.base == CLOSED
+        gate.set()
+        spawn_spoken = await asyncio.wait_for(spawn_task, 5)
+        assert not spawn_spoken.startswith("On it")
+        assert "failed" in spawn_spoken.lower()
+        assert fleet.workers == []        # the phantom was deregistered
+        assert fleet._pending_spawns == 0
+        assert fleet.live == []
+    finally:
+        gate.set()
+        spawn_task.cancel()
+        await asyncio.gather(spawn_task, return_exceptions=True)
+        await cleanup(fleet)
+
+
+async def test_one_breath_says_starting_not_unknown_mid_start(tmp_path, monkeypatch):
+    """status_line got this treatment; one_breath still read "soccer is
+    unknown" — the exact alarm word the status_line change exists to avoid."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    path = repo(tmp_path, "soccer")
+    gate = asyncio.Event()
+    inner = fleet._client_factory
+
+    def gated_factory(options):
+        c = inner(options)
+        orig_connect = c.connect
+
+        async def connect():
+            await gate.wait()             # a REAL mid-connect suspension
+            await orig_connect()
+        c.connect = connect
+        return c
+
+    fleet._client_factory = gated_factory
+    spawn_task = asyncio.create_task(fleet.spawn("soccer", path, "task one"))
+    try:
+        for _ in range(100):              # register, then park in connect()
+            if fleet.workers:
+                break
+            await asyncio.sleep(0)
+        assert fleet.workers and fleet.workers[0].starting
+        breath = fleet.one_breath(path)
+        assert breath == "soccer is starting. Last activity: nothing yet."
+        assert "unknown" not in breath.lower()
+    finally:
+        gate.set()
+        spawn_task.cancel()
+        await asyncio.gather(spawn_task, return_exceptions=True)
+        await cleanup(fleet)
+
+
+async def test_a_worker_registered_without_an_in_flight_spawn_is_not_starting(tmp_path, monkeypatch):
+    """Task 10 registers pre-existing sessions found after a restart. Such a
+    worker has no consumer, so inferring "starting" from `consumer is None`
+    would make stop() a permanent no-op that still promises "I'll stop it the
+    moment it's up", and steer() refuse forever. Only _spawn's own in-flight
+    flag may mean starting."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    path = repo(tmp_path, "soccer")
+    wt = Worktree(repo=path, path=str(tmp_path / "wt-recovered"),
+                  branch="jarvis/recovered", base_commit="abc1234def5678")
+    w = Worker(project="soccer", path=path, task_text="task", wt=wt, bus=bus,
+               router=router, log=fleet._log_writer,
+               client_factory=fleet._client_factory, now=fleet._now)
+    fleet.workers.append(w)                       # registered by another path
+    try:
+        assert w.consumer is None and w.spawn_in_flight is False
+        assert w.starting is False
+        assert "still starting" not in fleet.status_line()
+        assert "still starting" not in fleet.steer_path(path, "also lint")
+        stopped = await fleet.stop(path)
+        assert "still starting" not in stopped    # a real stop, not a promise
+        assert w.stop_requested is False          # nothing left to redeem
+        assert w.machine.base == CLOSED
+    finally:
         await cleanup(fleet)
 
 
