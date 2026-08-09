@@ -33,6 +33,7 @@ class Project:
     mishearings: list[str] = field(default_factory=list)
     confirmed: bool = False
     kind: str = "code"
+    data_source: str | None = None   # §16: the voice-confirmed output file, finance only
 
     def spoken_forms(self) -> list[str]:
         return [self.name, *self.aliases, *self.mishearings]
@@ -182,3 +183,10 @@ class Registry:
         p = self._by_path(path)
         if p is not None and heard and heard not in p.mishearings:
             p.mishearings.append(heard)
+
+    def set_data_source(self, path: str, source: str) -> None:
+        """Pin the §16 voice-confirmed output file on the project at `path`.
+        Path-keyed like every mutation the confirmation flows make."""
+        p = self._by_path(path)
+        if p is not None and source:
+            p.data_source = source

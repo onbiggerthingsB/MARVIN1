@@ -287,3 +287,88 @@ async def test_okay_answers_the_repo_question_not_the_tool_approval(tmp_path):
     assert len(router.pending_approvals()) == 1      # the approval did NOT
     assert not task.done()
     task.cancel()
+
+
+def finance_fixture(tmp_path):
+    """A confirmed finance project with one readable output, plus the gate."""
+    import json as _json
+    from server.discovery import Candidate as C
+    from server.finance_gate import SourceGate
+    root = tmp_path / "quant agent"
+    root.mkdir()
+    (root / "picks.json").write_text(
+        _json.dumps([{"symbol": "TSLA", "shares": 3}]), encoding="utf-8")
+    reg = Registry()
+    reg.merge_candidates([C(path=str(root), name="quant agent", sources=["t"])])
+    reg.confirm("quant agent", kind="finance")
+    return reg, root
+
+
+async def test_first_portfolio_ask_confirms_the_source_before_briefing(tmp_path):
+    from server.finance_gate import SourceGate
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    reg, root = finance_fixture(tmp_path)
+    gate = SourceGate(bus, reg, tmp_path / "projects.json")
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=reg, finance=gate))
+    await asyncio.sleep(0)
+    briefed = []
+    bus_cid, bus_q = bus.subscribe()
+    bus.publish("command.received", {"text": "how are the picks doing?"})
+    await asyncio.sleep(0.05)
+    assert any("picks.json" in s for s in spk.spoke)     # the question, spoken
+    assert gate.awaiting is True
+    # no brief yet: nothing was confirmed
+    while not bus_q.empty():
+        ev = bus_q.get_nowait()
+        if ev and ev["type"] == "finance.brief":
+            briefed.append(ev)
+    assert briefed == []
+    task.cancel()
+
+
+async def test_confirming_the_source_briefs_immediately(tmp_path):
+    from server.finance_gate import SourceGate
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    reg, root = finance_fixture(tmp_path)
+    gate = SourceGate(bus, reg, tmp_path / "projects.json")
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=reg, finance=gate))
+    await asyncio.sleep(0)
+    bus.publish("command.received", {"text": "how are the picks doing?"})
+    await asyncio.sleep(0.05)
+    fut = asyncio.ensure_future(_drain(bus, "finance.brief"))
+    bus.publish("command.received", {"text": "yes"})
+    ev = await fut                                        # the yes doubles as "go"
+    assert ev["data"]["source"].endswith("picks.json")
+    assert reg.projects[0].data_source == str(root / "picks.json")
+    assert butler.asked == []                             # model never involved
+    task.cancel()
+
+
+async def test_the_brain_survives_a_source_gate_explosion(tmp_path):
+    class BoomGate:
+        @property
+        def awaiting(self):
+            raise RuntimeError("gate broke")
+        async def handle_reply(self, text):
+            raise RuntimeError("gate broke")
+        async def ask(self, project):
+            raise RuntimeError("gate broke")
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    reg, root = finance_fixture(tmp_path)
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=reg, finance=BoomGate()))
+    await asyncio.sleep(0)
+    # the portfolio verb hits BoomGate.ask; the reply path hits .awaiting —
+    # both must cost the turn, never the loop
+    bus.publish("command.received", {"text": "how are the picks doing?"})
+    await asyncio.sleep(0.05)
+    fut = asyncio.ensure_future(_drain(bus, "butler.answer"))
+    bus.publish("command.received", {"text": "where did I leave the Tibet study?"})
+    await fut
+    assert not task.done()
+    task.cancel()

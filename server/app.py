@@ -17,6 +17,7 @@ from server.app_brain import run_butler_brain
 from server.bus import EventBus
 from server.butler import Butler, build_options
 from server.config import ensure_config, load_keyterms, save_config
+from server.finance_gate import SourceGate
 from server.onboarding import Onboarding
 from server.registry import Registry
 from server.router import Router
@@ -115,6 +116,7 @@ def create_app(base_dir: Path) -> FastAPI:
     app.state.registry = Registry.load(registry_path)
     app.state.router = Router()
     app.state.onboarding = Onboarding(app.state.bus, app.state.registry, registry_path)
+    app.state.source_gate = SourceGate(app.state.bus, app.state.registry, registry_path)
 
     @app.middleware("http")
     async def guard(request: Request, call_next):
@@ -274,7 +276,8 @@ def create_app(base_dir: Path) -> FastAPI:
                              validate_citations=validate_citations,
                              router=app.state.router,
                              registry=app.state.registry,
-                             onboarding=app.state.onboarding))
+                             onboarding=app.state.onboarding,
+                             finance=app.state.source_gate))
 
         def _brain_died(t):
             # Last resort. run_butler_brain guards every await, so reaching here

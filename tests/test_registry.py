@@ -143,3 +143,14 @@ def test_load_tolerates_valid_json_of_the_wrong_shape(tmp_path):
     list_file = tmp_path / "list.json"
     list_file.write_text("[1,2,3]", encoding="utf-8")
     assert Registry.load(list_file).projects == []
+
+
+def test_roundtrip_persists_data_source(tmp_path):
+    f = tmp_path / "projects.json"
+    r = Registry()
+    r.merge_candidates([cand("/p/quant agent", "quant agent")])
+    r.confirm("quant agent", kind="finance")
+    r.set_data_source("/p/quant agent", "/p/quant agent/signals.sqlite")
+    r.save(f)
+    p = Registry.load(f).projects[0]
+    assert p.data_source == "/p/quant agent/signals.sqlite"

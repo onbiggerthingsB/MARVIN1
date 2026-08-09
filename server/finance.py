@@ -127,6 +127,15 @@ def _speak(rows: list[dict]) -> str:
 
 
 def _collect(project) -> dict:
+    pinned = getattr(project, "data_source", None)
+    if pinned:
+        # A voice-confirmed source is authoritative: read it or say so. No
+        # silent fallback to some other file Keke never approved (spec §16).
+        for reader in (_rows_from_sqlite, _rows_from_json):
+            rows = reader(pinned)
+            if rows:
+                return {"source": pinned, "rows": rows}
+        return {"source": None, "rows": []}
     root = Path(project.path)
     outputs = detect_outputs(root)
     for path in outputs["sqlite"]:

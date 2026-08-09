@@ -84,6 +84,19 @@ def speakable(spoken) -> str:
     return text
 
 
+async def _brief_and_publish(bus, registry) -> str:
+    """One place builds the finance turn — the portfolio verb and a
+    just-confirmed source both use it. Returns the spoken line. Callers guard
+    it; the .get() reads keep a shape drift from raising on their own."""
+    brief = await portfolio_brief(find_finance_project(registry)) or {}
+    bus.publish("finance.brief", {
+        "rows": brief.get("rows", []),
+        "source": brief.get("source"),
+        "as_of": brief.get("as_of"),
+        "caveat": brief.get("caveat", "")})
+    return brief.get("spoken") or UNCLEAR_LINE
+
+
 async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=None,
                            router=None, registry=None, onboarding=None, finance=None):
     """Subscribe to the bus and drive the butler. Never raises out of the loop.
@@ -96,8 +109,8 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
     `router`/`registry`/`onboarding` wire in M3's deterministic layer: dangerous
     verbs are parsed BEFORE the model ever sees an utterance, and a pending
     confirmation or approval owns the next reply. All keyword-optional so every
-    M2 caller and test keeps working. `finance` is reserved for M3 Part 2's
-    injection point and unused today (the brief pins the signature).
+    M2 caller and test keeps working. `finance` takes the §16 SourceGate: the
+    first portfolio ask names the output file and waits for a spoken yes.
     """
     cid, q = bus.subscribe()
 
@@ -213,6 +226,34 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                         await _speak("About the repo, sir — is that a yes or a no?")
                         continue
 
+                # A pending §16 data-source question owns the next yes/no.
+                # Same discipline as onboarding: awaiting read inside the
+                # guard and BEFORE handle_reply clears it.
+                if finance is not None:
+                    outcome, awaiting = "ignored", False
+                    try:
+                        awaiting = bool(finance.awaiting)
+                        outcome = await finance.handle_reply(text)
+                    except Exception as e:  # noqa: BLE001 — the gate must not kill the brain
+                        bus.publish("butler.error", {"reason": f"source gate failed: {e}"})
+                    if outcome == "confirmed":
+                        # The yes doubles as "go": brief from the pinned source now.
+                        try:
+                            spoken = await _brief_and_publish(bus, registry)
+                        except Exception as e:  # noqa: BLE001 — finance must not kill the brain
+                            bus.publish("butler.error",
+                                        {"reason": f"portfolio brief failed: {_reason(e)}"})
+                            spoken = "I couldn't read your stock system just now, sir."
+                        await _speak(spoken)
+                        continue
+                    if outcome == "rejected":
+                        await _speak("Understood, sir — point me at the right file "
+                                     "and I'll use that.")
+                        continue
+                    if awaiting and bare_yes_no(text):
+                        await _speak("About the data file, sir — is that a yes or a no?")
+                        continue
+
                 # Dangerous verbs are parsed deterministically, never by the model.
                 command = None
                 if router is not None and registry is not None:
@@ -293,20 +334,22 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                                          + " or ".join(map(str, command.needs_disambiguation or []))
                                          + ".")
                         elif command.verb == "portfolio":
-                            # The whole finance path — project lookup, the brief
-                            # await, and every dict read — is guarded: a raise on
-                            # any of it must cost this turn, never the loop. The
-                            # dict reads use .get() so a shape change in the brief
-                            # cannot raise either.
+                            # Whole path guarded: lookup, the gate, the brief
+                            # await, every dict read. A raise costs this turn,
+                            # never the loop.
                             try:
-                                brief = await portfolio_brief(find_finance_project(registry))
-                                brief = brief or {}
-                                bus.publish("finance.brief", {
-                                    "rows": brief.get("rows", []),
-                                    "source": brief.get("source"),
-                                    "as_of": brief.get("as_of"),
-                                    "caveat": brief.get("caveat", "")})
-                                spoken = brief.get("spoken") or UNCLEAR_LINE
+                                proj = find_finance_project(registry)
+                                if (proj is not None and finance is not None
+                                        and not getattr(proj, "data_source", None)):
+                                    # §16: never read a file Keke has not named
+                                    # and approved. Ask first; the reply lands
+                                    # in the gate block above next turn.
+                                    question = await finance.ask(proj)
+                                    spoken = question or (
+                                        f"I couldn't find a readable output file "
+                                        f"in {proj.name}, sir.")
+                                else:
+                                    spoken = await _brief_and_publish(bus, registry)
                             except Exception as e:  # noqa: BLE001 — a finance fault must never kill the brain
                                 bus.publish("butler.error",
                                             {"reason": f"portfolio brief failed: {_reason(e)}"})

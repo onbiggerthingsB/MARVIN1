@@ -143,3 +143,58 @@ async def test_brief_works_from_a_path_containing_a_space(tmp_path):
     r = finance_registry(str(root))          # reuse the file's existing helper
     brief = await portfolio_brief(find_finance_project(r))
     assert brief["available"] is True and brief["rows"][0]["symbol"] == "NVDA"
+
+
+def make_sqlite(path, rows=(("NVDA", 10.0),)):
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE positions (symbol TEXT, shares REAL)")
+    con.executemany("INSERT INTO positions VALUES (?,?)", list(rows))
+    con.commit()
+    con.close()
+
+
+async def test_propose_source_prefers_readable_sqlite(tmp_path):
+    from server.finance_gate import propose_source
+    make_sqlite(tmp_path / "signals.sqlite")
+    (tmp_path / "picks.json").write_text(
+        json.dumps([{"symbol": "TSLA"}]), encoding="utf-8")
+    r = finance_registry(str(tmp_path))
+    src = await propose_source(find_finance_project(r))
+    assert src is not None and src.endswith("signals.sqlite")
+
+
+async def test_propose_source_skips_unreadable_and_falls_back_to_json(tmp_path):
+    from server.finance_gate import propose_source
+    (tmp_path / "junk.sqlite").write_bytes(b"not a database at all")
+    (tmp_path / "picks.json").write_text(
+        json.dumps([{"symbol": "TSLA"}]), encoding="utf-8")
+    r = finance_registry(str(tmp_path))
+    src = await propose_source(find_finance_project(r))
+    assert src is not None and src.endswith("picks.json")
+
+
+async def test_propose_source_none_when_nothing_readable(tmp_path):
+    from server.finance_gate import propose_source
+    r = finance_registry(str(tmp_path))
+    assert await propose_source(find_finance_project(r)) is None
+
+
+async def test_brief_reads_the_pinned_source_not_the_newest_file(tmp_path):
+    import os
+    (tmp_path / "picks.json").write_text(
+        json.dumps([{"symbol": "TSLA"}]), encoding="utf-8")
+    make_sqlite(tmp_path / "signals.sqlite")           # newer AND normally preferred
+    os.utime(tmp_path / "picks.json", (1_000_000, 1_000_000))
+    r = finance_registry(str(tmp_path))
+    r.set_data_source(str(tmp_path), str(tmp_path / "picks.json"))
+    brief = await portfolio_brief(find_finance_project(r))
+    assert brief["available"] is True
+    assert brief["source"].endswith("picks.json")      # the voice-confirmed file wins
+
+
+async def test_brief_is_honest_when_the_pinned_source_disappears(tmp_path):
+    make_sqlite(tmp_path / "signals.sqlite")           # a readable file EXISTS...
+    r = finance_registry(str(tmp_path))
+    r.set_data_source(str(tmp_path), str(tmp_path / "gone.sqlite"))
+    brief = await portfolio_brief(find_finance_project(r))
+    assert brief["available"] is False                 # ...but it was never confirmed
