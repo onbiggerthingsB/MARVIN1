@@ -9,6 +9,16 @@ from server.router import Router
 NOW = 1000.0
 
 
+def open_spoken(router, *args, **kwargs):
+    """Open an approval AND mark it read aloud — the state every test below
+    means. A voice yes may only resolve a request JARVIS actually SPOKE, so a
+    raw open_approval() now models an approval nobody has heard; that
+    correlation is pinned on its own in tests/test_approval_correlation.py."""
+    a = router.open_approval(*args, **kwargs)
+    router.mark_spoken(a.nonce)
+    return a
+
+
 def reg(*names, kind="code"):
     r = Registry()
     r.merge_candidates([Candidate(path=f"/p/{n}", name=n, sources=["t"]) for n in names])
@@ -80,7 +90,7 @@ def test_trade_requests_are_refused_not_routed(said):
 # ---------- approvals ----------
 def test_single_pending_approval_accepts_a_bare_yes():
     router = Router()
-    router.open_approval("soccer", "npm test", now=NOW)
+    open_spoken(router, "soccer", "npm test", now=NOW)
     state, appr = router.resolve_approval("yes, go ahead", now=NOW + 5)
     assert state == "approved" and appr.project == "soccer"
     assert router.pending_approvals() == []      # consumed
@@ -88,8 +98,8 @@ def test_single_pending_approval_accepts_a_bare_yes():
 
 def test_bare_yes_is_refused_when_two_are_pending():
     router = Router()
-    router.open_approval("soccer", "npm test", now=NOW)
-    router.open_approval("alethic", "rm -rf build", now=NOW)
+    open_spoken(router, "soccer", "npm test", now=NOW)
+    open_spoken(router, "alethic", "rm -rf build", now=NOW)
     state, appr = router.resolve_approval("yes", now=NOW + 5)
     assert state == "ambiguous" and appr is None
     assert len(router.pending_approvals()) == 2  # nothing consumed
@@ -97,8 +107,8 @@ def test_bare_yes_is_refused_when_two_are_pending():
 
 def test_addressed_approval_works_with_two_pending():
     router = Router()
-    router.open_approval("soccer", "npm test", now=NOW)
-    router.open_approval("alethic", "rm -rf build", now=NOW)
+    open_spoken(router, "soccer", "npm test", now=NOW)
+    open_spoken(router, "alethic", "rm -rf build", now=NOW)
     state, appr = router.resolve_approval("approve soccer npm test", now=NOW + 5)
     assert state == "approved" and appr.project == "soccer"
     assert [a.project for a in router.pending_approvals()] == ["alethic"]
@@ -106,14 +116,14 @@ def test_addressed_approval_works_with_two_pending():
 
 def test_denial_is_distinguished_from_approval():
     router = Router()
-    router.open_approval("soccer", "npm test", now=NOW)
+    open_spoken(router, "soccer", "npm test", now=NOW)
     state, appr = router.resolve_approval("no, deny that", now=NOW + 5)
     assert state == "denied" and appr.project == "soccer"
 
 
 def test_an_expired_approval_cannot_be_accepted():
     router = Router()
-    router.open_approval("soccer", "npm test", now=NOW)
+    open_spoken(router, "soccer", "npm test", now=NOW)
     state, appr = router.resolve_approval("yes", now=NOW + 601)   # past the 600s expiry
     assert state == "expired" and appr is None
     assert router.pending_approvals() == []      # swept
@@ -125,14 +135,14 @@ def test_yes_with_nothing_pending_is_not_a_command():
 
 def test_each_approval_gets_a_distinct_nonce():
     router = Router()
-    a = router.open_approval("soccer", "npm test", now=NOW)
-    b = router.open_approval("alethic", "npm test", now=NOW)
+    a = open_spoken(router, "soccer", "npm test", now=NOW)
+    b = open_spoken(router, "alethic", "npm test", now=NOW)
     assert a.nonce != b.nonce
 
 
 def test_naming_an_unmatched_project_does_not_consume_the_only_pending():
     router = Router()
-    router.open_approval("soccer", "npm test", now=NOW)
+    open_spoken(router, "soccer", "npm test", now=NOW)
     state, appr = router.resolve_approval("approve alethic rm -rf build", now=NOW + 5)
     assert state == "none" and appr is None
     assert len(router.pending_approvals()) == 1      # soccer's approval untouched
@@ -140,8 +150,8 @@ def test_naming_an_unmatched_project_does_not_consume_the_only_pending():
 
 def test_two_approvals_for_one_project_are_addressable_by_tool():
     router = Router()
-    router.open_approval("soccer", "npm test", now=NOW)
-    router.open_approval("soccer", "rm -rf build", now=NOW)
+    open_spoken(router, "soccer", "npm test", now=NOW)
+    open_spoken(router, "soccer", "rm -rf build", now=NOW)
     state, appr = router.resolve_approval("approve soccer npm test", now=NOW + 5)
     assert state == "approved" and appr.tool == "npm test"
     assert [a.tool for a in router.pending_approvals()] == ["rm -rf build"]
@@ -149,15 +159,15 @@ def test_two_approvals_for_one_project_are_addressable_by_tool():
 
 def test_unrelated_speech_is_not_an_approval_answer():
     router = Router()
-    router.open_approval("soccer", "npm test", now=NOW)
-    router.open_approval("alethic", "npm test", now=NOW)
+    open_spoken(router, "soccer", "npm test", now=NOW)
+    open_spoken(router, "alethic", "npm test", now=NOW)
     assert router.resolve_approval("where did I leave the Tibet study?", now=NOW + 5) == ("none", None)
     assert len(router.pending_approvals()) == 2
 
 
 def test_unrelated_speech_after_expiry_is_not_reported_as_expired():
     router = Router()
-    router.open_approval("soccer", "npm test", now=NOW)
+    open_spoken(router, "soccer", "npm test", now=NOW)
     assert router.resolve_approval("what's the weather?", now=NOW + 601) == ("none", None)
 
 
@@ -174,7 +184,7 @@ def test_unrelated_speech_after_expiry_is_not_reported_as_expired():
 ])
 def test_an_affirm_prefixed_refusal_never_approves(said):
     router = Router()
-    router.open_approval("soccer", "Bash: rm -rf build", now=NOW)
+    open_spoken(router, "soccer", "Bash: rm -rf build", now=NOW)
     state, appr = router.resolve_approval(said, now=NOW + 5)
     assert state == "unclear" and appr is None
     assert len(router.pending_approvals()) == 1      # card stays on screen
@@ -184,7 +194,7 @@ def test_a_deny_prefixed_affirmation_never_resolves():
     # The mirror direction: "no, go ahead" is genuinely two-faced and must
     # not be read as a denial (or an approval) on its opener alone.
     router = Router()
-    router.open_approval("soccer", "Bash: npm test", now=NOW)
+    open_spoken(router, "soccer", "Bash: npm test", now=NOW)
     state, appr = router.resolve_approval("no, go ahead", now=NOW + 5)
     assert state == "unclear" and appr is None
     assert len(router.pending_approvals()) == 1
@@ -194,7 +204,7 @@ def test_a_negated_affirm_phrase_is_still_a_plain_denial():
     # "no, don't do it now, please" carries "do it" — but negated. It is the
     # canonical bare denial from _BARE_FILLER's docstring and must stay one.
     router = Router()
-    router.open_approval("soccer", "Bash: npm test", now=NOW)
+    open_spoken(router, "soccer", "Bash: npm test", now=NOW)
     state, appr = router.resolve_approval("no, don't do it now, please", now=NOW + 5)
     assert state == "denied" and appr.project == "soccer"
     assert router.pending_approvals() == []
@@ -270,8 +280,8 @@ def test_bare_name_is_still_ambiguous_for_twins():
 
 def test_same_name_approvals_for_different_repos_are_ambiguous_by_voice():
     router = Router()
-    a = router.open_approval("jarvis", "npm test", now=NOW, path="/Users/likerun/jarvis")
-    b = router.open_approval("jarvis", "npm test", now=NOW, path="/Users/likerun/Desktop/jarvis")
+    a = open_spoken(router, "jarvis", "npm test", now=NOW, path="/Users/likerun/jarvis")
+    b = open_spoken(router, "jarvis", "npm test", now=NOW, path="/Users/likerun/Desktop/jarvis")
     state, appr = router.resolve_approval("approve jarvis npm test", now=NOW + 5)
     assert state == "ambiguous" and appr is None
     assert len(router.pending_approvals()) == 2      # neither consumed
@@ -281,7 +291,7 @@ def test_same_name_approvals_for_different_repos_are_ambiguous_by_voice():
 
 def test_approvals_carry_a_path():
     router = Router()
-    a = router.open_approval("soccer", "npm test", now=NOW, path="/p/soccer")
+    a = open_spoken(router, "soccer", "npm test", now=NOW, path="/p/soccer")
     assert a.path == "/p/soccer"
     state, appr = router.resolve_approval("yes", now=NOW + 1)
     assert state == "approved" and appr.path == "/p/soccer"
@@ -289,8 +299,8 @@ def test_approvals_carry_a_path():
 
 def test_take_nonce_consumes_exactly_that_approval():
     router = Router()
-    a = router.open_approval("soccer", "npm test", now=NOW, path="/p/soccer")
-    b = router.open_approval("alethic", "pip install", now=NOW, path="/p/alethic")
+    a = open_spoken(router, "soccer", "npm test", now=NOW, path="/p/soccer")
+    b = open_spoken(router, "alethic", "pip install", now=NOW, path="/p/alethic")
     taken = router.take_nonce(a.nonce, now=NOW + 1)
     assert taken is a
     assert [x.nonce for x in router.pending_approvals()] == [b.nonce]
@@ -299,7 +309,7 @@ def test_take_nonce_consumes_exactly_that_approval():
 def test_take_nonce_unknown_or_expired_is_none():
     router = Router()
     assert router.take_nonce("deadbeef", now=NOW) is None
-    a = router.open_approval("soccer", "npm test", now=NOW)
+    a = open_spoken(router, "soccer", "npm test", now=NOW)
     assert router.take_nonce(a.nonce, now=NOW + 601) is None   # swept, not taken
     assert router.pending_approvals() == []
 
@@ -333,7 +343,7 @@ DANGEROUS = "Bash: rm -rf build"
 
 def one_pending(tool=DANGEROUS):
     router = Router()
-    router.open_approval("soccer", tool, now=NOW, path="/p/soccer")
+    open_spoken(router, "soccer", tool, now=NOW, path="/p/soccer")
     return router
 
 
@@ -449,8 +459,8 @@ def test_plain_denials_still_deny(said):
 
 def test_an_addressed_approval_that_accounts_for_everything_still_resolves():
     router = Router()
-    router.open_approval("soccer", "npm test", now=NOW)
-    router.open_approval("alethic", "rm -rf build", now=NOW)
+    open_spoken(router, "soccer", "npm test", now=NOW)
+    open_spoken(router, "alethic", "rm -rf build", now=NOW)
     state, appr = router.resolve_approval("approve soccer npm test", now=NOW + 5)
     assert state == "approved" and appr.project == "soccer"
     assert [a.project for a in router.pending_approvals()] == ["alethic"]
@@ -483,9 +493,9 @@ def test_a_spoken_full_path_still_singles_out_a_twin():
     """Path tokens are part of what the match explains, so the one utterance
     that CAN tell twin checkouts apart is not blocked by the whitelist."""
     router = Router()
-    router.open_approval("jarvis", "npm test", now=NOW, path="/Users/likerun/jarvis")
-    b = router.open_approval("jarvis", "npm test", now=NOW,
-                             path="/Users/likerun/Desktop/jarvis")
+    open_spoken(router, "jarvis", "npm test", now=NOW, path="/Users/likerun/jarvis")
+    b = open_spoken(router, "jarvis", "npm test", now=NOW,
+                    path="/Users/likerun/Desktop/jarvis")
     state, appr = router.resolve_approval(
         "approve jarvis npm test /Users/likerun/Desktop/jarvis", now=NOW + 5)
     assert state == "approved" and appr is b

@@ -251,6 +251,17 @@ class Approval:
     tool: str
     created: float
     path: str = ""                   # which checkout this approval belongs to
+    # Set by the brain AFTER _speak(question) RETURNS — i.e. only once this
+    # exact request has been read to Keke. A voice yes may resolve nothing
+    # else. The whole safety model is the spoken line (the worktree is not a
+    # sandbox), so "a request is pending" and "Keke heard THIS request" are
+    # different facts and must be stored as such: the brain loop is serial with
+    # 60-120s awaits while approvals open asynchronously in the SDK callback,
+    # so the pending set routinely diverges from what has been spoken.
+    #
+    # The CLICK path (take_nonce) deliberately does NOT consult this: the card
+    # carries the full command, and clicking Approve on it IS reading it.
+    spoken: bool = False
 
 
 class Router:
@@ -351,6 +362,18 @@ class Router:
     def pending_approvals(self) -> list[Approval]:
         return list(self._approvals)
 
+    def mark_spoken(self, nonce: str) -> bool:
+        """Record that THIS request was read aloud. Called by the brain only
+        after the readback's await returns — not before it, and never on the
+        strength of having published the card. Returns False for a nonce the
+        router no longer holds (stopped, clicked, expired), which is exactly
+        the case the readback itself must skip."""
+        for a in self._approvals:
+            if a.nonce == nonce:
+                a.spoken = True
+                return True
+        return False
+
     def take_nonce(self, nonce: str, now: float) -> Approval | None:
         """Consume one specific approval — the console click path, the worker
         timeout, and the handoff rejection all resolve by nonce, never by
@@ -377,6 +400,18 @@ class Router:
         if not self._approvals:
             return ("expired", None) if had else ("none", None)
 
+        # THE CORRELATION. Consent answers a QUESTION, and a question that was
+        # never asked cannot have been answered. Only approvals whose readback
+        # has actually finished are resolvable by voice — in BOTH branches
+        # below, because naming the project says nothing about whether its
+        # sentence was ever spoken. An unspoken approval is left pending and
+        # the caller is told ("unspoken"), never silently dropped into the
+        # butler as conversation: the worker is blocked and Keke's yes deserves
+        # an answer, just not that one.
+        heard = [a for a in self._approvals if a.spoken]
+        if not heard:
+            return ("unspoken", None)
+
         # Mixed polarity FAILS CLOSED: an affirm opener stapled to a refusal
         # ("sure, cancel that", "yeah, stop it", "sure, stop soccer") — or the
         # mirror ("no, go ahead") — must never resolve anything. The prefix
@@ -389,7 +424,7 @@ class Router:
             return ("unclear", None)
 
         lowered = text.lower()
-        matched = [a for a in self._approvals if a.project.lower() in lowered]
+        matched = [a for a in heard if a.project.lower() in lowered]
         if len(matched) > 1:
             # FIX 2: several approvals for one project — narrow by tool text
             # (token overlap) so "approve soccer npm test" is not a deadlock.
@@ -428,10 +463,13 @@ class Router:
             if _unexplained(text, _approval_vocabulary(target)):
                 return ("unclear", None)
         else:
-            # A bare "yes"/"no" can only answer a single unambiguous question.
-            if len(self._approvals) > 1:
+            # A bare "yes"/"no" can only answer a single unambiguous question —
+            # and only one that was ASKED. A second, unread approval opened
+            # while the first was being spoken leaves exactly one candidate
+            # here, which is the honest reading: Keke heard one sentence.
+            if len(heard) > 1:
                 return ("ambiguous", None)
-            target = self._approvals[0]
+            target = heard[0]
 
         self._approvals.remove(target)
         return ("denied" if deny else "approved", target)

@@ -206,13 +206,47 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                 # this is the spoken half (readback of project, tool, args,
                 # risk — composed by the fleet). Guarded: a malformed event
                 # must cost this speech, never the loop.
-                question = ""
+                question, nonce = "", ""
                 try:
                     question = str((data or {}).get("question") or "")[:400]
+                    nonce = str((data or {}).get("nonce") or "")
                 except Exception:  # noqa: BLE001
-                    question = ""
+                    question, nonce = "", ""
+                # Stale requests are never read aloud (M3P2 review, C3). This
+                # event may have been queued behind a 120-second butler.ask
+                # while `stop soccer` rejected the future and TOOK the nonce,
+                # or a click resolved it, or its TTL swept it. Asking about a
+                # dead worker is a question with no answer: a "no" in reply
+                # finds nothing pending and falls through to the butler, which
+                # answers it as conversation.
+                verified = True
+                if nonce and router is not None:
+                    try:
+                        verified = any(a.nonce == nonce
+                                       for a in router.pending_approvals())
+                    except Exception as e:  # noqa: BLE001 — a router fault must not kill the brain
+                        bus.publish("butler.error",
+                                    {"reason": f"approval readback check "
+                                               f"failed: {_reason(e)}"})
+                        # Can't verify and can't mark: say the generic line
+                        # rather than assert details we cannot stand behind.
+                        question, nonce = "", ""
+                    if not verified:
+                        continue
                 await _speak(question or "A worker needs permission, sir — "
                                          "the card is on screen.")
+                # AFTER the await returns, never before it: `spoken` means the
+                # sentence finished, and only then may a bare yes resolve THIS
+                # nonce. An event with no nonce (a malformed publish) is spoken
+                # as the generic alert and marks nothing — so it can still warn
+                # Keke without making anything voice-resolvable.
+                if nonce and router is not None:
+                    try:
+                        router.mark_spoken(nonce)
+                    except Exception as e:  # noqa: BLE001 — see above
+                        bus.publish("butler.error",
+                                    {"reason": f"approval readback failed: "
+                                               f"{_reason(e)}"})
                 continue
             if etype in ("fleet.spoken", "fleet.recovered"):
                 text_out = ""
@@ -403,6 +437,18 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                 if state in ("approved", "denied"):
                     await _speak("Approved, sir." if state == "approved"
                                  else "Denied, sir.")
+                    continue
+                if state == "unspoken":
+                    # A yes arrived before (or instead of) the readback. It
+                    # resolves NOTHING — but it must not vanish either: the
+                    # worker is blocked and Keke thinks he just answered. Say
+                    # what actually happened. When the readback is merely
+                    # QUEUED behind this turn (the common case) the loop reads
+                    # it out immediately after this sentence, and a second yes
+                    # then lands on something he has heard; when the card was
+                    # lost to a bus eviction the console is where it lives.
+                    await _speak("One moment, sir — I haven't read that "
+                                 "request to you yet; it's on the console.")
                     continue
                 if state == "ambiguous":
                     await _speak("More than one approval is pending, sir — "

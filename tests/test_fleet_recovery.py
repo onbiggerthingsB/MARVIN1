@@ -135,16 +135,63 @@ def test_a_ghost_is_retired_once_its_worktree_is_gone(tmp_path):
     """The worktree IS the evidence, so it is also the retirement rule: seeded
     ghosts that persisted forever with no way to clear them would be the
     opposite failure. Delete the directory (merge-back, or plain cleanup) and
-    the next compaction stops carrying it."""
+    the next compaction stops carrying it.
+
+    The retirement has to be reachable on a WORKER-FREE boot, and this test
+    used to call close_all() on run 2 — the one boot where the log still had
+    records, and therefore the only boot on which Fleet.snapshot got past its
+    empty-log guard at all. Every boot after that starts with a log that the
+    previous compaction rotated away, so the guard returned before the
+    retirement loop ever ran and the ghost was immortal. Boot 3 below is that
+    boot: it spawns nothing, logs nothing, and must still retire."""
     wt = tmp_path / "wt-a"
     wt.mkdir()
     seed_log(tmp_path,
              ("spawned", {**W1, "worktree": str(wt), "state": "IDLE_AT_PROMPT"}))
     run2 = fresh_fleet(tmp_path)
     assert len(run2.recover()) == 1
+    asyncio.run(run2.close_all())                  # compaction rotates the log
+
+    run3 = fresh_fleet(tmp_path)                   # empty log, ghost from .snap
+    assert len(run3.recover()) == 1                # still real: worktree exists
+    assert run3._log.path.stat().st_size == 0 if run3._log.path.exists() else True
     wt.rmdir()                                     # the human cleaned it up
-    asyncio.run(run2.close_all())
+    asyncio.run(run3.close_all())                  # spawned nothing all boot
+
     assert fresh_fleet(tmp_path).recover() == []
+
+
+def test_a_retired_ghost_is_not_re_announced_on_the_next_boot(tmp_path):
+    """The consequence the count made visible: `fleet.recovered` fired on every
+    boot, so JARVIS announced "workers were interrupted by a restart" about a
+    worktree that had been deleted several restarts ago — and a DETACHED ghost
+    kept offering a `claude --resume` for a session that ended long before."""
+    wt = tmp_path / "wt-a"
+    wt.mkdir()
+    seed_log(tmp_path,
+             ("spawned", {**W1, "worktree": str(wt), "state": "IDLE_AT_PROMPT"}),
+             ("prompt", {**W1, "worktree": str(wt), "state": "ACTIVE_TURN"}))
+    counts = []
+    for boot in range(4):
+        bus = EventBus()
+        fleet = fresh_fleet(tmp_path, bus=bus)
+        cid, q = bus.subscribe()
+        fleet.recover()
+        events = []
+        while not q.empty():
+            ev = q.get_nowait()
+            if ev:
+                events.append(ev)
+        bus.unsubscribe(cid)
+        counts.append(sum(e["data"]["count"] for e in events
+                          if e["type"] == "fleet.recovered"))
+        if boot == 1:
+            wt.rmdir()                             # cleaned up after boot 2
+        asyncio.run(fleet.close_all())
+    # boots 1 and 2 legitimately report it (the worktree still holds work);
+    # boot 3 is the compaction that retires it; boot 4 has nothing to say.
+    assert counts[:2] == [1, 1]
+    assert counts[3] == 0
 
 
 def test_a_detached_ghost_keeps_the_command_that_rejoins_it(tmp_path):
@@ -241,6 +288,46 @@ def test_get_fleet_serves_live_workers_and_ghosts_to_a_cookie(tmp_path):
     assert "interrupted" not in live                # only ghosts carry it
     assert ghost["state"] == UNKNOWN and ghost["interrupted"] is True
     assert ghost["project"] == "soccer"
+
+
+def test_get_fleet_serves_pending_approval_cards_to_a_cookie(tmp_path):
+    """The console loses CARDS on an SSE drop and never resyncs: it reconnects
+    without a Last-Event-ID and /fleet was fetched exactly once at setup. A
+    worker could sit blocked for the full 600s TTL with no card on screen and
+    no spoken line. Same cookie gate as the rest of the route — never the hook
+    bearer, which lives in every worktree."""
+    import json
+    import time
+
+    from tests.test_app_auth import bootstrap, make_client
+    c = make_client(tmp_path)
+    with c:
+        a = c.app.state.router.open_approval(
+            "soccer", "Bash: rm -rf …", now=time.time(), path="/p/soccer")
+        card = {"nonce": a.nonce, "worker": "w9", "project": "soccer",
+                "path": "/p/soccer", "tool": "Bash", "args": "rm -rf …",
+                "full_args": "rm -rf /Users/likerun/Documents",
+                "risk": "Careful, sir — this one can destroy things.",
+                "outside": "That target is inside your Obsidian vault, sir.",
+                "worktree": "/wt/soccer-1", "question": "…"}
+        c.app.state.fleet.workers.append(SimpleNamespace(
+            id="w9", project="soccer", path="/p/soccer", task_text="t",
+            worktree=SimpleNamespace(path="/wt/soccer-1"), starting=False,
+            machine=SimpleNamespace(state=lambda now: "WAITING_PERMISSION"),
+            _cards={a.nonce: card}))
+        try:
+            assert c.get("/fleet").status_code == 401      # cookie required
+            bootstrap(c)
+            body = c.get("/fleet").json()
+        finally:
+            c.app.state.fleet.workers.clear()
+    served = body["approvals"]
+    assert len(served) == 1
+    assert served[0]["full_args"] == "rm -rf /Users/likerun/Documents"
+    assert "destroy things" in served[0]["risk"]
+    assert "Obsidian vault" in served[0]["outside"]
+    assert c.app.state.cfg.hook_bearer not in json.dumps(body)   # never the bearer
+    assert "session_id" not in json.dumps(served)                # nor a session id
 
 
 def test_get_fleet_never_paints_a_starting_worker_unknown(tmp_path):

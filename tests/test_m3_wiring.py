@@ -7,6 +7,9 @@ from server.discovery import Candidate
 from server.registry import Registry
 from server.router import Router
 from server.app_brain import run_butler_brain
+# An approval JARVIS has already read aloud. A raw open_approval() models one
+# nobody has heard, which a voice yes may no longer resolve.
+from tests.test_fleet_wiring import open_spoken
 
 
 class FakeButler:
@@ -152,7 +155,7 @@ async def test_brain_without_a_router_behaves_exactly_as_m2():
 async def test_stop_project_beats_denial_when_it_names_a_confirmed_project():
     bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
     router, registry = Router(), confirmed_registry("soccer")
-    router.open_approval("soccer", "npm test", now=time.time())
+    open_spoken(router, "soccer", "npm test", now=time.time())
     task = asyncio.create_task(run_butler_brain(
         bus, butler, spk, FakeTurnLog(), router=router, registry=registry))
     await asyncio.sleep(0)
@@ -168,7 +171,7 @@ async def test_stop_project_beats_denial_when_it_names_a_confirmed_project():
 async def test_a_bare_yes_resolves_the_pending_approval_not_the_butler():
     bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
     router, registry = Router(), confirmed_registry("soccer")
-    router.open_approval("soccer", "npm test", now=time.time())
+    open_spoken(router, "soccer", "npm test", now=time.time())
     task = asyncio.create_task(run_butler_brain(
         bus, butler, spk, FakeTurnLog(), router=router, registry=registry))
     await asyncio.sleep(0)
@@ -185,7 +188,7 @@ async def test_a_bare_yes_resolves_the_pending_approval_not_the_butler():
 async def test_a_bare_no_denies_the_pending_approval():
     bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
     router, registry = Router(), confirmed_registry("soccer")
-    router.open_approval("soccer", "npm test", now=time.time())
+    open_spoken(router, "soccer", "npm test", now=time.time())
     task = asyncio.create_task(run_butler_brain(
         bus, butler, spk, FakeTurnLog(), router=router, registry=registry))
     await asyncio.sleep(0)
@@ -252,7 +255,7 @@ async def test_a_pending_confirmation_owns_affirm_shaped_speech():
     # the confirmation gate — never resolve the approval, never reach the model.
     bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
     router = Router()
-    router.open_approval("soccer", "npm test", now=time.time())
+    open_spoken(router, "soccer", "npm test", now=time.time())
     task = asyncio.create_task(run_butler_brain(
         bus, butler, spk, FakeTurnLog(),
         router=router, registry=confirmed_registry("soccer"),
@@ -276,7 +279,7 @@ async def test_okay_answers_the_repo_question_not_the_tool_approval(tmp_path):
     ob = Onboarding(bus, reg, tmp_path / "projects.json")
     await ob.ask_next()                              # repo question now pending
     router = Router()
-    router.open_approval("alethic", "rm -rf build", now=time.time())
+    open_spoken(router, "alethic", "rm -rf build", now=time.time())
     task = asyncio.create_task(run_butler_brain(
         bus, butler, spk, FakeTurnLog(),
         router=router, registry=reg, onboarding=ob))

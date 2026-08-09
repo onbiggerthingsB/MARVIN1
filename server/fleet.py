@@ -96,6 +96,29 @@ def _short_args(args, limit: int = ARGS_BUDGET) -> str:
     return _elide(str(args), limit)
 
 
+def _full_args(args) -> str:
+    """The COMPLETE argument text — no budget, no elision. For the CONSOLE.
+
+    Speech has to be short, and _short_args cuts the middle, so a long enough
+    shell line loses its destructive clause from the spoken sentence while
+    _risk_note (which scans the whole blob) still says "this one can destroy
+    things". Executed against a 347-character command, the elided middle was an
+    `rm -rf` on the owner's vault. The card publishes this instead, rendered
+    with textContent, so there is at least ONE surface in JARVIS showing the
+    exact thing being approved.
+
+    Same field preference as _short_args, so the card and the sentence are the
+    same argument at two lengths. A tool whose payload is not one of those keys
+    (Write's `content`, an MCP blob) still only shows its dict repr — the voice
+    shows no more than that either."""
+    if not isinstance(args, dict):
+        return str(args)
+    for key in ("command", "file_path", "path", "pattern", "url"):
+        if args.get(key):
+            return str(args[key])
+    return str(args)
+
+
 def _risk_note(tool: str, args) -> str:
     blob = f"{tool} {args}".lower()
     return ("Careful, sir — this one can destroy things. "
@@ -106,11 +129,19 @@ def _named_paths(args) -> list[str]:
     """Filesystem targets a tool request names, for the worktree check.
 
     Explicit path arguments are exact. A Bash `command` is only SCANNED, for
-    tokens SHAPED like a path — `/…`, `~/…`, `../…` after shell splitting —
-    which is where false positives are cheapest to avoid: a quoted commit
-    message is one token starting with a letter, `sed -i s/a/b/` does not start
-    with a slash either, and a URL starts with its scheme. A warning nobody
-    believes is worse than no warning."""
+    tokens SHAPED like a path — `/…`, `~/…`, `../…`, plus the two `$HOME`
+    spellings — after shell splitting, which is where false positives are
+    cheapest to avoid: a quoted commit message is one token starting with a
+    letter, `sed -i s/a/b/` does not start with a slash either, and a URL
+    starts with its scheme. A warning nobody believes is worse than no warning.
+
+    KNOWN BLIND SPOTS, and they are silence rather than imprecision: any other
+    variable (`$VAULT/notes`, `$PWD/..`), command substitution (`$(pwd)`), and
+    every interpreter form (`python -c "shutil.rmtree(...)"`, `node -e`, a
+    heredoc) name no path-shaped token at all, so they produce NO outside note
+    whatsoever. `$HOME` is folded here because it is the one variable that is
+    both universal and unambiguous — nothing else can start with `$HOME/` —
+    so it costs no false positives."""
     if not isinstance(args, dict):
         return []
     out = [str(args[k]) for k in ("file_path", "path", "notebook_path")
@@ -121,32 +152,59 @@ def _named_paths(args) -> list[str]:
             tokens = shlex.split(text)
         except ValueError:                # unbalanced quotes — still worth a look
             tokens = text.split()
-        out += [t for t in tokens
-                if t.startswith(("/", "~/", "../"))]
+        for t in tokens:
+            for prefix in ("$HOME", "${HOME}"):
+                if t == prefix:
+                    t = "~"
+                    break
+                if t.startswith(prefix + "/"):
+                    t = "~" + t[len(prefix):]
+                    break
+            if t.startswith(("/", "~/", "../")) or t == "~":
+                out.append(t)
     return out
 
 
-def _outside_note(args, worktree_path: str) -> str:
+def _outside_note(args, worktree_path: str, protected=()) -> str:
     """Spoken warning when a tool's target resolves OUTSIDE the worktree.
 
     The worktree is not a sandbox (see worktrees.py): cwd is set, but Write,
     Edit and Bash all take absolute paths, and the live smoke's first real tool
     call was `Write /tmp/DONE.txt`. The spoken approval is the only containment
     there is, so it has to say when the blast lands outside the disposable
-    directory. Advisory, never a refusal — the answer is still Keke's."""
+    directory. Advisory, never a refusal — the answer is still Keke's.
+
+    `protected` is ((resolved_path, spoken_name), …) — the roots this whole
+    system exists to protect. One generic sentence made a Write into
+    `<vault>/Daily/2026-08-09.md` sound exactly like a Write into
+    /tmp/DONE.txt; Fleet.forbidden already knew both roots but only consulted
+    them at spawn, never in the readback. A hit inside one of them wins over
+    the generic note and NAMES it."""
     try:
         root = Path(worktree_path).resolve()
     except (OSError, RuntimeError, TypeError, ValueError):
         return ""
+    roots = []
+    for entry in protected or ():
+        try:
+            raw_root, name = entry
+            roots.append((Path(raw_root).resolve(), str(name)))
+        except (OSError, RuntimeError, TypeError, ValueError):
+            continue
+    generic = ""
     for raw in _named_paths(args):
         try:
             p = Path(raw).expanduser()
             p = (p if p.is_absolute() else root / p).resolve()
         except (OSError, RuntimeError, ValueError):
             continue
-        if p != root and root not in p.parents:
-            return "Outside its worktree, sir. "
-    return ""
+        if p == root or root in p.parents:
+            continue
+        for proot, name in roots:
+            if p == proot or proot in p.parents:
+                return f"That target is inside {name}, sir — not its worktree. "
+        generic = generic or "Outside its worktree, sir. "
+    return generic
 
 
 def _resume_command(info: dict) -> str:
@@ -316,8 +374,11 @@ class _FleetLogWriter:
 class Worker:
     def __init__(self, *, project: str, path: str, task_text: str, wt,
                  bus, router, log, client_factory=ClaudeSDKClient,
-                 now=time.time):
+                 now=time.time, protected=()):
         self.id = uuid.uuid4().hex[:8]
+        # ((path, spoken name), …) — the roots the readback must NAME rather
+        # than lump into a generic "outside its worktree" (Fleet.protected).
+        self.protected = tuple(protected or ())
         self.project = project
         self.path = path                  # the REAL repo path (registry key)
         self.task_text = task_text
@@ -352,6 +413,12 @@ class Worker:
         self._client = None
         self._inbox: asyncio.Queue[str] = asyncio.Queue(maxsize=INPUT_QUEUE_MAX)
         self._futures: dict[str, asyncio.Future] = {}   # nonce -> decision
+        # nonce -> the approval.request payload as published. The SSE stream is
+        # lossy (bus.py drops a subscriber whose queue fills) and the console
+        # reconnects without a Last-Event-ID, so a card published during the
+        # gap was gone for good: no card, no spoken line, a worker blocked for
+        # the full 600s TTL. GET /fleet replays these for the pending nonces.
+        self._cards: dict[str, dict] = {}
 
     @property
     def starting(self) -> bool:
@@ -552,14 +619,26 @@ class Worker:
                     f"{self.project} wants {tool_name}")[:80]
         # The worktree confines nothing on its own — cwd is set, absolute paths
         # ignore it. If the target is outside, Keke hears that BEFORE the yes.
-        outside = _outside_note(tool_input, self.worktree.path)
-        self._bus.publish("approval.request", {
+        outside = _outside_note(tool_input, self.worktree.path, self.protected)
+        risk = _risk_note(tool_name, tool_input)
+        # The card carries MORE than the sentence, not less. Speech is elided
+        # (from the MIDDLE, so a long shell line can lose the very clause the
+        # risk note is warning about) and both notes used to live only in the
+        # spoken half — so a console click approved a command the console had
+        # never fully shown. `full_args` is unelided and rendered with
+        # textContent; `risk`/`outside`/`worktree` put the warnings on screen.
+        card = {
             "nonce": approval.nonce, "worker": self.id,
             "project": self.project, "path": self.path, "tool": tool_name,
             "args": _short_args(tool_input),
-            "question": (f"{_risk_note(tool_name, tool_input)}{outside}"
+            "full_args": _full_args(tool_input),
+            "risk": risk.strip(), "outside": outside.strip(),
+            "worktree": self.worktree.path,
+            "question": (f"{risk}{outside}"
                          f"{title} — {_short_args(tool_input)}. "
-                         f"Approve or deny, sir?")})
+                         f"Approve or deny, sir?")}
+        self._cards[approval.nonce] = card
+        self._bus.publish("approval.request", dict(card))
         approved = False
         try:
             approved = bool(await asyncio.wait_for(fut, APPROVAL_WAIT_S))
@@ -586,6 +665,10 @@ class Worker:
             raise
         finally:
             self._futures.pop(approval.nonce, None)
+            # Decided (or expired, or cancelled): the card is no longer a
+            # replayable pending request. pending_cards() also filters on the
+            # router, so this is the belt to that braces.
+            self._cards.pop(approval.nonce, None)
         self._apply("permission_done",
                     {"nonce": approval.nonce, "approved": approved})
         if approved:
@@ -654,10 +737,14 @@ class Fleet:
                  worktree_factory=create_worktree,
                  settings_writer=write_hook_settings,
                  hook_port: int = 7777, hook_bearer: str = "",
-                 open_terminal=None):
+                 open_terminal=None, protected=()):
         self.workers: list[Worker] = []
         self.queue: deque[tuple[str, str, str]] = deque()
         self.ghosts: list[dict] = []      # restart reports (Task 10)
+        # Whether THIS session actually read the durable log. A boot that never
+        # recovered holds no opinion about what was in it, and Fleet.snapshot
+        # must not rotate the previous generation away on the strength of one.
+        self._recovered = False
         self.max_workers = max_workers
         # Spawns that have RESERVED a slot but not yet registered a worker.
         # Counted into every admission check so two overlapping spawns can
@@ -666,6 +753,12 @@ class Fleet:
         self._pending_spawns = 0
         self.worktrees_dir = Path(worktrees_dir)
         self.forbidden = tuple(str(Path(f).resolve()) for f in forbidden)
+        # ((path, spoken name), …). `forbidden` blocks a worker's CWD at spawn
+        # and nothing else; it was never consulted in the readback, so a Write
+        # into the vault and a Write into /tmp sounded identical. These are the
+        # same roots, carrying the words to say about them.
+        self.protected = tuple((str(Path(p).resolve()), str(name))
+                               for p, name in (protected or ()))
         self.hook_port = hook_port
         self.hook_bearer = hook_bearer
         self._bus = bus
@@ -741,7 +834,7 @@ class Fleet:
                                 wt=wt, bus=self._bus, router=self._router,
                                 log=self._log_writer,
                                 client_factory=self._client_factory,
-                                now=self._now)
+                                now=self._now, protected=self.protected)
                 # Register BEFORE start(): the CLI's SessionStart hook can
                 # POST during connect(), and an unregistered worker would be
                 # published as fleet.unknown_session. published_state is
@@ -1117,6 +1210,22 @@ class Fleet:
                 else "nothing yet")
         return f"{w.project} is {state}. Last activity: {last}."
 
+    def pending_cards(self) -> list[dict]:
+        """The approval.request payloads still awaiting an answer.
+
+        SSE is lossy by design (bus.py drops a subscriber whose 256-slot queue
+        fills — roughly 128 worker messages) and the console reconnects with no
+        Last-Event-ID, so every card published during the gap was lost for
+        good: no card, no spoken line, and a worker blocked for the full 600s
+        TTL. GET /fleet serves these so a reload or a reconnect gets them back.
+
+        The ROUTER decides what is still pending — a card whose nonce it no
+        longer holds was answered, expired, or died with a stop, and must never
+        come back as a clickable request."""
+        pending = {a.nonce for a in self._router.pending_approvals()}
+        return [dict(card) for w in self.workers
+                for nonce, card in w._cards.items() if nonce in pending]
+
     # ---------- inbound ----------
     def deliver_approval(self, nonce: str, approved: bool) -> bool:
         return any(w.deliver_approval(nonce, approved) for w in self.workers)
@@ -1236,15 +1345,6 @@ class Fleet:
         by a process with no clock context at all. Bases are what recover()
         maps: anything live becomes UNKNOWN/INTERRUPTED, which is exactly what
         close_all's refusal to log session_end intends."""
-        # An empty or absent log has nothing to compact, and rotating it is not
-        # a compaction — it is a deletion of the previous generation. A JARVIS
-        # session that never spawned a worker must not erase the last one that
-        # did.
-        try:
-            if self._log.path.stat().st_size == 0:
-                return
-        except OSError:
-            return
         workers = {w.id: {"worker": w.id, "project": w.project, "path": w.path,
                           "state": w.machine.base, "task": w.task_text,
                           "worktree": w.worktree.path,
@@ -1277,6 +1377,36 @@ class Fleet:
                             "state": g.get("state", UNKNOWN),
                             "task": g.get("task", ""), "worktree": wt,
                             "session_id": g.get("session_id", "")}
+        # An empty or absent log has nothing to compact, and rotating it is not
+        # a compaction — it is a deletion of the previous generation. A JARVIS
+        # session that never spawned a worker must not erase the last one that
+        # did.
+        #
+        # That guard used to sit ABOVE the retirement loop, and the two were
+        # individually right but jointly wrong: close_all's own compaction
+        # rotates the log away, so every LATER boot opens with an empty log and
+        # returned here before a ghost could ever be retired. The retirement
+        # rule was reachable only on a boot that appended at least one record —
+        # and a ghost survives precisely the boots that spawn nothing. Simulated
+        # boots 2 through 8 each re-reported the same ghost, including the boots
+        # after its worktree had been deleted, so `fleet.recovered` fired every
+        # time and JARVIS claimed workers were "interrupted by a restart" many
+        # restarts later. So compute the state FIRST and skip the rotation only
+        # when there is genuinely nothing new to write down.
+        try:
+            logged = self._log.path.stat().st_size > 0
+        except OSError:
+            logged = False
+        if not logged:
+            if not self._recovered:
+                # This session never read the log, so `workers` is not a
+                # considered opinion about what was in it — writing would
+                # erase the last session on the strength of an empty guess.
+                return
+            stored = ((self._log.load_snapshot() or {}).get("state", {})
+                      or {}).get("workers", {}) or {}
+            if workers == stored:
+                return          # nothing ran, nothing retired: no rotation
         self._log_writer.snapshot({"workers": workers})
 
     def recover(self) -> list[dict]:
@@ -1386,4 +1516,5 @@ class Fleet:
                 "still read, but there may be workers from the last run I "
                 "can't tell you about.")})
         self.ghosts = reports
+        self._recovered = True
         return reports

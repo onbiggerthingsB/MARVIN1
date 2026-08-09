@@ -129,6 +129,12 @@ def create_app(base_dir: Path) -> FastAPI:
         # spec §5/§9: never the vault, never the JARVIS repo itself
         forbidden=(str(Path(vault_root).resolve()),
                    str(Path(base_dir).resolve())),
+        # The SAME two roots, carrying the words to say about them. `forbidden`
+        # blocks a worker's cwd at spawn and nothing more, so a Write into
+        # <vault>/Daily/2026-08-09.md and a Write into /tmp/DONE.txt used to
+        # get the identical "Outside its worktree, sir."
+        protected=((str(Path(vault_root).resolve()), "your Obsidian vault"),
+                   (str(Path(base_dir).resolve()), "the JARVIS repo itself")),
         hook_port=cfg.port, hook_bearer=cfg.hook_bearer)
 
     @app.middleware("http")
@@ -182,7 +188,20 @@ def create_app(base_dir: Path) -> FastAPI:
                  "state": "STARTING" if w.starting else w.machine.state(now),
                  "task": w.task_text, "worktree": w.worktree.path}
                 for w in app.state.fleet.workers]
-        return {"workers": live + list(app.state.fleet.ghosts)}
+        # Pending approval CARDS ride along. SSE is lossy on purpose (bus.py
+        # drops a subscriber whose queue fills) and the console reconnects
+        # without a Last-Event-ID, so a card published during the gap was lost
+        # for good — no card, no spoken line, a worker blocked for the full
+        # 600s TTL. This is the resync. Same cookie gate as the rest of the
+        # console; the payload is the card the browser already receives over
+        # SSE — nonce, project, path, tool, args, the two warnings — and
+        # carries no session id and no bearer.
+        try:
+            approvals = app.state.fleet.pending_cards()
+        except Exception:  # noqa: BLE001 — a fleet fault must not 500 the page
+            approvals = []
+        return {"workers": live + list(app.state.fleet.ghosts),
+                "approvals": approvals}
 
     @app.get("/bootstrap")
     async def bootstrap(token: str = ""):

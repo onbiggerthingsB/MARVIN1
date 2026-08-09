@@ -9,8 +9,8 @@ import pytest
 from claude_agent_sdk import CanUseToolShadowedWarning
 
 from server.bus import EventBus
-from server.fleet import (APPROVAL_WAIT_S, Fleet, Worker, _risk_note,
-                          _short_args)
+from server.fleet import (APPROVAL_WAIT_S, Fleet, Worker, _full_args,
+                          _named_paths, _risk_note, _short_args)
 from server.fleet_log import FleetLog
 from server.fleet_state import (ACTIVE_TURN, CLOSED, IDLE_AT_PROMPT, UNKNOWN,
                                 WAITING_PERMISSION)
@@ -1162,6 +1162,58 @@ def test_a_short_argument_is_spoken_verbatim():
     assert _short_args({"file_path": "/a/b.txt"}) == "/a/b.txt"
 
 
+def test_the_full_command_survives_somewhere_even_when_speech_elides_it():
+    """The elision cuts the MIDDLE, so a long enough command loses its
+    destructive clause from the spoken sentence while _risk_note (which scans
+    the FULL blob) still fires: "Careful, sir — this one can destroy things"
+    over a sentence naming only `npm run build` and `npm test`. The console
+    card is the complete record, so _full_args elides nothing."""
+    cmd = ("npm run build -- --verbose " + "--flag=value " * 18
+           + "&& rm -rf '/Users/likerun/Library/Mobile Documents/"
+             "iCloud~md~obsidian/Documents/KEKE LI' && npm test")
+    assert len(cmd) > 300
+    spoken = _short_args({"command": cmd})
+    assert _risk_note("Bash", {"command": cmd})     # the warning fires...
+    assert "rm -rf" not in spoken                   # ...over an elided middle
+    assert _full_args({"command": cmd}) == cmd      # and the card has it all
+    assert _full_args({"file_path": "/a/b.txt"}) == "/a/b.txt"
+    assert _full_args("not-a-dict") == "not-a-dict"
+
+
+async def test_the_card_carries_the_full_command_and_both_warnings(
+        tmp_path, monkeypatch):
+    """The click path was told LESS than the voice path: `_short_args` on the
+    card too, and neither the risk note nor the outside-the-worktree note
+    anywhere on it. There was no surface in JARVIS showing the full command."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    await fleet.spawn("soccer", repo(tmp_path), "task")
+    w = fleet.workers[0]
+    # The destructive clause sits in the MIDDLE — the half _elide throws away.
+    cmd = ("npm run build " + "--flag=value " * 14
+           + "&& rm -rf /Users/likerun/Documents && npm test -- "
+           + "--reporter=verbose " * 6)
+    cid, q = bus.subscribe()
+    try:
+        t = asyncio.create_task(w._on_tool_request(
+            "Bash", {"command": cmd}, SimpleNamespace(title=None)))
+        await asyncio.sleep(0.05)
+        fleet.deliver_approval(router.pending_approvals()[0].nonce, False)
+        await asyncio.wait_for(t, 1)
+        card = None
+        while not q.empty():
+            ev = q.get_nowait()
+            if ev and ev["type"] == "approval.request":
+                card = ev["data"]
+        assert card is not None
+        assert card["full_args"] == cmd                # verbatim, unelided
+        assert "rm -rf /Users/likerun/Documents" not in card["args"]  # spoken half
+        assert "destroy things" in card["risk"]
+        assert "outside" in card["outside"].lower()
+        assert card["worktree"] == w.worktree.path
+    finally:
+        await cleanup(fleet)
+
+
 async def test_an_approval_says_when_the_target_is_outside_the_worktree(
         tmp_path, monkeypatch):
     """cwd is the worktree, but Write/Edit/Bash take absolute paths — the live
@@ -1195,3 +1247,91 @@ async def test_an_approval_says_when_the_target_is_outside_the_worktree(
         assert "outside its worktree" not in questions[3]  # relative, still inside
     finally:
         await cleanup(fleet)
+
+
+async def test_the_readback_names_the_vault_and_the_jarvis_repo(tmp_path,
+                                                                monkeypatch):
+    """One generic sentence made a Write into the owner's Obsidian vault sound
+    exactly like a Write into /tmp/DONE.txt — "Outside its worktree, sir." for
+    both. Fleet.forbidden already held the resolved vault root and the JARVIS
+    repo; it was consulted only at spawn, never in the readback."""
+    vault, jarvis = tmp_path / "vault", tmp_path / "jarvis"
+    vault.mkdir()
+    jarvis.mkdir()
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    fleet.protected = ((str(vault), "your Obsidian vault"),
+                       (str(jarvis), "the JARVIS repo itself"))
+    await fleet.spawn("soccer", repo(tmp_path), "task")
+    w = fleet.workers[0]
+    w.protected = fleet.protected
+    cid, q = bus.subscribe()
+    try:
+        for tool, args in (
+                ("Write", {"file_path": str(vault / "Daily" / "2026-08-09.md")}),
+                ("Bash", {"command": f"git -C {jarvis} push --force"}),
+                ("Write", {"file_path": "/tmp/DONE.txt"})):
+            t = asyncio.create_task(w._on_tool_request(
+                tool, args, SimpleNamespace(title=None)))
+            await asyncio.sleep(0.05)
+            fleet.deliver_approval(router.pending_approvals()[0].nonce, False)
+            await asyncio.wait_for(t, 1)
+        said = []
+        while not q.empty():
+            ev = q.get_nowait()
+            if ev and ev["type"] == "approval.request":
+                said.append(ev["data"]["question"])
+        assert "inside your Obsidian vault" in said[0]
+        assert "inside the JARVIS repo itself" in said[1]
+        assert said[2].count("Outside its worktree, sir.") == 1   # still generic
+        assert "vault" not in said[2] and "JARVIS repo" not in said[2]
+    finally:
+        await cleanup(fleet)
+
+
+async def test_a_pending_card_can_be_replayed_after_the_sse_drops(tmp_path,
+                                                                  monkeypatch):
+    """A chatty worker evicts the browser's bus subscriber, and the console
+    reconnects with NO Last-Event-ID — so an approval.request published in the
+    gap never rendered, nothing resynced, and the worker sat blocked for the
+    full TTL with no card and no spoken line. GET /fleet serves the pending
+    cards so a reconnect (or a reload) gets them back."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    await fleet.spawn("soccer", repo(tmp_path), "task")
+    w = fleet.workers[0]
+    try:
+        assert fleet.pending_cards() == []
+        t = asyncio.create_task(w._on_tool_request(
+            "Bash", {"command": "rm -rf /Users/likerun/Documents"},
+            SimpleNamespace(title=None)))
+        await asyncio.sleep(0.05)
+        cards = fleet.pending_cards()
+        assert len(cards) == 1
+        assert cards[0]["nonce"] == router.pending_approvals()[0].nonce
+        assert cards[0]["full_args"] == "rm -rf /Users/likerun/Documents"
+        assert "destroy things" in cards[0]["risk"]
+        assert "session_id" not in cards[0]          # nothing secret rides along
+        fleet.deliver_approval(cards[0]["nonce"], False)
+        await asyncio.wait_for(t, 1)
+        # answered → never replayable again, however the page reloads
+        assert fleet.pending_cards() == []
+    finally:
+        await cleanup(fleet)
+
+
+def test_the_bash_scanner_sees_the_two_home_spellings():
+    """`rm -rf $HOME/Documents` and `cd "$HOME/Documents" && rm -rf .` produced
+    NO outside note at all — the scanner only recognised tokens starting `/`,
+    `~/` or `../`. $HOME is the one variable worth folding: nothing else can
+    start with `$HOME/`, so it costs no false positives. Every OTHER variable,
+    command substitution, and interpreter form is still silent, by design and
+    by documentation — see _named_paths."""
+    assert _named_paths({"command": "rm -rf $HOME/Documents"}) == ["~/Documents"]
+    assert _named_paths({"command": 'cd "${HOME}/Documents" && rm -rf .'}) \
+        == ["~/Documents"]
+    assert _named_paths({"command": "cd $HOME && ls"}) == ["~"]
+    # unchanged: no path-shaped token, no claim
+    assert _named_paths({"command": "git commit -m 'fix /etc/hosts parsing'"}) \
+        == []
+    assert _named_paths({"command": 'python -c "import shutil; shutil.rmtree(v)"'}) \
+        == []
+    assert _named_paths({"command": "rm -rf $VAULT/Daily"}) == []

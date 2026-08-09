@@ -62,6 +62,16 @@ def confirmed_registry(*names, kind="code"):
     return r
 
 
+def open_spoken(router, *args, **kwargs):
+    """An approval JARVIS has already read aloud — the precondition every
+    voice-resolution test below assumes. A bare open_approval() models one
+    nobody has heard, and a yes may not resolve that (see
+    tests/test_approval_correlation.py)."""
+    a = router.open_approval(*args, **kwargs)
+    router.mark_spoken(a.nonce)
+    return a
+
+
 async def brain(bus, butler, spk, **kw):
     task = asyncio.create_task(run_butler_brain(
         bus, butler, spk, FakeTurnLog(), **kw))
@@ -160,8 +170,8 @@ async def test_bare_pull_it_up_resolves_the_only_worker():
 async def test_voice_approval_is_delivered_to_the_fleet():
     bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
     router, fleet = Router(), FakeFleet()
-    a = router.open_approval("soccer", "Bash: npm test",
-                             now=time.time(), path="/p/soccer")
+    a = open_spoken(router, "soccer", "Bash: npm test",
+                    now=time.time(), path="/p/soccer")
     task = await brain(bus, butler, spk, router=router,
                        registry=confirmed_registry("soccer"), fleet=fleet)
     fut = asyncio.ensure_future(_drain(bus, "approval.resolved"))
@@ -180,8 +190,8 @@ async def test_a_mixed_polarity_answer_asks_and_leaves_the_approval_pending():
     for said in ("sure, cancel that", "yeah, stop it", "sure, stop soccer"):
         bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
         router, fleet = Router(), FakeFleet()
-        router.open_approval("soccer", "Bash: rm -rf build",
-                             now=time.time(), path="/p/soccer")
+        open_spoken(router, "soccer", "Bash: rm -rf build",
+                    now=time.time(), path="/p/soccer")
         task = await brain(bus, butler, spk, router=router,
                            registry=confirmed_registry("soccer"), fleet=fleet)
         cid, q = bus.subscribe()
@@ -211,8 +221,8 @@ async def test_a_refusal_the_router_never_heard_of_never_runs_the_tool():
                  "okay, forget soccer", "yeah, don’t run soccer"):
         bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
         router, fleet = Router(), FakeFleet()
-        router.open_approval("soccer", "Bash: rm -rf build",
-                             now=time.time(), path="/p/soccer")
+        open_spoken(router, "soccer", "Bash: rm -rf build",
+                    now=time.time(), path="/p/soccer")
         task = await brain(bus, butler, spk, router=router,
                            registry=confirmed_registry("soccer"), fleet=fleet)
         cid, q = bus.subscribe()
@@ -243,8 +253,8 @@ async def test_a_publish_failure_cannot_speak_over_a_delivered_approval():
             return super().publish(type_, data)
     bus, butler, spk = BoomOnResolved(), FakeButler(), FakeSpeaker()
     router, fleet = Router(), FakeFleet()
-    a = router.open_approval("soccer", "Bash: npm test",
-                             now=time.time(), path="/p/soccer")
+    a = open_spoken(router, "soccer", "Bash: npm test",
+                    now=time.time(), path="/p/soccer")
     task = await brain(bus, butler, spk, router=router,
                        registry=confirmed_registry("soccer"), fleet=fleet)
     bus.publish("command.received", {"text": "yes, go ahead"})
@@ -266,8 +276,8 @@ async def test_a_deliver_failure_speaks_truth_and_publishes_nothing():
             raise RuntimeError("delivery broke")
     bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
     router, fleet = Router(), BoomDeliverFleet()
-    router.open_approval("soccer", "Bash: npm test",
-                         now=time.time(), path="/p/soccer")
+    open_spoken(router, "soccer", "Bash: npm test",
+                now=time.time(), path="/p/soccer")
     task = await brain(bus, butler, spk, router=router,
                        registry=confirmed_registry("soccer"), fleet=fleet)
     cid, q = bus.subscribe()
@@ -291,15 +301,23 @@ async def test_a_deliver_failure_speaks_truth_and_publishes_nothing():
 
 
 async def test_approval_request_cards_are_spoken():
+    """The nonce must be REAL. This test used to publish a card for a nonce
+    the router had never heard of, so it passed both on a brain that read
+    STALE requests aloud (C3) and on one that never tied the readback to the
+    resolver (C1). Both facts are asserted here now."""
     bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
-    task = await brain(bus, butler, spk, router=Router(),
+    router = Router()
+    a = router.open_approval("soccer", "Bash: npm test",
+                             now=time.time(), path="/p/soccer")
+    task = await brain(bus, butler, spk, router=router,
                        registry=confirmed_registry("soccer"), fleet=FakeFleet())
     bus.publish("approval.request",
-                {"nonce": "n1", "project": "soccer", "tool": "Bash",
+                {"nonce": a.nonce, "project": "soccer", "tool": "Bash",
                  "args": "npm test",
                  "question": "soccer wants Bash — npm test. Approve or deny, sir?"})
     await asyncio.sleep(0.05)
     assert any("Approve or deny" in s for s in spk.spoke)
+    assert router.pending_approvals()[0].spoken is True   # and it is on record
     task.cancel()
 
 
