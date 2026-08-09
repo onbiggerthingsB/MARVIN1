@@ -5,6 +5,7 @@ import asyncio
 import time
 
 from server.butler import ButlerUnavailable
+from server.discovery import default_home
 from server.finance import TRADE_REFUSAL, find_finance_project, portfolio_brief
 from server.router import bare_yes_no
 from server.vault_paths import vault_root_from_env
@@ -37,6 +38,10 @@ FLEET_TIMEOUT_S = 90   # spawn = worktree + connect + first query; generous but 
 # never makes. Bound them.
 SPEAK_TIMEOUT_S = 60
 PRECONNECT_TIMEOUT_S = 15
+# Discovery walks the home directory. It runs off the loop (discover() uses a
+# thread) but the loop still AWAITS it, and an iCloud-evicted or network mount
+# can stall that walk indefinitely. Bounded like every other await here.
+DISCOVERY_TIMEOUT_S = 60
 # Citation validation touches the filesystem (an iCloud-evicted directory can
 # stall), so it is bounded too. A slow validator must cost the chips, not the turn.
 VALIDATE_TIMEOUT_S = 10
@@ -206,6 +211,61 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
             if etype == "tts.done":
                 _safe(_record_audio, data.get("t_first_audio"))
                 continue
+            if etype == "confirm.request":
+                # The repo confirmation, READ ALOUD. The console has rendered
+                # this event since M3.1; the voice half was never wired, and
+                # the milestone's first beat is a *spoken* confirm.
+                #
+                # Only the onboarding flow's own question is spoken here. The
+                # §16 data-source gate publishes the same event type for the
+                # same console widget, but speaks its question in the turn
+                # that asked it — reading it again would ask Keke something
+                # whose answer is already pending. Whitelisted on `kind`, so
+                # a future publisher of this event is silent until it opts in
+                # rather than accidentally loud.
+                question = ""
+                try:
+                    d = data if isinstance(data, dict) else {}
+                    if d.get("kind") == "repo":
+                        question = str(d.get("question") or "")[:400]
+                except Exception:  # noqa: BLE001 — a malformed event costs the sentence
+                    question = ""
+                if question:
+                    await _speak(question)
+                continue
+            if etype == "confirm.next":
+                # Propose the next discovered repo. Boot discovery, the
+                # `find my projects` verb and the answer-to-the-last-question
+                # chain all arrive here rather than calling ask_next()
+                # themselves, and that hop is the point: the bus queue is a
+                # BARRIER.
+                #
+                # Onboarding starts owning bare yes/no speech the instant
+                # ask_next() returns, but the question is only heard once the
+                # confirm.request above has been spoken. Doing both from the
+                # asking turn leaves a window in between — an impatient second
+                # "yes", said while "Noted, sir." was still playing, would
+                # confirm a repo whose question had never been read. Asking
+                # HERE closes it: everything Keke said before the publisher
+                # published is already dequeued (and falls through as ordinary
+                # speech, owned by nothing), and everything said after lands
+                # behind the confirm.request, so the question is read aloud
+                # before the reply is processed — the same guarantee
+                # Approval.spoken gives the fleet's approvals.
+                if onboarding is None:
+                    continue
+                try:
+                    asked = bool(await onboarding.ask_next())
+                except Exception as e:  # noqa: BLE001 — onboarding must never kill the brain
+                    bus.publish("butler.error",
+                                {"reason": f"onboarding ask failed: {_reason(e)}"})
+                    await _speak("I couldn't line up the next project, sir.")
+                    continue
+                if not asked:
+                    # No candidates left. Say so once and STOP — nothing here
+                    # republishes, so the chain ends rather than looping.
+                    await _speak("Nothing left for me to confirm, sir.")
+                continue
             if etype == "approval.request":
                 # A worker is blocked on Keke's word; the card is on screen and
                 # this is the spoken half (readback of project, tool, args,
@@ -323,6 +383,19 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                         bus.publish("butler.error", {"reason": f"onboarding failed: {e}"})
                     if outcome != "ignored":
                         await _speak("Noted, sir." if outcome != "rejected" else "Understood.")
+                        # Keep the chain moving: one answer used to end the
+                        # flow, so the second candidate was never proposed and
+                        # the registry never grew past one repo. A `renamed`
+                        # outcome deliberately left the project PENDING, so
+                        # the next question is that same repo re-asked knowing
+                        # the alias — only a real yes confirms.
+                        #
+                        # Published AFTER the acknowledgment, never before:
+                        # anything Keke says while "Noted, sir." plays is then
+                        # queued AHEAD of this, so it is drained before the
+                        # next question exists and cannot be mistaken for its
+                        # answer (see the confirm.next handler).
+                        bus.publish("confirm.next", {"trigger": "reply"})
                         continue
                     if awaiting and bare_yes_no(text):
                         # Precondition 2 (Part 1 final review): the pending
@@ -547,6 +620,27 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                                             {"reason": f"portfolio brief failed: {_reason(e)}"})
                                 spoken = "I couldn't read your stock system just now, sir."
                             await _speak(spoken)
+                        elif command.verb == "discover":
+                            # Re-scan on demand. Inside the surrounding
+                            # dispatch try, so a scan fault costs this turn
+                            # and is spoken ("that command failed"), never
+                            # raised. The QUESTION is not asked here: the
+                            # publish below is the last act of the turn, so
+                            # everything said during the scan and the summary
+                            # is drained before onboarding starts awaiting an
+                            # answer (see the confirm.next handler).
+                            if onboarding is None:
+                                await _speak("I can't look for your projects "
+                                             "just yet, sir.")
+                            else:
+                                added = await asyncio.wait_for(
+                                    onboarding.refresh(default_home()),
+                                    DISCOVERY_TIMEOUT_S)
+                                await _speak(
+                                    f"I found {added} new "
+                                    f"project{'' if added == 1 else 's'}, sir."
+                                    if added else "Nothing new, sir.")
+                                bus.publish("confirm.next", {"trigger": "voice"})
                         elif command.verb == "capture":
                             # Regression fix: before the router existed, "note/
                             # remember that ..." reached the butler, whose

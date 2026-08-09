@@ -292,6 +292,241 @@ async def test_okay_answers_the_repo_question_not_the_tool_approval(tmp_path):
     task.cancel()
 
 
+# ---- beat 1: discovery -> a SPOKEN repo confirm -> the next candidate -----
+# Every piece below was already unit-tested and every unit passed while the
+# flow was dead: nothing asked, nothing spoke the question, and the chain
+# stopped after one answer. These pin the WIRING.
+
+def pending_registry(*names):
+    """A registry of discovered-but-unconfirmed candidates — what a first boot
+    produces, and the only state the confirmation flow has anything to do."""
+    r = Registry()
+    r.merge_candidates([Candidate(path=f"/p/{n}", name=n, sources=["t"]) for n in names])
+    return r
+
+
+def onboarding_for(bus, registry, tmp_path):
+    from server.onboarding import Onboarding
+    return Onboarding(bus, registry, tmp_path / "projects.json")
+
+
+async def _settle(seconds=0.1):
+    """Let the serial brain loop drain the events we just published."""
+    await asyncio.sleep(seconds)
+
+
+async def test_the_repo_question_is_spoken_not_only_rendered(tmp_path):
+    # Beat 1 is a SPOKEN confirm. confirm.request has always been rendered by
+    # the console; the brain never read it aloud.
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    reg = pending_registry("quant agent")
+    ob = onboarding_for(bus, reg, tmp_path)
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=reg, onboarding=ob))
+    await asyncio.sleep(0)
+    bus.publish("confirm.next", {"trigger": "boot"})
+    await _settle()
+    assert any("quant agent" in s and "correct repo" in s for s in spk.spoke), spk.spoke
+    assert ob.awaiting                                  # and the answer is owned
+    task.cancel()
+
+
+async def test_the_source_question_is_never_read_aloud_twice(tmp_path):
+    # The §16 data-source question rides the SAME confirm.request event (the
+    # console renders both), but it is spoken by the turn that asked it.
+    # Reading it a second time would put a question to Keke whose answer is
+    # already pending — the correlation defect this codebase keeps paying for.
+    from server.finance_gate import SourceGate
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    reg, root = finance_fixture(tmp_path)
+    gate = SourceGate(bus, reg, tmp_path / "projects.json")
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=reg, finance=gate))
+    await asyncio.sleep(0)
+    bus.publish("command.received", {"text": "how are the picks doing?"})
+    await _settle()
+    assert sum(1 for s in spk.spoke if "picks.json" in s) == 1, spk.spoke
+    task.cancel()
+
+
+async def test_a_confirmed_answer_proposes_the_next_candidate(tmp_path):
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    reg = pending_registry("quant agent", "soccer")
+    ob = onboarding_for(bus, reg, tmp_path)
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=reg, onboarding=ob))
+    await asyncio.sleep(0)
+    bus.publish("confirm.next", {"trigger": "boot"})
+    await _settle()
+    first = ob._asking.path
+    bus.publish("command.received", {"text": "yes"})
+    await _settle()
+    assert [p.path for p in reg.projects if p.confirmed] == [first]
+    assert ob.awaiting and ob._asking.path != first     # the chain kept going
+    assert any(ob._asking.name in s and "correct repo" in s
+               for s in spk.spoke), spk.spoke          # and the next one was SPOKEN
+    task.cancel()
+
+
+async def test_a_rejection_also_proposes_the_next_candidate(tmp_path):
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    reg = pending_registry("quant agent", "soccer")
+    ob = onboarding_for(bus, reg, tmp_path)
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=reg, onboarding=ob))
+    await asyncio.sleep(0)
+    bus.publish("confirm.next", {})
+    await _settle()
+    first = ob._asking.path
+    bus.publish("command.received", {"text": "no"})
+    await _settle()
+    assert not any(p.confirmed for p in reg.projects)   # a no confirms nothing
+    assert ob.awaiting and ob._asking.path != first
+    task.cancel()
+
+
+async def test_a_rename_re_asks_the_same_repo_because_it_is_still_pending(tmp_path):
+    # "no, I said the trading system" teaches an alias and deliberately leaves
+    # the project PENDING — only a real yes confirms. The chain must therefore
+    # re-propose THAT project, not skip past it.
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    reg = pending_registry("quant agent")
+    ob = onboarding_for(bus, reg, tmp_path)
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=reg, onboarding=ob))
+    await asyncio.sleep(0)
+    bus.publish("confirm.next", {})
+    await _settle()
+    asked = ob._asking.path
+    bus.publish("command.received", {"text": "no, I said the trading system"})
+    await _settle()
+    p = next(p for p in reg.projects if p.path == asked)
+    assert "the trading system" in p.aliases and not p.confirmed
+    assert ob.awaiting and ob._asking.path == asked     # re-asked, knowing the alias
+    task.cancel()
+
+
+async def test_the_last_candidate_ends_the_chain_truthfully(tmp_path):
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    reg = pending_registry("soccer")
+    ob = onboarding_for(bus, reg, tmp_path)
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=reg, onboarding=ob))
+    await asyncio.sleep(0)
+    bus.publish("confirm.next", {})
+    await _settle()
+    bus.publish("command.received", {"text": "yes"})
+    await _settle()
+    assert not ob.awaiting
+    assert any("nothing left" in s.lower() for s in spk.spoke), spk.spoke
+    # and it does not loop: exactly one question was ever asked
+    assert len([e for e in bus._ring if e["type"] == "confirm.request"]) == 1
+    task.cancel()
+
+
+async def test_a_second_yes_cannot_confirm_a_repo_that_was_never_asked(tmp_path):
+    # The double-yes. Keke answers, then says "yes" again while "Noted, sir."
+    # is still playing — that second yes was uttered before the next question
+    # existed and must never confirm it. The next candidate is proposed
+    # THROUGH the bus for exactly this reason: everything already said is
+    # drained (as ordinary speech) before onboarding starts awaiting again.
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    reg = pending_registry("quant agent", "soccer")
+    ob = onboarding_for(bus, reg, tmp_path)
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=reg, onboarding=ob))
+    await asyncio.sleep(0)
+    bus.publish("confirm.next", {})
+    await _settle()
+    first = ob._asking.path
+    bus.publish("command.received", {"text": "yes"})
+    bus.publish("command.received", {"text": "yes"})    # queued behind the first
+    await _settle()
+    assert [p.path for p in reg.projects if p.confirmed] == [first]
+    assert ob.awaiting and ob._asking.path != first     # asked, NOT confirmed
+    task.cancel()
+
+
+async def test_a_bare_yes_answers_the_spoken_repo_question_not_the_tool_approval(tmp_path):
+    # Three questions can be pending at once. A bare yes with a repo confirm
+    # pending belongs TERMINALLY to that confirm — it must never reach the
+    # approval resolver and run someone's `rm -rf`.
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    reg = pending_registry("soccer")
+    ob = onboarding_for(bus, reg, tmp_path)
+    router = Router()
+    open_spoken(router, "alethic", "rm -rf build", now=time.time())
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=router, registry=reg, onboarding=ob))
+    await asyncio.sleep(0)
+    bus.publish("confirm.next", {})
+    await _settle()
+    assert any("correct repo" in s for s in spk.spoke)   # it WAS read aloud
+    bus.publish("command.received", {"text": "yes"})
+    await _settle()
+    assert [p.name for p in reg.projects if p.confirmed] == ["soccer"]
+    assert len(router.pending_approvals()) == 1          # the rm -rf is untouched
+    assert butler.asked == []
+    task.cancel()
+
+
+async def test_the_discover_verb_rescans_and_proposes_a_repo(tmp_path, monkeypatch):
+    import server.app_brain as ab
+    home = tmp_path / "home"
+    (home / "alethic" / ".git").mkdir(parents=True)
+    monkeypatch.setattr(ab, "default_home", lambda: home)
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    reg = Registry()                                    # nothing known yet
+    ob = onboarding_for(bus, reg, tmp_path)
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=reg, onboarding=ob))
+    await asyncio.sleep(0)
+    fut = asyncio.ensure_future(_drain(bus, "router.command"))
+    bus.publish("command.received", {"text": "find my projects"})
+    ev = await fut
+    assert ev["data"]["verb"] == "discover"
+    for _ in range(200):                                # the scan runs off-loop
+        if ob.awaiting:
+            break
+        await asyncio.sleep(0.01)
+    assert [p.name for p in reg.projects] == ["alethic"]
+    assert any("alethic" in s and "correct repo" in s for s in spk.spoke), spk.spoke
+    assert butler.asked == []                           # the model was never consulted
+    task.cancel()
+
+
+async def test_the_brain_survives_an_onboarding_ask_explosion(tmp_path):
+    class BoomAsk:
+        awaiting = False
+        async def handle_reply(self, text): return "ignored"
+        async def ask_next(self): raise RuntimeError("ask exploded")
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=Registry(), onboarding=BoomAsk()))
+    await asyncio.sleep(0)
+    fut = asyncio.ensure_future(_drain(bus, "butler.error"))
+    bus.publish("confirm.next", {})
+    ev = await fut
+    assert "onboarding ask failed" in ev["data"]["reason"]
+    assert not task.done()
+    fut2 = asyncio.ensure_future(_drain(bus, "butler.answer"))
+    bus.publish("command.received", {"text": "where did I leave the Tibet study?"})
+    await fut2                                          # still answering
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
 def finance_fixture(tmp_path):
     """A confirmed finance project with one readable output, plus the gate."""
     import json as _json

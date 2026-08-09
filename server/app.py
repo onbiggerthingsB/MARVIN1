@@ -17,6 +17,7 @@ from server.app_brain import run_butler_brain
 from server.bus import EventBus
 from server.butler import Butler, build_options
 from server.config import ensure_config, load_keyterms, save_config
+from server.discovery import default_home
 from server.finance_gate import SourceGate
 from server.fleet import Fleet
 from server.fleet_log import FleetLog
@@ -454,12 +455,65 @@ def create_app(base_dir: Path) -> FastAPI:
                 "text": ("Sir, I couldn't read my own fleet log after that "
                          "restart — I don't know what was running. Details "
                          "are on screen.")})
+
+        async def _boot_discovery():
+            # Beat 1's trigger. Nothing used to call Onboarding.refresh() or
+            # ask_next(), so the registry stayed empty forever: Registry.match
+            # only ever returns CONFIRMED projects, so every spawn refused and
+            # there was no finance project either.
+            #
+            # The trigger is "nothing confirmed yet", not "every boot" — a
+            # rescan on every start would re-propose repos Keke has already
+            # answered for. `refresh` merges candidates without touching
+            # existing entries, so nothing it does can undo a confirmation.
+            #
+            # It ASKS through the bus (confirm.next) rather than calling
+            # ask_next() here: the brain reads the question aloud, and going
+            # through its queue keeps "asked" and "read aloud" in the order
+            # the reply is processed in. See the confirm.next handler.
+            try:
+                if any(p.confirmed for p in app.state.registry.projects):
+                    return
+                await app.state.onboarding.refresh(default_home())
+            except Exception as e:  # noqa: BLE001 — a scan fault must never block boot
+                app.state.bus.publish("butler.error",
+                                      {"reason": f"discovery failed: {e}"})
+                # ...and SAY so, the way a failed fleet recovery does above.
+                # Silence would read as "you have no projects", which is a
+                # claim this code just failed to be able to make.
+                app.state.bus.publish("fleet.spoken", {
+                    "text": ("Sir, I couldn't look for your projects just "
+                             "now. Details are on screen.")})
+                return
+            app.state.bus.publish("confirm.next", {"trigger": "boot"})
+
+        # Started AFTER the yield-to-the-loop above, so the brain has already
+        # subscribed and its confirm.next cannot land in nobody's queue. Its
+        # own task because the scan walks a home directory and can take
+        # seconds: awaiting it here would delay /health and the console.
+        discovery = asyncio.create_task(_boot_discovery())
+
+        def _discovery_died(t):
+            # Same last resort as the two above. The body guards Exception, so
+            # reaching here means something escaped it — and a dead discovery
+            # task is perfectly silent: JARVIS simply never asks, which is the
+            # exact failure this task exists to fix.
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                app.state.bus.publish("butler.error",
+                                      {"reason": f"discovery task died: {exc!r}"})
+
+        discovery.add_done_callback(_discovery_died)
+
         try:
             yield
         finally:
+            discovery.cancel()
             ticker.cancel()
             task.cancel()
-            for t in (ticker, task):
+            for t in (discovery, ticker, task):
                 # suppress EVERYTHING, not just CancelledError: a task that
                 # already died with a real exception re-raises it from this
                 # await, and letting it out of the finally would skip

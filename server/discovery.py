@@ -18,6 +18,17 @@ WORKTREE_MARKER = "/.claude/worktrees/"
 DEFAULT_ROOTS = ("", "Desktop", "Documents", "code", "src", "projects")
 
 
+def default_home() -> Path:
+    """Where discovery looks when no caller names a root.
+
+    A function rather than a module constant so it is read per call — frozen
+    at import time it could not be pointed at a temporary tree by a test, and
+    Path.home() raises when HOME is unset, which would then be an import
+    failure rather than one boot's spoken problem.
+    """
+    return Path.home()
+
+
 @dataclass
 class Candidate:
     path: str

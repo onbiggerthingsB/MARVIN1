@@ -105,7 +105,16 @@ class Onboarding:
             self._asking = None
             return False
         self._asking = next(p for p in self.registry.projects if p.path == prompt["path"])
-        self.bus.publish("confirm.request", prompt)
+        # `kind` tags WHOSE question this is. The §16 data-source gate publishes
+        # the same event type for the same console widget, but it speaks its own
+        # question in the turn that asked it; the brain reads THIS one aloud and
+        # would otherwise read that one a second time — putting a question to
+        # Keke whose answer is already pending, which is how consent gets
+        # attached to the wrong thing. A tag on the speaker's own question is a
+        # whitelist; deciding by what the event is NOT would be a blacklist.
+        # Additive: `prompt` itself is unchanged, so next_prompt()'s contract
+        # and the console's read of `question`/`name` are untouched.
+        self.bus.publish("confirm.request", {**prompt, "kind": "repo"})
         return True
 
     async def handle_reply(self, spoken: str) -> str:

@@ -26,6 +26,25 @@ _STOP_VERBS = ("stop", "halt", "cancel", "kill")
 _STOP = re.compile(r"^\s*(?:" + "|".join(_STOP_VERBS)
                    + r")\s+(?P<project>.+?)\s*$", re.I)
 _CAPTURE = re.compile(r"^\s*(?:note|capture|remember)\s+(?:that\s+)?(?P<text>.+)$", re.I)
+# Re-run project discovery. The registry is only ever seeded by a scan, so a
+# repo cloned after boot is invisible until another one runs — and Keke has no
+# console button for it, only a voice.
+#
+# The pattern is ANCHORED on the whole utterance and closed on both ends: a
+# known opener, optional determiners, and one of a fixed set of object nouns.
+# "find the HRV protocol note" and "can you find my projects folder?" leave
+# words this pattern does not account for, so neither fires — the same
+# "explain every word or do nothing" rule the consent gates use.
+#
+# The "show me"/"open"/"pull up" family is deliberately EXCLUDED even though
+# "show me my projects" is natural: _PULL_UP already owns those openers and
+# resolves them against the registry, so sharing them would make one sentence
+# mean two different things depending on what happens to be confirmed.
+_DISCOVER = re.compile(
+    r"^\s*(?:find|discover|look\s+for|scan\s+for|search\s+for)"
+    r"(?:\s+(?:my|all|the))*"
+    r"\s+(?:projects?|repos?|repositor(?:y|ies))"
+    r"(?:\s+again)?\s*[.!?]*\s*$", re.I)
 _STATUS = re.compile(r"^\s*(?:what'?s|what is)\s+(?:running|the fleet|going on)\b.*$", re.I)
 _PULL_IT = re.compile(r"^\s*pull\s+(?:it|that)\s+up\s*[.!?]*\s*$", re.I)
 _PORTFOLIO = re.compile(
@@ -308,6 +327,13 @@ class Router:
         # and it must not depend on the model reading a system prompt (spec §16).
         if _TRADE.search(text):
             return Command(verb="refuse_trade")
+
+        # Checked before the project-resolving verbs. Those return None the
+        # moment their project does not resolve — they do not fall through to
+        # later patterns — so a discovery phrasing that ever overlapped one of
+        # them would be swallowed silently rather than mis-routed loudly.
+        if _DISCOVER.match(text):
+            return Command(verb="discover")
 
         for pattern, verb, arg_group in ((_SPAWN, "spawn", "task"), (_STEER, "steer", "task")):
             m = pattern.match(text)

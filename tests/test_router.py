@@ -57,6 +57,42 @@ def test_a_question_is_not_a_command_and_falls_through():
     assert Router().parse("where did I leave the Tibet study?", reg("soccer")) is None
 
 
+# ---------- the discovery verb (M3 beat 1) ----------
+# Discovery has to be re-runnable by voice: the registry is only ever seeded
+# by a scan, and a repo cloned after boot is invisible until another one runs.
+
+@pytest.mark.parametrize("said", [
+    "find my projects", "discover my projects", "look for my repos",
+    "find my repos", "scan for projects", "find all my projects",
+    "find my repositories", "discover my projects again", "find my projects."])
+def test_discovery_phrasings_are_parsed(said):
+    c = Router().parse(said, reg("soccer"))
+    assert c is not None and c.verb == "discover", said
+    assert c.project is None and c.argument is None
+
+
+@pytest.mark.parametrize("said", [
+    "where did I leave the Tibet study?",     # ordinary conversation
+    "find the HRV protocol note",             # a find that names something else
+    "can you find my projects folder?",       # the phrase inside a real question
+    "find my projects folder",                # a trailing word we did not parse
+    "what projects am I running?",
+    "note that I should find my projects"])   # capture keeps its own text
+def test_ordinary_speech_never_triggers_discovery(said):
+    c = Router().parse(said, reg("soccer"))
+    assert c is None or c.verb != "discover", said
+
+
+def test_the_discovery_verb_does_not_shadow_an_existing_verb():
+    # Every other verb still parses the way it did — the discovery pattern is
+    # anchored on its own closed vocabulary and shares no opener with them.
+    r, registry = Router(), reg("soccer", "projects")
+    assert r.parse("pull up soccer", registry).verb == "pull_up"
+    assert r.parse("stop soccer", registry).verb == "stop"
+    assert r.parse("open projects", registry).verb == "pull_up"   # _PULL_UP keeps "open"
+    assert r.parse("note that I found my repos", registry).verb == "capture"
+
+
 def test_status_questions_fall_through_to_the_butler():
     # No fleet exists yet, and "what's going on..." is a natural question the
     # butler used to answer. Part 2 restores the status verb with a real fleet.
