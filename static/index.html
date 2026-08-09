@@ -20,6 +20,12 @@
     <div id="confirm"></div>
     <div id="projects"></div>
     <div id="finance"></div>
+    <div id="fleet"></div>
+    <div id="interrupts"></div>
+    <!-- The worker transcript pane. NOT id="transcript": that id already names
+         the live STT pane above, and a duplicate id would send fleet.transcript
+         lines into it (querySelector returns the first match). -->
+    <pre id="worker-transcript"></pre>
     <footer id="metrics">—</footer>
   </main>
   <script type="module" src="/static/app.js"></script>

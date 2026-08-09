@@ -18,6 +18,8 @@ from server.bus import EventBus
 from server.butler import Butler, build_options
 from server.config import ensure_config, load_keyterms, save_config
 from server.finance_gate import SourceGate
+from server.fleet import Fleet
+from server.fleet_log import FleetLog
 from server.onboarding import Onboarding
 from server.registry import Registry
 from server.router import Router
@@ -28,7 +30,7 @@ from server.vault_read import vault_is_downloaded
 
 COOKIE = "jarvis_session"
 OPEN_PATHS = {"/health", "/bootstrap"}
-BEARER_PATHS = {"/wake"}
+BEARER_PATHS = {"/wake", "/hooks"}
 
 
 def _existing_note_titles(titles, vault_root: Path) -> set:
@@ -117,6 +119,14 @@ def create_app(base_dir: Path) -> FastAPI:
     app.state.router = Router()
     app.state.onboarding = Onboarding(app.state.bus, app.state.registry, registry_path)
     app.state.source_gate = SourceGate(app.state.bus, app.state.registry, registry_path)
+    app.state.fleet = Fleet(
+        bus=app.state.bus, router=app.state.router,
+        log=FleetLog(base_dir / "state" / "fleet.jsonl"),
+        worktrees_dir=base_dir / "state" / "worktrees",
+        # spec §5/§9: never the vault, never the JARVIS repo itself
+        forbidden=(str(Path(vault_root).resolve()),
+                   str(Path(base_dir).resolve())),
+        hook_port=cfg.port, hook_bearer=cfg.hook_bearer)
 
     @app.middleware("http")
     async def guard(request: Request, call_next):
@@ -169,6 +179,37 @@ def create_app(base_dir: Path) -> FastAPI:
     @app.post("/wake")
     async def wake():
         app.state.bus.publish("wake", {})
+        return {"ok": True}
+
+    @app.post("/hooks")
+    async def hooks(request: Request):
+        # Bearer-authed by the middleware (BEARER_PATHS). Payload is Claude
+        # Code's hook stdin JSON, relayed verbatim by the worktree's curl.
+        try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse({"error": "bad shape"}, status_code=400)
+        app.state.fleet.handle_hook(payload)
+        return {"ok": True}
+
+    @app.post("/approval")
+    async def approval(request: Request):
+        # The console click path — same nonce discipline as the voice path.
+        body = await request.json()
+        nonce = str(body.get("nonce", ""))
+        decision = body.get("decision")
+        if decision not in ("approve", "deny") or not nonce:
+            return JSONResponse({"error": "bad request"}, status_code=400)
+        taken = app.state.router.take_nonce(nonce, time.time())
+        if taken is None:
+            return JSONResponse({"error": "unknown or expired"}, status_code=404)
+        approved = decision == "approve"
+        app.state.fleet.deliver_approval(nonce, approved)
+        app.state.bus.publish("approval.resolved", {
+            "outcome": "approved" if approved else "denied",
+            "project": taken.project, "tool": taken.tool, "nonce": nonce})
         return {"ok": True}
 
     @app.post("/command")
@@ -277,7 +318,8 @@ def create_app(base_dir: Path) -> FastAPI:
                              router=app.state.router,
                              registry=app.state.registry,
                              onboarding=app.state.onboarding,
-                             finance=app.state.source_gate))
+                             finance=app.state.source_gate,
+                             fleet=app.state.fleet))
 
         def _brain_died(t):
             # Last resort. run_butler_brain guards every await, so reaching here
@@ -292,12 +334,27 @@ def create_app(base_dir: Path) -> FastAPI:
                                       {"reason": f"brain task died: {exc!r}"})
 
         task.add_done_callback(_brain_died)
+
+        async def _fleet_ticker():
+            # QUIET is derived: someone must look at the clock. A tick fault
+            # is reported and survived — the ticker must outlive any bug.
+            while True:
+                await asyncio.sleep(5)
+                try:
+                    await app.state.fleet.tick()
+                except Exception as e:  # noqa: BLE001
+                    app.state.bus.publish("fleet.error",
+                                          {"reason": f"tick failed: {e}"})
+        ticker = asyncio.create_task(_fleet_ticker())
         try:
             yield
         finally:
+            ticker.cancel()
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            for t in (ticker, task):
+                with contextlib.suppress(asyncio.CancelledError):
+                    await t
+            await app.state.fleet.close_all()
             await app.state.butler.close()
 
     # Assigned after the app is built (rather than passed to FastAPI(lifespan=…))

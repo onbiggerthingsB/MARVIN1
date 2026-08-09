@@ -21,9 +21,8 @@ _STEER = re.compile(r"^\s*tell\s+(?P<project>.+?)\s+to\s+(?P<task>.+)$", re.I)
 _PULL_UP = re.compile(r"^\s*(?:pull\s+up|show\s+me|open)\s+(?P<project>.+?)\s*$", re.I)
 _STOP = re.compile(r"^\s*(?:stop|halt|cancel|kill)\s+(?P<project>.+?)\s*$", re.I)
 _CAPTURE = re.compile(r"^\s*(?:note|capture|remember)\s+(?:that\s+)?(?P<text>.+)$", re.I)
-# Unused until Part 2 restores the status verb: with no fleet to report yet,
-# "what's going on..." must fall through to the butler, not be intercepted.
 _STATUS = re.compile(r"^\s*(?:what'?s|what is)\s+(?:running|the fleet|going on)\b.*$", re.I)
+_PULL_IT = re.compile(r"^\s*pull\s+(?:it|that)\s+up\s*[.!?]*\s*$", re.I)
 _PORTFOLIO = re.compile(
     r"\b(?:the\s+)?(?:picks|portfolio|positions|holdings)\b|"
     r"\bhow(?:'s| is| are)\s+(?:the\s+)?(?:market|stocks?|picks)\b", re.I)
@@ -165,7 +164,7 @@ class Router:
             return None, [_label(m, matches) for m in matches]
         return None, []
 
-    def parse(self, spoken: str, registry) -> Command | None:
+    def parse(self, spoken: str, registry, has_fleet: bool = False) -> Command | None:
         text = (spoken or "").strip()
         if not text:
             return None
@@ -197,6 +196,15 @@ class Router:
                                project=proj.name if proj else None,
                                path=proj.path if proj else None,
                                needs_disambiguation=ambiguous)
+
+        if has_fleet:
+            # Only intercepted while workers exist: with an empty fleet these
+            # are natural questions the butler answers better (Part 1 final
+            # review — the status verb used to swallow them).
+            if _STATUS.match(text):
+                return Command(verb="status")
+            if _PULL_IT.match(text):
+                return Command(verb="pull_up")     # the fleet's obvious worker
 
         if _PORTFOLIO.search(text):
             return Command(verb="portfolio")

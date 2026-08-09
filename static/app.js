@@ -12,6 +12,9 @@ function connectSSE() {
    "stt.error", "tts.start", "tts.done", "metrics.turn", "metrics.error",
    "butler.answer", "butler.error", "router.command", "confirm.request",
    "confirm.result", "registry.updated", "finance.brief",
+   "fleet.update", "fleet.message", "fleet.error", "fleet.transcript",
+   "fleet.unknown_session", "fleet.spoken", "fleet.recovered",
+   "fleet.handoff", "approval.request",
    "approval.resolved"].forEach((t) =>
     es.addEventListener(t, dispatch(t)));
   // Deliberate: reconnect fresh (no Last-Event-ID). Replaying stale tts.start/
@@ -287,9 +290,6 @@ window.jarvis.onEvent("router.command", (d) => {
   window.jarvis.setStatus(
     `command: ${d.verb}${d.project ? " → " + d.project : ""}`);
 });
-window.jarvis.onEvent("approval.resolved", (d) => {
-  window.jarvis.setStatus(`approval ${d.outcome}: ${d.project}`);
-});
 window.jarvis.onEvent("finance.brief", (d) => {
   const box = $("#finance");
   box.textContent = "";
@@ -314,4 +314,65 @@ window.jarvis.onEvent("metrics.turn", (m) => {
     `turns ${m.turns} · release→final p50 ${m.release_to_final_p50}ms ` +
     `p95 ${m.release_to_final_p95}ms · final→audio p50 ${m.final_to_audio_p50}ms ` +
     `p95 ${m.final_to_audio_p95}ms`;
+});
+
+// ---- M3 Part 2: fleet tiles / interrupt cards / worker transcript --------
+const fleetTiles = new Map();
+function renderFleetTile(d) {
+  let tile = fleetTiles.get(d.worker);
+  if (!tile) {
+    tile = document.createElement("div");
+    tile.className = "tile";
+    ["tile-name", "tile-state", "tile-task"].forEach((cls) => {
+      const el = document.createElement("div");
+      el.className = cls;
+      tile.appendChild(el);
+    });
+    $("#fleet").appendChild(tile);
+    fleetTiles.set(d.worker, tile);
+  }
+  tile.dataset.path = d.path || "";
+  tile.querySelector(".tile-name").textContent = d.project || "?";
+  tile.querySelector(".tile-state").textContent = d.state || "?";
+  tile.querySelector(".tile-task").textContent = d.task || "";
+}
+window.jarvis.onEvent("fleet.update", renderFleetTile);
+window.jarvis.onEvent("fleet.message", (d) => {
+  window.jarvis.setStatus(`${d.project}: working…`);
+});
+window.jarvis.onEvent("fleet.error", (d) => {
+  window.jarvis.setStatus("fleet: " + (d.reason || "error"));
+});
+window.jarvis.onEvent("fleet.transcript", (d) => {
+  // #worker-transcript, NOT #transcript: that id is the live STT pane, and a
+  // duplicate id would route these lines there (querySelector's first match).
+  $("#worker-transcript").textContent = (d.lines || [])
+    .map((l) => `${l.who}: ${l.text}`).join("\n\n");
+});
+window.jarvis.onEvent("approval.request", (d) => {
+  const card = document.createElement("div");
+  card.className = "interrupt";
+  card.dataset.nonce = d.nonce;
+  const q = document.createElement("div");
+  q.textContent = `${d.project}: ${d.tool} — ${d.args}`;
+  const send = (decision) => fetch("/approval", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ nonce: d.nonce, decision }),
+  }).then(() => card.remove());
+  const yes = document.createElement("button");
+  yes.textContent = "Approve";
+  yes.addEventListener("click", () => send("approve"));
+  const no = document.createElement("button");
+  no.textContent = "Deny";
+  no.addEventListener("click", () => send("deny"));
+  card.append(q, yes, no);
+  $("#interrupts").appendChild(card);
+});
+window.jarvis.onEvent("approval.resolved", (d) => {
+  // EVERY outcome removes the card — approved, denied, expired, cancelled,
+  // and anything a later task adds. An unknown outcome must never leave a
+  // stale card a click could still try to redeem.
+  document.querySelectorAll(`#interrupts .interrupt[data-nonce="${d.nonce}"]`)
+    .forEach((el) => el.remove());
+  window.jarvis.setStatus(`approval ${d.outcome}: ${d.project}`);
 });

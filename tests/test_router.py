@@ -256,3 +256,17 @@ def test_take_nonce_unknown_or_expired_is_none():
     a = router.open_approval("soccer", "npm test", now=NOW)
     assert router.take_nonce(a.nonce, now=NOW + 601) is None   # swept, not taken
     assert router.pending_approvals() == []
+
+
+def test_status_intercepts_only_when_the_fleet_is_live():
+    r = reg("soccer")
+    assert Router().parse("what's running right now?", r) is None          # M3.1 behavior
+    c = Router().parse("what's running right now?", r, has_fleet=True)
+    assert c is not None and c.verb == "status"
+
+
+def test_pull_it_up_is_a_bare_pull_up_only_with_a_fleet():
+    r = reg("soccer")
+    assert Router().parse("pull it up", r) is None
+    c = Router().parse("pull it up", r, has_fleet=True)
+    assert c.verb == "pull_up" and c.project is None and c.path is None

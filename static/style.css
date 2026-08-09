@@ -20,3 +20,10 @@ footer { opacity: 0.6; font-size: 0.8rem; }
 #projects { font-size: 0.8rem; opacity: 0.7; }
 #finance .pos { font-size: 0.85rem; }
 #finance .caveat { font-size: 0.75rem; opacity: 0.6; margin-top: 0.3rem; }
+#fleet { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+#fleet .tile { border: 1px solid #446; border-radius: 8px; padding: 0.5rem; min-width: 12rem; }
+#fleet .tile-state { font-size: 0.75rem; letter-spacing: 0.05em; opacity: 0.8; }
+#fleet .tile-task { font-size: 0.75rem; opacity: 0.6; }
+#interrupts .interrupt { border: 1px solid #a63; border-radius: 8px; padding: 0.6rem; margin: 0.3rem 0; }
+#interrupts button { margin-right: 0.5rem; }
+#worker-transcript { max-height: 14rem; overflow-y: auto; font-size: 0.8rem; white-space: pre-wrap; }

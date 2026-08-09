@@ -29,6 +29,7 @@ UNAVAILABLE_DEFAULT = "I can't reach my brain just now, sir."
 # taking every later utterance with it. Time it out and treat that like any
 # other failure.
 ASK_TIMEOUT_S = 120
+FLEET_TIMEOUT_S = 90   # spawn = worktree + connect + first query; generous but bounded
 # Same argument, applied to every other await in the loop. The loop is SERIAL:
 # one await that never returns is one JARVIS that never answers again. A TTS
 # socket that connects and then goes quiet, or an ElevenLabs pre-warm against a
@@ -102,7 +103,8 @@ async def _brief_and_publish(bus, project) -> str:
 
 
 async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=None,
-                           router=None, registry=None, onboarding=None, finance=None):
+                           router=None, registry=None, onboarding=None, finance=None,
+                           fleet=None):
     """Subscribe to the bus and drive the butler. Never raises out of the loop.
 
     `validate_citations` is an optional async callable taking the model's list of
@@ -199,6 +201,37 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
             if etype == "tts.done":
                 _safe(_record_audio, data.get("t_first_audio"))
                 continue
+            if etype == "approval.request":
+                # A worker is blocked on Keke's word; the card is on screen and
+                # this is the spoken half (readback of project, tool, args,
+                # risk — composed by the fleet). Guarded: a malformed event
+                # must cost this speech, never the loop.
+                question = ""
+                try:
+                    question = str((data or {}).get("question") or "")[:400]
+                except Exception:  # noqa: BLE001
+                    question = ""
+                await _speak(question or "A worker needs permission, sir — "
+                                         "the card is on screen.")
+                continue
+            if etype in ("fleet.spoken", "fleet.recovered"):
+                text_out = ""
+                try:
+                    if etype == "fleet.recovered":
+                        n = int((data or {}).get("count") or 0)
+                        text_out = ("Sir, one worker was interrupted by a restart. "
+                                    "Its worktree is preserved; I no longer hold "
+                                    "its session." if n == 1 else
+                                    f"Sir, {n} workers were interrupted by a "
+                                    "restart. Their worktrees are preserved; I no "
+                                    "longer hold their sessions.")
+                    else:
+                        text_out = str((data or {}).get("text") or "")[:400]
+                except Exception:  # noqa: BLE001
+                    text_out = ""
+                if text_out:
+                    await _speak(text_out)
+                continue
             if etype in ("stt.utterance", "command.received"):
                 if etype == "stt.utterance":
                     _safe(_record_utterance, turnlog, data)
@@ -265,8 +298,14 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                 # Dangerous verbs are parsed deterministically, never by the model.
                 command = None
                 if router is not None and registry is not None:
+                    has_fleet = False
                     try:
-                        command = router.parse(text, registry)
+                        has_fleet = bool(fleet is not None and fleet.workers)
+                    except Exception as e:  # noqa: BLE001 — a fleet fault must not break parsing
+                        bus.publish("butler.error",
+                                    {"reason": f"fleet status failed: {e}"})
+                    try:
+                        command = router.parse(text, registry, has_fleet=has_fleet)
                     except Exception as e:  # noqa: BLE001 — a router fault falls through
                         bus.publish("butler.error", {"reason": f"router failed: {e}"})
                         command = None
@@ -302,6 +341,12 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                                 bus.publish("approval.resolved", {
                                     "outcome": state, "project": approval.project,
                                     "tool": approval.tool, "nonce": approval.nonce})
+                                if fleet is not None:
+                                    # unblock the worker's can_use_tool future;
+                                    # same try — a delivery fault is an approval
+                                    # fault, handled by this guard.
+                                    fleet.deliver_approval(approval.nonce,
+                                                           state == "approved")
                     except Exception as e:  # noqa: BLE001 — a router fault must never kill the brain
                         bus.publish("butler.error",
                                     {"reason": f"approval handling failed: {e}"})
@@ -378,8 +423,46 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                                 bus.publish("butler.error",
                                             {"reason": f"capture failed: {_reason(e)}"})
                                 await _speak("I couldn't save that note, sir.")
+                        elif command.verb in ("spawn", "steer", "stop",
+                                              "status", "pull_up") and fleet is not None:
+                            # Fleet dispatch. Inside the surrounding dispatch
+                            # try — any raise costs this turn ("that command
+                            # failed"), never the loop. FLEET_TIMEOUT_S bounds
+                            # the awaits: a wedged spawn must not wedge JARVIS.
+                            if command.verb == "spawn":
+                                if not command.path:
+                                    spoken = "Which project, sir?"
+                                else:
+                                    spoken = await asyncio.wait_for(
+                                        fleet.spawn(command.project or "",
+                                                    command.path,
+                                                    command.argument or ""),
+                                        FLEET_TIMEOUT_S)
+                            elif command.verb == "steer":
+                                spoken = fleet.steer_path(command.path or "",
+                                                          command.argument or "")
+                            elif command.verb == "stop":
+                                spoken = await asyncio.wait_for(
+                                    fleet.stop(command.path or ""), FLEET_TIMEOUT_S)
+                            elif command.verb == "status":
+                                spoken = fleet.status_line()
+                            else:                       # pull_up
+                                target = command.path
+                                if target is None:
+                                    workers = list(fleet.workers)
+                                    if len(workers) == 1:
+                                        target = workers[0].path
+                                if target is None:
+                                    spoken = "Which one, sir?"
+                                else:
+                                    bus.publish("fleet.transcript", {
+                                        "path": target,
+                                        "project": command.project,
+                                        "lines": fleet.transcript(target)})
+                                    spoken = fleet.one_breath(target)
+                            await _speak(spoken)
                         else:
-                            # Fleet verbs (spawn/steer/stop/pull_up) land in M3 Part 2.
+                            # No fleet injected (tests, degraded boot): honest.
                             await _speak("Understood, sir — I can't run that yet.")
                     except Exception as e:  # noqa: BLE001 — a malformed Command must never kill the brain
                         bus.publish("butler.error",
