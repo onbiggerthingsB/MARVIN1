@@ -83,25 +83,42 @@ async def remove_worktree(wt: Worktree) -> None:
     the MAIN working tree. A Worktree is a plain dataclass anyone can forge or
     rehydrate stale from disk, so refuse anything JARVIS did not create:
       1. the recorded branch must live in JARVIS's own jarvis/ namespace;
-      2. the checkout actually at wt.path must have that exact branch checked
+      2. wt.path must be ABSOLUTE, so the checkout this verifies and the
+         worktree git deletes are provably the same directory;
+      3. the checkout actually at wt.path must have that exact branch checked
          out RIGHT NOW — this is what stops a stale record from aiming the
-         removal at somebody else's directory."""
+         removal at somebody else's directory.
+
+    On (2): a RELATIVE path is resolved against two different roots. The
+    verification below resolves it against the server process's cwd, while
+    `git -C <repo> worktree remove` finds no such directory under the repo and
+    falls back to matching a registered worktree by NAME — so path="worker-3"
+    can be verified against some ./worker-3 here and then delete a human's
+    unrelated worker-3 checkout inside wt.repo. An absolute path gets no name
+    matching, so the two can never diverge. create_worktree only ever records
+    absolute paths; anything else is forged or corrupt."""
     if not wt.branch.startswith("jarvis/"):
         raise WorktreeError(
             f"refusing to remove {wt.path}: branch {wt.branch!r} is outside "
             f"the jarvis/ namespace, so JARVIS did not create it")
+    if not Path(wt.path).is_absolute():
+        raise WorktreeError(
+            f"refusing to remove {wt.path!r}: that is not an absolute path, so "
+            f"git could delete a same-named worktree in {wt.repo} instead of "
+            f"the one I check — stale or forged record")
+    target = str(Path(wt.path))   # ONE string: what I verify is what git removes
     try:
-        checked_out = await _git(Path(wt.path), "rev-parse", "--abbrev-ref",
+        checked_out = await _git(Path(target), "rev-parse", "--abbrev-ref",
                                  "HEAD")
     except WorktreeError as e:
         raise WorktreeError(
-            f"refusing to remove {wt.path}: cannot confirm what is checked "
+            f"refusing to remove {target}: cannot confirm what is checked "
             f"out there ({e})") from e
     if checked_out != wt.branch:
         raise WorktreeError(
-            f"refusing to remove {wt.path}: it has {checked_out!r} checked "
+            f"refusing to remove {target}: it has {checked_out!r} checked "
             f"out, not the recorded {wt.branch!r} — stale or forged record")
-    await _git(Path(wt.repo), "worktree", "remove", "--force", wt.path)
+    await _git(Path(wt.repo), "worktree", "remove", "--force", target)
 
 
 def write_hook_settings(wt_path: Path, port: int, bearer: str) -> Path:

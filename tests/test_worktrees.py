@@ -79,7 +79,10 @@ async def test_remove_worktree_refuses_a_stale_record_on_the_wrong_checkout(tmp_
     try:
         forged = Worktree(repo=str(repo), path=wt_b.path, branch=wt_a.branch,
                           base_commit=wt_a.base_commit)
-        with pytest.raises(WorktreeError, match="refus"):
+        # Pin the guard's OWN branch-mismatch refusal: a bare "refus" also
+        # matches "cannot confirm what is checked out there", so a broken
+        # rev-parse in the environment would green this test for free.
+        with pytest.raises(WorktreeError, match="checked out, not the recorded"):
             await remove_worktree(forged)
         assert Path(wt_b.path).exists()             # the target survived
         assert (Path(wt_b.path) / "README.md").exists()
@@ -96,11 +99,54 @@ async def test_remove_worktree_refuses_a_jarvis_record_aimed_at_the_main_checkou
     try:
         forged = Worktree(repo=str(repo), path=str(repo), branch=wt.branch,
                           base_commit=wt.base_commit)
-        with pytest.raises(WorktreeError):
+        # match= is load-bearing: git refuses to delete a MAIN working tree all
+        # by itself ("fatal: ... is a main working tree"), so a bare raises()
+        # here passes with the guard fully reverted — it would be testing git,
+        # not JARVIS. Pin the guard's own branch-mismatch sentence instead.
+        with pytest.raises(WorktreeError,
+                           match="has 'main' checked out, not the recorded"):
             await remove_worktree(forged)
         assert repo.exists() and (repo / "README.md").exists()
     finally:
         await remove_worktree(wt)
+
+
+async def test_remove_worktree_refuses_a_relative_path(tmp_path, monkeypatch):
+    # A relative wt.path is resolved against two DIFFERENT roots: the guard's
+    # `git -C <path> rev-parse` resolves it against the server process's cwd,
+    # while `git -C <repo> worktree remove --force <path>` finds no such
+    # directory in the repo and falls back to matching a registered worktree by
+    # NAME. So one directory gets verified and a different one gets deleted.
+    victim_root = tmp_path / "victim"
+    victim_root.mkdir()
+    decoy_root = tmp_path / "decoy"
+    decoy_root.mkdir()
+    victim_repo = make_repo(victim_root)
+    decoy_repo = make_repo(decoy_root)
+    victim_w = victim_root / "wts" / "W"
+    decoy_w = decoy_root / "wts" / "W"
+    # The human's real linked checkout in victim_repo, on their own branch.
+    subprocess.run(["git", "worktree", "add", "-q", "-b", "feature/human",
+                    str(victim_w)], cwd=victim_repo, check=True)
+    (victim_w / "notes.txt").write_text("hours of work\n", encoding="utf-8")
+    # A same-NAME decoy in an unrelated repo, wearing a jarvis/ branch so the
+    # guard's rev-parse happily says yes.
+    subprocess.run(["git", "worktree", "add", "-q", "-b", "jarvis/decoy",
+                    str(decoy_w)], cwd=decoy_repo, check=True)
+    try:
+        monkeypatch.chdir(decoy_w.parent)        # "W" verifies HERE ...
+        forged = Worktree(repo=str(victim_repo), path="W",
+                          branch="jarvis/decoy", base_commit="deadbeef")
+        with pytest.raises(WorktreeError, match="not an absolute path"):
+            await remove_worktree(forged)        # ... but git would delete THERE
+        assert victim_w.exists()                 # the human's checkout survived
+        assert (victim_w / "notes.txt").exists()
+        assert (victim_w / "README.md").exists()
+        assert decoy_w.exists()                  # and nothing else went either
+    finally:
+        for repo, wt_dir in ((victim_repo, victim_w), (decoy_repo, decoy_w)):
+            subprocess.run(["git", "worktree", "remove", "--force", str(wt_dir)],
+                           cwd=repo, check=False, capture_output=True)
 
 
 def test_hook_settings_cover_all_seven_events(tmp_path):
