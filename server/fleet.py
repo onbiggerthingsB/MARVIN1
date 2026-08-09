@@ -174,6 +174,7 @@ class Worker:
         self.session_id: str | None = None
         self.transcript: deque[dict] = deque(maxlen=TRANSCRIPT_KEEP)
         self.locked = False               # handoff lockout: no more input
+        self.stop_requested = False       # a stop that landed mid-start, deferred
         self.published_state: str | None = None
         self.consumer: asyncio.Task | None = None
         self.pump: asyncio.Task | None = None
@@ -185,6 +186,14 @@ class Worker:
         self._client = None
         self._inbox: asyncio.Queue[str] = asyncio.Queue(maxsize=INPUT_QUEUE_MAX)
         self._futures: dict[str, asyncio.Future] = {}   # nonce -> decision
+
+    @property
+    def starting(self) -> bool:
+        """True while start() has not yet built the session's tasks: the
+        client may be absent or half-connected and there is no pump. Early
+        registration makes this window visible to _find, so stop() and
+        steer() must not treat it as a running session."""
+        return self.consumer is None
 
     # ---------- state plumbing ----------
     def _apply(self, kind: str, extra: dict | None = None) -> None:
@@ -316,6 +325,12 @@ class Worker:
             raise
 
     def steer(self, text: str) -> str:
+        if self.starting:
+            # No pump exists yet: "Told X" would be a claim of delivery into
+            # an inbox nothing drains until connect() finishes — and a claim
+            # silently dropped if the spawn fails. Refuse honestly instead.
+            return (f"{self.project} is still starting, sir — "
+                    f"give it a moment.")
         if self.locked:
             return (f"{self.project} is detached, sir — "
                     f"steer it from its terminal.")
@@ -532,6 +547,33 @@ class Fleet:
                     raise
             finally:
                 self._pending_spawns -= 1
+            if worker.stop_requested:
+                # A stop landed while start() was awaited; stop() deferred it
+                # to us. Execute it now that the client, consumer and pump
+                # really exist — never speak "On it" over a worker the user
+                # already stopped, and admit the queue only once the CLI is
+                # actually gone.
+                if await self._stop_worker(worker):
+                    spoken = (f"{project} is stopped as you asked, sir — it "
+                              f"finished starting and I shut it down. Its "
+                              f"worktree is preserved for your review.")
+                else:
+                    spoken = (f"You asked me to stop {project}, sir, but it "
+                              f"wouldn't stop cleanly — treat it as unknown.")
+                await self._admit_next()
+                return spoken
+            if worker.machine.base == CLOSED:
+                # The machine closed under the in-flight start without a
+                # deferred stop: a stop() in the query window (consumer
+                # already existed, normal teardown ran) or a SessionEnd hook
+                # (the CLI itself exited). Either way the tile is CLOSED —
+                # "On it" would be a false success over it. Best-effort
+                # cleanup, then say what actually happened.
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        worker.shutdown(interrupt_first=False), 5)
+                return (f"{project} was stopped while it was starting, sir — "
+                        f"nothing is running there.")
             # Spec §3 acknowledgment honesty: "On it" ONLY now — the worktree
             # exists, the client connected, the task is in the session.
             return (f"On it, sir — {project} is working in a fresh worktree "
@@ -564,18 +606,37 @@ class Fleet:
             return "Nothing is running there, sir."
         if w.machine.base == DETACHED:
             return f"{w.project} is detached, sir — stop it from its terminal."
+        if w.starting:
+            # Early registration makes a half-started worker visible here
+            # while start() is still awaited. Tearing it down NOW would
+            # no-op or misfire shutdown (no consumer/pump, a client that may
+            # be mid-connect), close the tile over the in-flight start, and
+            # free the slot so a queued worker gets admitted beside the
+            # zombie CLI. Defer instead: _spawn executes this stop the
+            # moment start() returns, and only then drains the queue.
+            w.stop_requested = True
+            return (f"{w.project} is still starting, sir — I'll stop it the "
+                    f"moment it's up.")
+        spoken = (f"Stopped {w.project}, sir. Its worktree is preserved "
+                  f"for your review."
+                  if await self._stop_worker(w) else
+                  f"I couldn't stop {w.project} cleanly, sir — "
+                  f"treat it as unknown.")
+        await self._admit_next()
+        return spoken
+
+    async def _stop_worker(self, w: Worker) -> bool:
+        """Lockout → interrupt → disconnect → session_end, shared by stop()
+        and _spawn's deferred stop. False = dirty stop, worker marked lost
+        (UNKNOWN still counts live, so admission stays blocked)."""
         try:
             await asyncio.wait_for(w.shutdown(interrupt_first=True),
                                    STOP_TIMEOUT_S)
             w._apply("session_end")
-            spoken = (f"Stopped {w.project}, sir. Its worktree is preserved "
-                      f"for your review.")
+            return True
         except Exception as e:  # noqa: BLE001 — a dirty stop is reported, not raised
             w._apply("lost", {"reason": f"stop failed: {e}"})
-            spoken = (f"I couldn't stop {w.project} cleanly, sir — "
-                      f"treat it as unknown.")
-        await self._admit_next()
-        return spoken
+            return False
 
     async def _admit_next(self) -> None:
         # No await between this capacity check, the pop, and _spawn's own
@@ -595,7 +656,11 @@ class Fleet:
         if not self.workers and not self.queue:
             return "The fleet is empty, sir."
         now = self._now()
-        parts = [f"{w.project} is {w.machine.state(now).replace('_', ' ').lower()}"
+        # A worker mid-start reads "starting", not the machine's pre-spawned
+        # UNKNOWN — "unknown" is an alarm word reserved for failed probes.
+        parts = [f"{w.project} is "
+                 + ("starting" if w.starting
+                    else w.machine.state(now).replace('_', ' ').lower())
                  for w in self.workers]
         if self.queue:
             parts.append(f"{len(self.queue)} queued")

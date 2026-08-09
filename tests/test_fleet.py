@@ -532,6 +532,158 @@ async def test_a_worktree_timeout_speaks_and_registers_nothing(tmp_path, monkeyp
     assert fleet._pending_spawns == 0                 # the reservation released
 
 
+# ---------- regression: a start() failure must deregister the early-registered worker ----------
+async def test_a_start_failure_deregisters_and_frees_admission(tmp_path, monkeypatch):
+    """The worker joins self.workers BEFORE start() (early registration, so a
+    mid-connect SessionStart hook matches). If start() itself fails, the
+    deregistration line is the only thing between a failed spawn and a phantom
+    UNKNOWN worker that counts live forever and wedges admission at
+    max_workers=1. The worktree-timeout test above fails BEFORE registration,
+    so only this test covers that revert."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    inner = fleet._client_factory
+
+    def exploding_factory(options):
+        c = inner(options)
+
+        async def connect():
+            await asyncio.sleep(0)        # a real suspension INSIDE start()
+            raise RuntimeError("CLI refused to boot")
+        c.connect = connect
+        return c
+
+    fleet._client_factory = exploding_factory
+    spoken = await fleet.spawn("soccer", repo(tmp_path), "task")
+    assert "failed" in spoken.lower()     # the spoken failure, never a raise
+    assert fleet.workers == []            # the phantom was deregistered
+    assert fleet._pending_spawns == 0     # and the reservation released
+    # Admission is NOT wedged: a healthy spawn is admitted, not queued.
+    fleet._client_factory = inner
+    spoken2 = await fleet.spawn("alethic", repo(tmp_path, "alethic"), "task two")
+    try:
+        assert spoken2.startswith("On it")
+        assert len(fleet.workers) == 1 and len(fleet.queue) == 0
+    finally:
+        await cleanup(fleet)
+
+
+# ---------- regression: stop() during connect() must not close a tile over a live CLI ----------
+async def test_stop_during_connect_defers_and_never_leaves_a_zombie(tmp_path, monkeypatch):
+    """Early registration makes a half-started worker visible to _find. A stop
+    landing while start() still awaits connect() used to no-op shutdown, close
+    the tile (CLOSED), speak "Stopped", and free the slot — while the in-flight
+    start connected a real CLI behind the dead tile and a queued worker was
+    admitted beside it. The stop must DEFER: refuse to tear down mid-start,
+    then execute the moment start() returns, and only then admit the queue."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    path = repo(tmp_path, "soccer")
+    gate = asyncio.Event()
+    events: list[str] = []
+    inner = fleet._client_factory
+
+    def gated_factory(options):
+        c = inner(options)
+        idx = len(clients)
+        orig_connect, orig_disconnect = c.connect, c.disconnect
+
+        async def connect():
+            if idx == 1:
+                await gate.wait()         # a REAL mid-connect suspension
+            events.append(f"connect-{idx}")
+            await orig_connect()
+
+        async def disconnect():
+            events.append(f"disconnect-{idx}")
+            await orig_disconnect()
+        c.connect, c.disconnect = connect, disconnect
+        return c
+
+    fleet._client_factory = gated_factory
+    spawn_task = asyncio.create_task(fleet.spawn("soccer", path, "task one"))
+    try:
+        for _ in range(100):              # let spawn register + park in connect
+            if fleet.workers:
+                break
+            await asyncio.sleep(0)
+        assert fleet.workers, "spawn never registered its worker"
+        queued = await fleet.spawn("alethic", repo(tmp_path, "alethic"),
+                                   "task two")
+        assert "queued" in queued.lower()
+        # Cosmetics while starting: status_line must not read "unknown", and
+        # steer must not claim delivery into a pump that does not exist.
+        assert "soccer is starting" in fleet.status_line()
+        assert "still starting" in fleet.steer_path(path, "also lint")
+        stop_spoken = await fleet.stop(path)
+        assert "still starting" in stop_spoken        # deferred, not "Stopped"
+        soccer = fleet.workers[0]
+        assert soccer.machine.base != CLOSED          # tile NOT closed early
+        assert len(fleet.queue) == 1                  # queue NOT drained early
+        gate.set()                                    # connect finishes AFTER the stop
+        spawn_spoken = await asyncio.wait_for(spawn_task, 5)
+        # Spawn never speaks a false "On it" over a worker the user stopped.
+        assert not spawn_spoken.startswith("On it")
+        assert "stopped" in spawn_spoken.lower()
+        assert soccer.machine.base == CLOSED
+        assert clients[0].disconnected is True        # no zombie subprocess
+        assert soccer.consumer.done() and soccer.pump.done()
+        assert "also lint" not in clients[0].queries  # steer refused, not dropped
+        # The queued worker was admitted only AFTER the stopped CLI was gone.
+        assert events.index("disconnect-1") < events.index("connect-2")
+        alethic = next(w for w in fleet.workers if w.project == "alethic")
+        assert alethic.machine.base == ACTIVE_TURN
+        assert len(fleet.live) == 1                   # exactly one real worker
+    finally:
+        gate.set()
+        spawn_task.cancel()
+        await asyncio.gather(spawn_task, return_exceptions=True)
+        await cleanup(fleet)
+
+
+async def test_stop_in_the_query_window_is_not_spoken_over_by_on_it(tmp_path, monkeypatch):
+    """After connect() the consumer/pump exist, so a stop during the awaited
+    query() takes the NORMAL teardown path — but start() then returns into
+    _spawn, which must not announce "On it" over the already-CLOSED tile."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    path = repo(tmp_path, "soccer")
+    gate = asyncio.Event()
+    inner = fleet._client_factory
+
+    def gated_factory(options):
+        c = inner(options)
+        orig_query = c.query
+
+        async def query(text):
+            if not c.queries:             # first query: the spawn task text
+                await gate.wait()         # a REAL suspension inside start()
+            await orig_query(text)
+        c.query = query
+        return c
+
+    fleet._client_factory = gated_factory
+    spawn_task = asyncio.create_task(fleet.spawn("soccer", path, "task one"))
+    try:
+        for _ in range(100):              # park inside the gated query()
+            if fleet.workers and fleet.workers[0].consumer is not None:
+                break
+            await asyncio.sleep(0)
+        w = fleet.workers[0]
+        assert w.consumer is not None     # past connect: the normal stop path
+        stop_spoken = await fleet.stop(path)
+        assert "Stopped soccer" in stop_spoken
+        assert w.machine.base == CLOSED
+        assert clients[0].disconnected is True
+        gate.set()                                    # query() resumes now
+        spawn_spoken = await asyncio.wait_for(spawn_task, 5)
+        assert not spawn_spoken.startswith("On it")   # never a false success
+        assert "stopped" in spawn_spoken.lower()
+        assert w.machine.base == CLOSED
+    finally:
+        gate.set()
+        spawn_task.cancel()
+        await asyncio.gather(spawn_task, return_exceptions=True)
+        await cleanup(fleet)
+
+
 async def test_session_start_during_connect_is_not_an_unknown_session(tmp_path, monkeypatch):
     """The CLI's SessionStart hook can POST while connect() is still awaited;
     the fleet's own spawn must never be published as fleet.unknown_session."""
