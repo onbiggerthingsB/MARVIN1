@@ -202,6 +202,60 @@ async def test_a_mixed_polarity_answer_asks_and_leaves_the_approval_pending():
         task.cancel()
 
 
+async def test_a_refusal_the_router_never_heard_of_never_runs_the_tool():
+    """End to end, through the real brain: a refusal built from vocabulary the
+    guard does not know ("yeah, kill soccer", "sure, halt soccer") used to
+    resolve to APPROVED and deliver True to the worker's can_use_tool future —
+    a real `rm -rf build`. Nothing may be delivered, and the card stays up."""
+    for said in ("sure, halt soccer", "yeah, kill soccer", "sure, pause soccer",
+                 "okay, forget soccer", "yeah, don’t run soccer"):
+        bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+        router, fleet = Router(), FakeFleet()
+        router.open_approval("soccer", "Bash: rm -rf build",
+                             now=time.time(), path="/p/soccer")
+        task = await brain(bus, butler, spk, router=router,
+                           registry=confirmed_registry("soccer"), fleet=fleet)
+        cid, q = bus.subscribe()
+        bus.publish("command.received", {"text": said})
+        await asyncio.sleep(0.05)
+        resolved = []
+        while not q.empty():
+            ev = q.get_nowait()
+            if ev and ev["type"] == "approval.resolved":
+                resolved.append(ev["data"])
+        bus.unsubscribe(cid)
+        assert resolved == [], said
+        assert all(c[0] != "deliver" for c in fleet.calls), said
+        assert len(router.pending_approvals()) == 1, said
+        assert "Approved, sir." not in spk.spoke, said
+        assert any("yes and a no" in s for s in spk.spoke), said
+        task.cancel()
+
+
+async def test_a_publish_failure_cannot_speak_over_a_delivered_approval():
+    """The publish now sits OUTSIDE the try that owns delivery. A raising
+    bus.publish must never produce "approval handling failed on my side" for a
+    tool call that WAS approved and is already running."""
+    class BoomOnResolved(EventBus):
+        def publish(self, type_, data=None):
+            if type_ == "approval.resolved":
+                raise RuntimeError("publish broke")
+            return super().publish(type_, data)
+    bus, butler, spk = BoomOnResolved(), FakeButler(), FakeSpeaker()
+    router, fleet = Router(), FakeFleet()
+    a = router.open_approval("soccer", "Bash: npm test",
+                             now=time.time(), path="/p/soccer")
+    task = await brain(bus, butler, spk, router=router,
+                       registry=confirmed_registry("soccer"), fleet=fleet)
+    bus.publish("command.received", {"text": "yes, go ahead"})
+    await asyncio.sleep(0.05)
+    assert ("deliver", a.nonce, True) in fleet.calls        # the tool IS running
+    assert not any("failed" in s.lower() for s in spk.spoke)
+    assert "Approved, sir." in spk.spoke                    # the honest sentence
+    assert not task.done()                                  # and the brain lives
+    task.cancel()
+
+
 async def test_a_deliver_failure_speaks_truth_and_publishes_nothing():
     """Voice path, deliver_approval raises. Deliver runs FIRST (the /approval
     order), so no approval.resolved goes out for a worker that never got the

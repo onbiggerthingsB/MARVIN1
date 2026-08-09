@@ -1,3 +1,5 @@
+import re
+
 import pytest
 
 from server.discovery import Candidate
@@ -314,3 +316,245 @@ def test_pull_it_up_is_a_bare_pull_up_only_with_a_fleet():
     assert Router().parse("pull it up", r) is None
     c = Router().parse("pull it up", r, has_fleet=True)
     assert c.verb == "pull_up" and c.project is None and c.path is None
+
+
+# ---------- addressed approvals must account for EVERY word (whitelist) ----------
+# The mixed-polarity guard above is a BLACKLIST: it fires only when a token
+# from _DENY_WORDS is present. A refusal word outside that set does not trip
+# it — it merely makes the utterance ADDRESSED, and the addressed branch then
+# handed back the named project's approval with deny=False. Every utterance
+# below is a plain refusal that resolved to "approved" on a card whose tool
+# was `rm -rf build`. Adding these words to _DENY_WORDS would be a fifth
+# blacklist; the fix is that an addressed utterance may resolve ONLY when the
+# match explains every non-filler word in it.
+
+DANGEROUS = "Bash: rm -rf build"
+
+
+def one_pending(tool=DANGEROUS):
+    router = Router()
+    router.open_approval("soccer", tool, now=NOW, path="/p/soccer")
+    return router
+
+
+# Verified live bypasses on e647617 — every one returned ("approved", <rm -rf>).
+UNKNOWN_REFUSALS = [
+    "sure, halt soccer",           # _STOP's own verb, absent from _DENY_WORDS
+    "yeah, kill soccer",           # ditto
+    "yeah, abort soccer",
+    "yes, hold off on soccer",
+    "okay, forget soccer",
+    "sure, leave soccer alone",
+    "yeah, back out of soccer",
+    "sure, pause soccer",
+    "yeah, never mind soccer",
+    "sure, not soccer",
+    "yes, wait on soccer",
+    "yeah, don’t run soccer",  # U+2019: _WORD split "don’t" into don + t
+]
+
+
+@pytest.mark.parametrize("said", UNKNOWN_REFUSALS)
+def test_a_refusal_the_guard_never_heard_of_never_approves(said):
+    router = one_pending()
+    state, appr = router.resolve_approval(said, now=NOW + 5)
+    assert state == "unclear" and appr is None, said
+    assert len(router.pending_approvals()) == 1, said     # card stays on screen
+
+
+@pytest.mark.parametrize("said", UNKNOWN_REFUSALS)
+def test_the_bypasses_reach_the_resolver_at_all(said):
+    # The premise of the bug: router.parse claims none of these, so the brain
+    # really does hand them to resolve_approval. If parse ever started
+    # claiming them, the test above would be proving nothing.
+    assert Router().parse(said, reg("soccer")) is None, said
+
+
+def _stop_verbs():
+    """The stop verbs _STOP ITSELF defines, read off the compiled pattern so a
+    verb added there is automatically covered by the property below."""
+    from server.router import _STOP
+    m = re.search(r"\(\?:([a-z|\s]+)\)", _STOP.pattern)
+    assert m, f"cannot read the verb alternation out of {_STOP.pattern!r}"
+    return [v.strip() for v in m.group(1).split("|") if v.strip()]
+
+
+def test_no_stop_verb_can_ride_an_affirm_opener():
+    """PROPERTY, not a word list. The last round's matrix was drawn from
+    _DENY's own vocabulary, which is exactly why it could not see `halt` and
+    `kill`. This one is drawn from _STOP, so the next verb added there cannot
+    silently reopen the hole."""
+    from server.router import _STOP
+    verbs = _stop_verbs()
+    assert len(verbs) >= 4, verbs                 # derivation did not degrade
+    for verb in verbs:
+        assert _STOP.match(f"{verb} soccer"), verb   # faithful to the real regex
+        router = one_pending()
+        state, appr = router.resolve_approval(f"sure, {verb} soccer", now=NOW + 5)
+        assert state != "approved", f"{verb!r} rode an affirm opener to approval"
+        assert appr is None, verb
+        assert len(router.pending_approvals()) == 1, verb
+
+
+# Refusal vocabulary the guard does NOT know — none of these appear in
+# _DENY_WORDS, _AFFIRM_WORDS, _BARE_FILLER, the project name, or the tool.
+@pytest.mark.parametrize("verb", [
+    "abort", "pause", "forget", "scrap", "skip", "hold", "ditch", "nix",
+    "quit", "shelve", "freeze", "revoke", "withdraw", "undo", "retract",
+    "veto", "decline", "refuse", "block", "terminate", "suspend", "cease",
+    "desist", "rescind", "unapprove", "disregard", "ignore", "bail",
+    "scratch", "kibosh", "squash", "yank", "postpone", "defer",
+])
+def test_any_unaccounted_word_refuses_to_resolve(verb):
+    """The whole point of a whitelist: it holds for refusal words nobody has
+    thought of yet. Not one of these is known to the router."""
+    router = one_pending()
+    state, appr = router.resolve_approval(f"sure, {verb} soccer", now=NOW + 5)
+    assert state == "unclear" and appr is None, verb
+    assert len(router.pending_approvals()) == 1, verb
+
+
+def test_the_blacklist_genuinely_cannot_see_these():
+    """Documents WHICH mechanism does the work. _polarity_conflict is blind to
+    every one of these — if this ever starts returning True, someone widened
+    _DENY_WORDS again and the whitelist stopped being what protects us."""
+    from server.router import _polarity_conflict
+    for said in ("sure, halt soccer", "yeah, kill soccer", "sure, pause soccer",
+                 "okay, forget soccer", "sure, not soccer"):
+        assert _polarity_conflict(said) is False, said
+
+
+# ---------- the whitelist must NOT over-block legitimate consent ----------
+@pytest.mark.parametrize("said", [
+    "yes", "go ahead", "approve", "do it", "yeah", "yep", "sure", "okay",
+    "approved", "yes, go ahead", "sure, go ahead, sir", "approve that now",
+])
+def test_plain_approvals_still_approve(said):
+    router = one_pending("npm test")
+    state, appr = router.resolve_approval(said, now=NOW + 5)
+    assert state == "approved" and appr is not None, said
+    assert router.pending_approvals() == [], said
+
+
+@pytest.mark.parametrize("said", [
+    "no", "stop", "cancel", "cancel that", "no, don't do it now, please",
+    "nope", "deny", "reject", "no, deny that", "don't", "no thank you sir",
+])
+def test_plain_denials_still_deny(said):
+    router = one_pending("npm test")
+    state, appr = router.resolve_approval(said, now=NOW + 5)
+    assert state == "denied" and appr is not None, said
+    assert router.pending_approvals() == [], said
+
+
+def test_an_addressed_approval_that_accounts_for_everything_still_resolves():
+    router = Router()
+    router.open_approval("soccer", "npm test", now=NOW)
+    router.open_approval("alethic", "rm -rf build", now=NOW)
+    state, appr = router.resolve_approval("approve soccer npm test", now=NOW + 5)
+    assert state == "approved" and appr.project == "soccer"
+    assert [a.project for a in router.pending_approvals()] == ["alethic"]
+
+
+def test_naming_the_wrong_tool_no_longer_approves_the_right_project():
+    """Found by the whitelist, not by the bug report. With ONE pending
+    approval, `matched` is decided by the project name alone — so "approve
+    soccer npm test" spoken at a card reading `rm -rf build` used to approve
+    the rm. The human named a tool that is not the pending one; that is not
+    consent to the pending one."""
+    router = one_pending(DANGEROUS)
+    state, appr = router.resolve_approval("approve soccer npm test", now=NOW + 5)
+    assert state == "unclear" and appr is None
+    assert len(router.pending_approvals()) == 1
+    # and the same words DO approve when they describe the real tool
+    ok = one_pending("npm test")
+    assert ok.resolve_approval("approve soccer npm test", now=NOW + 5)[0] == "approved"
+
+
+def test_an_addressed_denial_that_accounts_for_everything_still_resolves():
+    router = one_pending()
+    state, appr = router.resolve_approval("deny soccer bash rm -rf build",
+                                          now=NOW + 5)
+    assert state == "denied" and appr.project == "soccer"
+    assert router.pending_approvals() == []
+
+
+def test_a_spoken_full_path_still_singles_out_a_twin():
+    """Path tokens are part of what the match explains, so the one utterance
+    that CAN tell twin checkouts apart is not blocked by the whitelist."""
+    router = Router()
+    router.open_approval("jarvis", "npm test", now=NOW, path="/Users/likerun/jarvis")
+    b = router.open_approval("jarvis", "npm test", now=NOW,
+                             path="/Users/likerun/Desktop/jarvis")
+    state, appr = router.resolve_approval(
+        "approve jarvis npm test /Users/likerun/Desktop/jarvis", now=NOW + 5)
+    assert state == "approved" and appr is b
+
+
+@pytest.mark.parametrize("said", [
+    "sure, cancel that", "yeah, stop it", "sure, stop soccer", "no, go ahead"])
+def test_the_previously_fixed_mixed_polarity_cases_stay_fixed(said):
+    router = one_pending()
+    state, appr = router.resolve_approval(said, now=NOW + 5)
+    assert state == "unclear" and appr is None, said
+    assert len(router.pending_approvals()) == 1, said
+
+
+# ---------- curly apostrophes tokenize like their ASCII twins ----------
+@pytest.mark.parametrize("curly,ascii_", [
+    ("no, don’t", "no, don't"),
+    ("don’t do it", "don't do it"),
+    ("no, don’t do it now, please", "no, don't do it now, please"),
+])
+def test_a_curly_apostrophe_resolves_exactly_like_a_straight_one(curly, ascii_):
+    """Deepgram nova-3 emits U+2019. _WORD is [a-z']+, so "don’t" used to split
+    into "don" + "t" and the curly form of even the PINNED vocabulary escaped
+    every gate."""
+    got = [one_pending("npm test").resolve_approval(s, now=NOW + 5)[0]
+           for s in (curly, ascii_)]
+    assert got[0] == got[1] == "denied", (curly, got)
+
+
+def test_curly_apostrophes_do_not_change_the_addressed_shape():
+    from server.router import bare_yes_no, is_addressed
+    assert bare_yes_no("no, don’t") == bare_yes_no("no, don't") is True
+    assert is_addressed("don’t") == is_addressed("don't") is False
+
+
+# ---------- why the BARE branch may keep using the blacklist ----------
+def test_every_refusal_a_bare_utterance_can_carry_is_known_to_the_guard():
+    """The bare branch is itself whitelisted — a bare utterance is one whose
+    every word is in _BARE_FILLER — so _polarity_conflict's blacklist is
+    COMPLETE over that closed vocabulary, but only while this holds. If a
+    refusal word is ever added to _BARE_FILLER without being added to
+    _DENY_WORDS, "sure, <that word>" becomes bare, unconflicted, and
+    approved."""
+    from server.router import (_AFFIRM_PHRASES, _AFFIRM_WORDS, _BARE_FILLER,
+                               _DENY_WORDS, _POLITE)
+    assert _DENY_WORDS <= _BARE_FILLER
+    assert _AFFIRM_WORDS <= _BARE_FILLER
+    # and the filler set is BUILT from those vocabularies plus polarity-free
+    # politeness, so the invariant cannot drift by hand-editing one list
+    assert _BARE_FILLER == (_AFFIRM_WORDS | _DENY_WORDS | _POLITE
+                            | {w for p in _AFFIRM_PHRASES for w in p})
+
+
+# ---------- the two known over-blocks from the last round ----------
+def test_a_trailing_okay_tag_is_acknowledgment_not_consent():
+    """"cancel that, okay?" was a working denial on 96b3f70 and the last round
+    turned it into "unclear" — English mostly uses a TRAILING ok/okay as a tag,
+    not as consent. Dropping trailing-tag affirm evidence can only ever turn a
+    conflict into a DENIAL (the outcome polarity comes from the opener, which
+    is a refusal in every such utterance), never into an approval."""
+    for said in ("cancel that, okay?", "no, that's ok", "stop, ok?"):
+        router = one_pending()
+        state, appr = router.resolve_approval(said, now=NOW + 5)
+        assert state == "denied", (said, state)
+        assert appr.project == "soccer"
+
+
+def test_a_leading_okay_on_a_refusal_still_fails_closed():
+    # The tag exception is TRAILING-only. "okay, cancel that" keeps both
+    # polarities and must still refuse to resolve.
+    router = one_pending()
+    assert router.resolve_approval("okay, cancel that", now=NOW + 5) == ("unclear", None)

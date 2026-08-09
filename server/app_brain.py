@@ -333,6 +333,7 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                 # fault (or a contract-violating ("approved", None) return)
                 # raised straight out of the loop and killed the brain.
                 state, approval, resolving = "none", None, False
+                resolved_event = None
                 if router is not None:
                     try:
                         if (router.pending_approvals()
@@ -356,9 +357,20 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                                     # fault, handled by this guard.
                                     fleet.deliver_approval(approval.nonce,
                                                            state == "approved")
-                                bus.publish("approval.resolved", {
+                                # The payload is BUILT here (the approval
+                                # dereferences stay inside the guard — a
+                                # contract-violating ("approved", None) return
+                                # is the class of bug this try exists for) but
+                                # PUBLISHED below, outside it. A publish that
+                                # raised in here reached the handler's
+                                # `resolving` branch and spoke "approval
+                                # handling failed on my side" over a tool call
+                                # that was in fact approved and already
+                                # running — the last contradictory-sentence
+                                # path in this loop.
+                                resolved_event = {
                                     "outcome": state, "project": approval.project,
-                                    "tool": approval.tool, "nonce": approval.nonce})
+                                    "tool": approval.tool, "nonce": approval.nonce}
                     except Exception as e:  # noqa: BLE001 — a router fault must never kill the brain
                         bus.publish("butler.error",
                                     {"reason": f"approval handling failed: {e}"})
@@ -376,6 +388,18 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                                          "screen.")
                             continue
                         state, approval = "none", None
+                if resolved_event is not None:
+                    # Console notification only — the decision is already with
+                    # the worker and the tool is already running. Its failure
+                    # may cost the card an update; it may NOT cost the brain
+                    # (an unguarded raise here ends the loop) and it may NOT
+                    # turn into a spoken failure, because "Approved, sir." is
+                    # the truth at this point. Nothing to report it THROUGH
+                    # either: the bus is the thing that just failed.
+                    try:
+                        bus.publish("approval.resolved", resolved_event)
+                    except Exception:  # noqa: BLE001 — see above
+                        pass
                 if state in ("approved", "denied"):
                     await _speak("Approved, sir." if state == "approved"
                                  else "Denied, sir.")

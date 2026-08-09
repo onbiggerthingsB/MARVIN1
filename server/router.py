@@ -19,7 +19,12 @@ _SPAWN = re.compile(
     r"\s*[:,]\s*(?P<task>.+)$", re.I)
 _STEER = re.compile(r"^\s*tell\s+(?P<project>.+?)\s+to\s+(?P<task>.+)$", re.I)
 _PULL_UP = re.compile(r"^\s*(?:pull\s+up|show\s+me|open)\s+(?P<project>.+?)\s*$", re.I)
-_STOP = re.compile(r"^\s*(?:stop|halt|cancel|kill)\s+(?P<project>.+?)\s*$", re.I)
+# Named so the fail-closed property test can enumerate them: every verb here
+# is a REFUSAL when it lands on a pending approval instead of on a worker, and
+# only two of them ("stop", "cancel") happen to also live in _DENY_WORDS.
+_STOP_VERBS = ("stop", "halt", "cancel", "kill")
+_STOP = re.compile(r"^\s*(?:" + "|".join(_STOP_VERBS)
+                   + r")\s+(?P<project>.+?)\s*$", re.I)
 _CAPTURE = re.compile(r"^\s*(?:note|capture|remember)\s+(?:that\s+)?(?P<text>.+)$", re.I)
 _STATUS = re.compile(r"^\s*(?:what'?s|what is)\s+(?:running|the fleet|going on)\b.*$", re.I)
 _PULL_IT = re.compile(r"^\s*pull\s+(?:it|that)\s+up\s*[.!?]*\s*$", re.I)
@@ -32,6 +37,40 @@ _TRADE = re.compile(
 
 _AFFIRM = re.compile(r"^\s*(?:yes|yeah|yep|sure|ok|okay|go ahead|do it|approve[d]?)\b", re.I)
 _DENY = re.compile(r"^\s*(?:no|nope|deny|don'?t|stop|cancel|reject)\b", re.I)
+
+# ---------- one tokenizer, one normalization, for every consent gate ----------
+# Deepgram nova-3 emits the TYPOGRAPHIC right single quote (U+2019) inside
+# contractions, and _WORD is [a-z']+ — so "don’t" tokenized as "don" + "t",
+# and the curly form of even the PINNED refusal vocabulary walked past every
+# gate ("yeah, don’t run soccer" resolved to approved). Fold every apostrophe
+# variant onto ASCII "'" BEFORE anything matches or tokenizes, in ONE place
+# that all three gates (this module, onboarding, finance_gate) route through.
+#
+# Nothing else in an STT transcript needs folding: nova-3 emits ASCII letters
+# and ASCII digits, and every other typographic character it can produce
+# (…, –, —, curly DOUBLE quotes) is already a separator to both tokenizers and
+# to every pattern here, so it changes no decision. The map is 1:1 in
+# characters, so match offsets on normalized text still index the original.
+_APOSTROPHES = "’‘ʼʹ′＇"
+_APOSTROPHE_MAP = {ord(c): "'" for c in _APOSTROPHES}
+
+_WORD = re.compile(r"[a-z']+")
+_TOKEN = re.compile(r"[a-z0-9]+")
+
+
+def _normalized(text: str) -> str:
+    return (text or "").translate(_APOSTROPHE_MAP)
+
+
+def _words(text: str) -> list[str]:
+    """Apostrophe-preserving words ("don't" stays one word)."""
+    return _WORD.findall(_normalized(text).lower())
+
+
+def _tokens(text: str) -> list[str]:
+    """Alphanumeric tokens, for matching against paths and tool strings."""
+    return _TOKEN.findall(_normalized(text).lower())
+
 
 # Mixed-polarity guard (Task 8 review). _AFFIRM and _DENY anchor on the FIRST
 # word, so "sure, cancel that" reads as an affirmation while carrying a
@@ -48,45 +87,70 @@ _DENY_WORDS = frozenset({"no", "nope", "deny", "denied", "don't", "dont",
 # and must stay a conflict, while "don't go ahead" is a plain denial.
 _AFFIRM_PHRASES = frozenset({("go", "ahead"), ("do", "it")})
 _NEGATORS = frozenset({"don't", "dont", "not", "never"})
+# English mostly uses a TRAILING "ok"/"okay" as a tag, not as consent —
+# "cancel that, okay?", "no, that's ok". Discounting affirm evidence in that
+# one position can only ever turn a conflict into a DENIAL, never into an
+# approval: the resolved polarity comes from _DENY/_AFFIRM on the FIRST word,
+# and any utterance opening with an affirm word already supplies unassailable
+# affirm evidence at index 0 (which is never the last index once a deny word
+# is also present). So this exception cannot open a fail-open path.
+_TAG_AFFIRM = frozenset({"ok", "okay"})
+
+# Politeness that addresses nothing and carries NO polarity. Kept separate
+# from the two vocabularies above so _BARE_FILLER can be DERIVED rather than
+# hand-copied — the previous hand-copied list is what made it possible for the
+# two to drift.
+_POLITE = frozenset({"that", "that's", "thats", "this", "please", "sir",
+                     "now", "the", "a", "and", "then", "thank", "thanks",
+                     "you"})
+
+# Words that may appear in a BARE affirmation/denial without addressing
+# anything specific ("yes, go ahead", "no, don't do it now, please").
+# Any other alphabetic word means the utterance names something, and it may
+# then only resolve an approval whose match explains every word in it.
+_BARE_FILLER = (_AFFIRM_WORDS | _DENY_WORDS | _POLITE
+                | frozenset(w for phrase in _AFFIRM_PHRASES for w in phrase))
 
 
 def _polarity_conflict(text: str) -> bool:
     """True when one utterance carries BOTH consent polarities — "sure,
     cancel that", "yeah, stop it", "no, go ahead". resolve_approval must
-    FAIL CLOSED on that shape: resolve nothing, let the brain ask."""
-    words = _WORD.findall(text.lower())
-    deny = any(w in _DENY_WORDS for w in words)
-    if not deny:
+    FAIL CLOSED on that shape: resolve nothing, let the brain ask.
+
+    This is a BLACKLIST (it fires only on _DENY_WORDS) and it is sound ONLY
+    over the closed vocabulary of _BARE_FILLER, where every refusal word is by
+    construction a _DENY_WORDS member. Outside that vocabulary it is blind —
+    "halt", "kill", "pause" trip nothing — which is why the addressed branch
+    is guarded by _unexplained() instead."""
+    words = _words(text)
+    if not any(w in _DENY_WORDS for w in words):
         return False
+    last = len(words) - 1
     for i, w in enumerate(words):
         if i > 0 and words[i - 1] in _NEGATORS:
             continue                       # "don't approve", "don't do it"
+        if i == last and i > 0 and w in _TAG_AFFIRM:
+            continue                       # "cancel that, okay?" — a tag
         if w in _AFFIRM_WORDS:
             return True
         if i + 1 < len(words) and (w, words[i + 1]) in _AFFIRM_PHRASES:
             return True
     return False
 
-# Words that may appear in a BARE affirmation/denial without addressing
-# anything specific ("yes, go ahead", "no, don't do it now, please").
-# Any other alphabetic token means the utterance names something, and it
-# may then only resolve an approval it actually matches.
-_BARE_FILLER = frozenset({
-    # affirm/deny vocabulary
-    "yes", "yeah", "yep", "sure", "ok", "okay", "go", "ahead", "do", "it",
-    "approve", "approved", "no", "nope", "deny", "denied", "don't", "dont",
-    "stop", "cancel", "reject",
-    # polite filler that addresses nothing
-    "that", "this", "please", "sir", "now", "the", "a", "and", "then",
-})
 
-_WORD = re.compile(r"[a-z']+")
-_TOKEN = re.compile(r"[a-z0-9]+")
+def _unexplained(text: str, vocabulary) -> list[str]:
+    """The words of `text` that `vocabulary` does not account for.
+
+    The one mechanism behind both consent gates. Empty means the utterance
+    said NOTHING the match cannot explain; anything left over means the
+    speaker said something this code does not understand, and consent must
+    never be inferred from an utterance we only partly understood."""
+    return [w for w in _words(text) if w not in vocabulary]
 
 
 def _is_addressed(text: str) -> bool:
     """True when the utterance names something beyond a bare yes/no."""
-    return any(w not in _BARE_FILLER for w in _WORD.findall(text.lower()))
+    return bool(_unexplained(text, _BARE_FILLER))
 
 
 def is_addressed(text: str) -> bool:
@@ -103,7 +167,7 @@ def bare_yes_no(text: str) -> bool:
     own TERMINALLY. Addressed utterances ("approve soccer npm test", "stop
     soccer") keep flowing to the router: naming something is positive evidence
     the speaker is not answering the pending question."""
-    t = (text or "").strip()
+    t = _normalized((text or "").strip())
     return bool((_AFFIRM.match(t) or _DENY.match(t)) and not _is_addressed(t))
 
 
@@ -111,17 +175,40 @@ def _mentions_tool(tool: str, spoken_tokens: set[str]) -> bool:
     """Token-overlap tool match: every token of the tool appears in the
     utterance ("approve soccer npm test" mentions "npm test" but not
     "rm -rf build"). Case-insensitive, punctuation-insensitive."""
-    tool_tokens = _TOKEN.findall(tool.lower())
+    tool_tokens = _tokens(tool)
     return bool(tool_tokens) and all(t in spoken_tokens for t in tool_tokens)
+
+
+def _approval_vocabulary(a) -> frozenset[str]:
+    """Every word an addressed utterance may contain and still resolve `a`.
+
+    THE WHITELIST. An addressed utterance names something, so it may only
+    resolve an approval it matched — but "matched" was a substring test on the
+    project name, which says nothing about the REST of the sentence. "yeah,
+    kill soccer" matched soccer and approved an `rm -rf`. The rule instead: the
+    match must account for every word said — the project name, the tool, the
+    checkout path, plus the polarity vocabulary and politeness in
+    _BARE_FILLER. A word explained by NONE of those is a word this code did
+    not understand, and consent is never inferred from that.
+
+    Whitelists degrade in the safe direction. An unknown refusal ("halt",
+    "pause", or whatever the next one turns out to be) leaves a leftover word
+    and the approval stays pending; an unknown POLITENESS costs one clarifying
+    question. A blacklist degrades the other way — four rounds of this bug
+    family are four demonstrations."""
+    vocabulary = set(_BARE_FILLER)
+    for said in (a.project, a.tool, a.path):
+        vocabulary.update(_words(said or ""))
+    return frozenset(vocabulary)
 
 
 def _distinct_path_tokens(p, matches) -> set[str]:
     """Tokens of p's path that appear in NO other match's path — the words that
     can single it out ("desktop" for /Users/likerun/Desktop/jarvis)."""
-    mine = set(_TOKEN.findall(p.path.lower()))
+    mine = set(_tokens(p.path))
     for other in matches:
         if other is not p:
-            mine -= set(_TOKEN.findall(other.path.lower()))
+            mine -= set(_tokens(other.path))
     return mine
 
 
@@ -141,7 +228,7 @@ def _label(p, matches) -> str:
         # Prefer a whole path component that is distinct on its own — the way
         # a person names a place ("Desktop"), scanning from the parent upward.
         for part in reversed(PurePosixPath(p.path).parent.parts):
-            tokens = set(_TOKEN.findall(part.lower()))
+            tokens = set(_tokens(part))
             if tokens and tokens <= distinct:
                 return f"{p.name} in {part}"
         return f"{p.name} in {sorted(distinct)[0]}"
@@ -187,7 +274,7 @@ class Router:
             if len(by_path) == 1:
                 matches = by_path
             else:
-                q_tokens = set(_TOKEN.findall(lowered))
+                q_tokens = set(_tokens(lowered))
                 narrowed = [m for m in matches
                             if q_tokens & _distinct_path_tokens(m, matches)]
                 if len(narrowed) == 1:
@@ -199,7 +286,10 @@ class Router:
         return None, []
 
     def parse(self, spoken: str, registry, has_fleet: bool = False) -> Command | None:
-        text = (spoken or "").strip()
+        # Normalized before ANY pattern runs: several patterns here spell an
+        # apostrophe inline ("what'?s", "don'?t"), and nova-3's curly form
+        # would slip past every one of them.
+        text = _normalized((spoken or "").strip())
         if not text:
             return None
 
@@ -273,7 +363,7 @@ class Router:
         return a
 
     def resolve_approval(self, spoken: str, now: float) -> tuple[str, Approval | None]:
-        text = (spoken or "").strip()
+        text = _normalized((spoken or "").strip())
 
         # FIX 3: affirm/deny FIRST. Unrelated speech is never an approval
         # answer, and must not leak approval state ("ambiguous"/"expired")
@@ -327,6 +417,16 @@ class Router:
                 # precisely by nonce (take_nonce); voice refuses.
                 return ("ambiguous", None)
             target = matched[0]
+            # THE WHITELIST. Matching the project name is not the same as
+            # understanding the sentence: "yeah, kill soccer" matched soccer
+            # and approved its `rm -rf build`. An addressed utterance resolves
+            # only when the match explains EVERY word in it (see
+            # _approval_vocabulary). One unaccounted-for word — a refusal verb
+            # nobody has added to a list yet, or anything else — and we say so
+            # instead of guessing: "unclear" leaves the approval pending and
+            # the card on screen for the brain to ask about.
+            if _unexplained(text, _approval_vocabulary(target)):
+                return ("unclear", None)
         else:
             # A bare "yes"/"no" can only answer a single unambiguous question.
             if len(self._approvals) > 1:
