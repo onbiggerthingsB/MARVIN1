@@ -55,6 +55,14 @@ def _is_addressed(text: str) -> bool:
     return any(w not in _BARE_FILLER for w in _WORD.findall(text.lower()))
 
 
+def is_addressed(text: str) -> bool:
+    """Public form of _is_addressed for the other consent gates (onboarding's
+    repo confirmation). Naming anything beyond the bare yes/no stop-words is
+    positive evidence the speaker is NOT answering the pending question — one
+    vocabulary, defined once here, so the gates can never drift apart."""
+    return _is_addressed(text or "")
+
+
 def bare_yes_no(text: str) -> bool:
     """A bare affirmation or denial that addresses nothing specific — the
     shape a pending spoken question (repo confirm, data-source confirm) must

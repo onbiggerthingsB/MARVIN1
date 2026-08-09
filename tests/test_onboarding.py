@@ -73,6 +73,31 @@ async def test_affirmative_prefixed_negations_never_confirm(tmp_path, said):
     assert not any(p.confirmed for p in r.projects)
 
 
+@pytest.mark.parametrize("said", [
+    "okay, where did I leave the Tibet study?",
+    "sure, stop soccer",
+    "go ahead and pull up composed",
+    "yes, run the tests in alethic"])
+async def test_an_addressed_request_is_not_a_confirmation(tmp_path, said):
+    # _YES is prefix-anchored, so each of these matches it — but each carries
+    # a real request. Naming something is positive evidence the speaker is not
+    # answering the pending question (router.bare_yes_no's rule).
+    ob, r = seeded(tmp_path)
+    await ob.ask_next()
+    outcome = await ob.handle_reply(said)
+    assert outcome == "ignored"                       # falls through to the router/butler
+    assert not any(p.confirmed for p in r.projects)   # nothing confirmed by a real request
+    assert ob.awaiting                                # the question is still pending
+
+
+@pytest.mark.parametrize("said", ["yes", "yeah", "yep", "yes, that's right", "confirm"])
+async def test_a_plain_yes_still_confirms(tmp_path, said):
+    ob, r = seeded(tmp_path)
+    await ob.ask_next()
+    assert await ob.handle_reply(said) == "confirmed"
+    assert any(p.confirmed for p in r.projects)
+
+
 async def test_mutation_lands_on_the_exact_path_asked_about(tmp_path):
     r = Registry()
     r.merge_candidates([Candidate(path="/one/jarvis", name="jarvis", sources=["a"]),

@@ -15,6 +15,7 @@ from pathlib import Path
 
 from server.discovery import discover
 from server.registry import Project, Registry
+from server.router import is_addressed
 
 # A correction must show POSITIVE evidence: an explicit connector between the
 # negation and the new name. Without one ("No.", "no thanks", "no way"), the
@@ -36,6 +37,28 @@ _NO = re.compile(r"^\s*(?:no|nope|skip|not\s+(?:that|it)|wrong)\b", re.I)
 # that one" — and _YES anchors on that opener, so prefix order alone cannot
 # save us. Confirmation is consent; it must never ride on the first word.
 _NEGATION = re.compile(r"\b(?:no|nope|not|don'?t|wrong|isn'?t)\b", re.I)
+# Punctuation/space between stacked affirmation phrases ("yes, that's right").
+_SEPARATORS = " \t,.;:!?"
+
+
+def _bare_affirmation(text: str) -> bool:
+    """True when the utterance is an affirmation and NOTHING else — the only
+    shape allowed to confirm a repo.
+
+    _YES is prefix-anchored, so "sure, stop soccer" matches it while carrying
+    a stop COMMAND. Consume every leading _YES phrase (spoken confirmations
+    stack them: "yes, that's right"), then apply the router's rule to the
+    remainder: naming anything beyond the bare yes/no stop-words is positive
+    evidence the speaker is NOT answering the pending question (the same
+    principle as router.bare_yes_no). _YES itself supplies the affirmation
+    vocabulary; the router supplies the stop-words — each defined once."""
+    rest = text
+    while True:
+        m = _YES.match(rest)
+        if m is None:
+            break
+        rest = rest[m.end():].lstrip(_SEPARATORS)
+    return not is_addressed(rest)
 
 
 class Onboarding:
@@ -118,6 +141,14 @@ class Onboarding:
                 # rejection, never a confirmation.
                 self._rejected.add(asked.path)
                 outcome = "rejected"
+            elif not _bare_affirmation(text):
+                # "sure, stop soccer" / "okay, where did I leave the Tibet
+                # study?": an affirmative OPENER carrying a real request is
+                # not consent, and confirming would also swallow the request.
+                # Leave outcome "ignored" so the utterance falls through
+                # untouched to the router/butler, and leave self._asking set
+                # so the confirmation stays pending and gets re-asked.
+                pass
             else:
                 self._confirm(asked)
                 outcome = "confirmed"
