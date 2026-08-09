@@ -348,6 +348,45 @@ async def test_confirming_the_source_briefs_immediately(tmp_path):
     task.cancel()
 
 
+async def test_the_confirmed_brief_targets_the_pinned_project_not_a_rederived_one(tmp_path):
+    # Two confirmed finance projects. The gate asked about the SECOND one, so
+    # the yes pins that one — but a re-derived find_finance_project() returns
+    # the FIRST, which is unpinned and would fall back to scanning its newest
+    # readable file: a brief from a source Keke never confirmed (§16). The
+    # confirmed branch must brief the exact project the gate pinned.
+    import json as _json
+    from server.discovery import Candidate as C
+    from server.finance_gate import SourceGate
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    root_a = tmp_path / "quant agent"          # what re-derivation selects
+    root_a.mkdir()
+    (root_a / "decoy.json").write_text(
+        _json.dumps([{"symbol": "AAPL", "shares": 1}]), encoding="utf-8")
+    root_b = tmp_path / "second system"        # what the gate asked about
+    root_b.mkdir()
+    (root_b / "picks.json").write_text(
+        _json.dumps([{"symbol": "TSLA", "shares": 3}]), encoding="utf-8")
+    reg = Registry()
+    reg.merge_candidates([C(path=str(root_a), name="quant agent", sources=["t"]),
+                          C(path=str(root_b), name="second system", sources=["t"])])
+    reg.confirm("quant agent", kind="finance")
+    reg.confirm("second system", kind="finance")
+    gate = SourceGate(bus, reg, tmp_path / "projects.json")
+    proj_b = next(p for p in reg.projects if p.path == str(root_b))
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=reg, finance=gate))
+    await asyncio.sleep(0)
+    await gate.ask(proj_b)                     # question pending for B
+    fut = asyncio.ensure_future(_drain(bus, "finance.brief"))
+    bus.publish("command.received", {"text": "yes"})
+    ev = await fut
+    assert ev["data"]["source"] == str(root_b / "picks.json")   # never the decoy
+    assert proj_b.data_source == str(root_b / "picks.json")
+    assert butler.asked == []
+    task.cancel()
+
+
 async def test_the_brain_survives_a_source_gate_explosion(tmp_path):
     class BoomGate:
         @property

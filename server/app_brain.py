@@ -84,11 +84,15 @@ def speakable(spoken) -> str:
     return text
 
 
-async def _brief_and_publish(bus, registry) -> str:
+async def _brief_and_publish(bus, project) -> str:
     """One place builds the finance turn — the portfolio verb and a
-    just-confirmed source both use it. Returns the spoken line. Callers guard
-    it; the .get() reads keep a shape drift from raising on their own."""
-    brief = await portfolio_brief(find_finance_project(registry)) or {}
+    just-confirmed source both use it, and both name the EXACT project to
+    brief. No re-deriving here: with two confirmed finance projects, a fresh
+    lookup could select the other one — unpinned, so its _collect would fall
+    back to scanning for a file Keke never confirmed (spec §16). Returns the
+    spoken line. Callers guard it; the .get() reads keep a shape drift from
+    raising on their own."""
+    brief = await portfolio_brief(project) or {}
     bus.publish("finance.brief", {
         "rows": brief.get("rows", []),
         "source": brief.get("source"),
@@ -237,9 +241,13 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                     except Exception as e:  # noqa: BLE001 — the gate must not kill the brain
                         bus.publish("butler.error", {"reason": f"source gate failed: {e}"})
                     if outcome == "confirmed":
-                        # The yes doubles as "go": brief from the pinned source now.
+                        # The yes doubles as "go": brief the EXACT project the
+                        # gate just pinned. Re-deriving here could select a
+                        # second confirmed finance project — unpinned, so the
+                        # brief would scan a file Keke never approved (§16).
                         try:
-                            spoken = await _brief_and_publish(bus, registry)
+                            spoken = await _brief_and_publish(
+                                bus, getattr(finance, "confirmed_project", None))
                         except Exception as e:  # noqa: BLE001 — finance must not kill the brain
                             bus.publish("butler.error",
                                         {"reason": f"portfolio brief failed: {_reason(e)}"})
@@ -349,7 +357,7 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                                         f"I couldn't find a readable output file "
                                         f"in {proj.name}, sir.")
                                 else:
-                                    spoken = await _brief_and_publish(bus, registry)
+                                    spoken = await _brief_and_publish(bus, proj)
                             except Exception as e:  # noqa: BLE001 — a finance fault must never kill the brain
                                 bus.publish("butler.error",
                                             {"reason": f"portfolio brief failed: {_reason(e)}"})
