@@ -38,7 +38,7 @@ footer { opacity: 0.6; font-size: 0.8rem; }
 #interrupts .interrupt-head { font-weight: bold; }
 #interrupts .interrupt-note:not(:empty) { font-size: 0.8rem; color: #ffb3ae;
   margin: 0.3rem 0; }
-/* The FULL command, unelided — the only surface in JARVIS that shows it.
+/* The FULL command, unelided — the only surface in Marlowe that shows it.
    Selectable so Keke can read or copy it, wrapped rather than clipped, and
    height-capped so a huge argument cannot push the buttons off screen. */
 #interrupts .interrupt-args:not(:empty) { font-size: 0.75rem;

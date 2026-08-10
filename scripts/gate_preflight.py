@@ -18,7 +18,7 @@ token, and never removes a worktree — cleanup stays a human act, exactly as
 worktrees.remove_worktree documents.
 
 The proxy check is deliberately TWO checks. server.worktrees.proxy_problem is
-reused verbatim (never reimplemented — it is the same sentence JARVIS speaks
+reused verbatim (never reimplemented — it is the same sentence Marlowe speaks
 at spawn), but it only inspects environment variables: it cannot tell whether
 FlClash is actually up. A machine with perfect HTTPS_PROXY vars and a dead
 proxy spawns a worker that dies on `403 Request not allowed`, which is exactly
@@ -88,7 +88,7 @@ class Report:
 def parse_env_file(text: str) -> dict[str, str]:
     """Parse a .env the way `set -a && source .env` would, minus the shell.
 
-    bin/jarvis sources this file, so what it contains — not what happens to be
+    bin/marlowe sources this file, so what it contains — not what happens to be
     exported in the terminal running the preflight — is what the SERVER will
     see. Getting this wrong in either direction is a false result: reading only
     os.environ would fail a perfectly configured machine, and reading only the
@@ -139,20 +139,20 @@ def proxy_endpoint(env: dict) -> tuple[str, int] | None:
 
 def check_proxy_env(env: dict) -> Check:
     """The spawn-time check itself, run early. Same function, same sentence."""
-    if env.get("JARVIS_SKIP_PROXY_CHECK") == "1":
+    if env.get("MARLOWE_SKIP_PROXY_CHECK") == "1":
         return Check(
             "proxy env", WARN,
-            "JARVIS_SKIP_PROXY_CHECK=1 — the spawn-time proxy check is "
+            "MARLOWE_SKIP_PROXY_CHECK=1 — the spawn-time proxy check is "
             "DISABLED. On this machine a worker without the proxy dies with "
             "`403 Request not allowed`, and the failure will look like a "
             "broken worker, not a broken network.",
-            "unset JARVIS_SKIP_PROXY_CHECK in .env unless you are certain "
+            "unset MARLOWE_SKIP_PROXY_CHECK in .env unless you are certain "
             "this network reaches Anthropic directly")
     problem = proxy_problem(env=env)
     if problem:
         return Check(
             "proxy env", ERROR,
-            f"proxy_problem() says: {problem}. JARVIS would refuse the beat-2 "
+            f"proxy_problem() says: {problem}. Marlowe would refuse the beat-2 "
             f"spawn with \"I can't spawn safely, sir\".",
             "in ~/jarvis/.env set HTTPS_PROXY=http://127.0.0.1:7890, "
             "HTTP_PROXY=http://127.0.0.1:7890 and "
@@ -204,7 +204,7 @@ def summarize_fleet(records: list[dict], damaged: int, has_snapshot: bool,
         out.append(Check(
             "fleet ghosts", WARN,
             f"{len(ghosts)} worker(s) in the log are NOT closed: {rows}. "
-            f"JARVIS will announce these as interrupted by a restart on the "
+            f"Marlowe will announce these as interrupted by a restart on the "
             f"very FIRST boot — before beat 9 — and again on every boot while "
             f"their worktrees exist (a known-open item). Beat 9's report will "
             f"contain workers this demo never started.",
@@ -286,7 +286,7 @@ def check_beat1(wired: bool, projects: list) -> Check:
     return Check(
         "beat 1 (discovery)", WARN,
         f"nothing in the running server calls Onboarding.refresh()/ask_next(), "
-        f"so JARVIS will never ASK the repo question — beat 1's spoken confirm "
+        f"so Marlowe will never ASK the repo question — beat 1's spoken confirm "
         f"cannot be performed. The registry already holds "
         f"{len(confirmed)} confirmed repo(s), so beats 2-9 are unaffected.",
         "record beat 1 as NOT DEMONSTRATED (discovery is unreachable from the "
@@ -322,7 +322,7 @@ def summarize_registry(projects: list, loaded: bool, wired: bool = False) -> lis
             "registry", OK,
             f"no confirmed repo yet ({len(projects)} discovered) — which is "
             f"the CORRECT state to start from. Beat 1 is what fills this: "
-            f"JARVIS asks, you say yes, and beat 2 then has a repo to name. "
+            f"Marlowe asks, you say yes, and beat 2 then has a repo to name. "
             f"Do NOT hand-seed the registry; that would skip beat 1."))
     elif not confirmed:
         out.append(Check(
@@ -330,7 +330,7 @@ def summarize_registry(projects: list, loaded: bool, wired: bool = False) -> lis
             f"no CONFIRMED repo ({len(projects)} discovered). "
             f"Registry.match only ever returns confirmed projects, so beat "
             f"2's \"Start work in <repo>, <task>\" resolves to nothing and "
-            f"JARVIS refuses.",
+            f"Marlowe refuses.",
             "confirm the repo the gate will use — see the beat 1 fix above"))
     else:
         out.append(Check(
@@ -386,10 +386,10 @@ def check_voice(env: dict) -> list[Check]:
     """STT is a hard requirement; TTS is not.
 
     Without DEEPGRAM_API_KEY the /mic socket publishes stt.error and closes
-    with 4500 — there is no way to say anything to JARVIS, so eight of the
+    with 4500 — there is no way to say anything to Marlowe, so eight of the
     nine beats cannot be performed at all. Without the ElevenLabs pair,
     SpeakEngine._eleven_enabled is False and every line comes out of the macOS
-    `say` voice: the demo still passes, it just does not sound like JARVIS."""
+    `say` voice: the demo still passes, it just does not sound like Marlowe."""
     out: list[Check] = []
     if env.get("DEEPGRAM_API_KEY"):
         out.append(Check("STT (Deepgram)", OK,
@@ -399,23 +399,23 @@ def check_voice(env: dict) -> list[Check]:
             "STT (Deepgram)", ERROR,
             "DEEPGRAM_API_KEY is not set. The /mic WebSocket publishes "
             "stt.error and closes with code 4500, so nothing you say reaches "
-            "JARVIS — this is a voice gate and it cannot start.",
+            "Marlowe — this is a voice gate and it cannot start.",
             "add DEEPGRAM_API_KEY=<key> to ~/jarvis/.env (it is currently "
             "present but commented out)"))
-    forced = (env.get("JARVIS_VOICE") or "").strip().lower()
+    forced = (env.get("MARLOWE_VOICE") or "").strip().lower()
     has_pair = bool(env.get("ELEVENLABS_API_KEY")
                     and env.get("ELEVENLABS_VOICE_ID"))
     if forced == "say":
         out.append(Check(
             "TTS (ElevenLabs)", WARN,
-            "JARVIS_VOICE=say forces the fallback voice. The demo will be "
+            "MARLOWE_VOICE=say forces the fallback voice. The demo will be "
             "spoken by macOS `say` — every beat still works and every "
-            "readback is still read aloud, it just is not the JARVIS voice.",
-            "unset JARVIS_VOICE in .env to use ElevenLabs"))
+            "readback is still read aloud, it just is not the Marlowe voice.",
+            "unset MARLOWE_VOICE in .env to use ElevenLabs"))
     elif has_pair:
         out.append(Check("TTS (ElevenLabs)", OK,
                          "ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are set "
-                         "— the JARVIS voice"))
+                         "— the Marlowe voice"))
     else:
         missing = [k for k in ("ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID")
                    if not env.get(k)]
@@ -427,40 +427,40 @@ def check_voice(env: dict) -> list[Check]:
             f"still spoken — it just sounds like the system voice, which is "
             f"worth a sentence in the report so nobody thinks TTS failed.",
             "add ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID to ~/jarvis/.env "
-            "if you want the JARVIS voice on the recording"))
+            "if you want the Marlowe voice on the recording"))
     return out
 
 
 def access_log_check(launcher_text: str) -> Check:
     """Beat 7's first evidence lane is `POST /hooks` in state/server.log —
-    which only exists if uvicorn's access log is on. bin/jarvis passes
+    which only exists if uvicorn's access log is on. bin/marlowe passes
     --no-access-log, so as shipped that lane is silent."""
     if not launcher_text:
         return Check("access log", WARN,
-                     "could not read bin/jarvis — cannot tell whether the "
+                     "could not read bin/marlowe — cannot tell whether the "
                      "access log will be on",
                      "check by hand that uvicorn is not started with "
                      "--no-access-log")
     if not access_log_disabled(launcher_text):
         return Check("access log", OK,
-                     "bin/jarvis leaves uvicorn's access log on — `POST "
+                     "bin/marlowe leaves uvicorn's access log on — `POST "
                      "/hooks` lines will land in state/server.log")
     return Check(
         "access log", ERROR,
-        "bin/jarvis starts uvicorn with --no-access-log, so `POST /hooks` "
+        "bin/marlowe starts uvicorn with --no-access-log, so `POST /hooks` "
         "will NEVER appear in state/server.log. That is beat 7's stated "
         "evidence, and the beat with no automated proof anywhere else.",
-        "start the server yourself BEFORE running `jarvis`, with the access "
+        "start the server yourself BEFORE running `marlowe`, with the access "
         "log on (do the same for beat 9's restart):\n"
         "     cd ~/jarvis && set -a && . ./.env && set +a && \\\n"
         "       nohup uv run uvicorn server.app:app_factory --factory \\\n"
         "         --host 127.0.0.1 --port 7777 --access-log \\\n"
         "         >> state/server.log 2>&1 &\n"
-        "   then run `jarvis` — it sees /health answering and will not start "
+        "   then run `marlowe` — it sees /health answering and will not start "
         "a second one.\n"
         "   (If the console then says \"not bootstrapped\", open the URL in "
         "state/bootstrap_url once.)\n"
-        "   Do NOT edit bin/jarvis for this: the launcher is part of the "
+        "   Do NOT edit bin/marlowe for this: the launcher is part of the "
         "system under test.\n"
         "   Beat 7 still has a second lane either way — the observer proves "
         "it from records reaching a DETACHED worker.")
@@ -499,7 +499,7 @@ def git(args: list[str], cwd: Path) -> str:
 
 
 def scan_worktrees(worktrees_dir: Path, extra_repos: list[str]) -> list[Check]:
-    """Leftover worktrees and jarvis/* branches from previous runs.
+    """Leftover worktrees and marlowe/* branches from previous runs.
 
     Nothing removes a worktree automatically — that is deliberate, the
     worktree holds a diff a human may still want — so they accumulate, and a
@@ -525,18 +525,18 @@ def scan_worktrees(worktrees_dir: Path, extra_repos: list[str]) -> list[Check]:
         rows.append(f"{d.name}  [{branch}]  from {origin}")
     branches = []
     for repo in sorted(repos):
-        listed = git(["branch", "--list", "jarvis/*"], Path(repo))
+        listed = git(["branch", "--list", "marlowe/*"], Path(repo))
         for line in listed.splitlines():
             name = line.strip().lstrip("* ").strip()
             if name:
                 branches.append(f"{name}  in {repo}")
     if not rows and not branches:
         out.append(Check("leftover worktrees", OK,
-                         "no worktrees under state/worktrees and no jarvis/* "
+                         "no worktrees under state/worktrees and no marlowe/* "
                          "branches in the repos I can see"))
         return out
     detail = (f"{len(rows)} leftover worktree(s) and {len(branches)} "
-              f"jarvis/* branch(es) from earlier runs:")
+              f"marlowe/* branch(es) from earlier runs:")
     for r in rows:
         detail += f"\n     - {r}"
     for b in branches:
@@ -547,7 +547,7 @@ def scan_worktrees(worktrees_dir: Path, extra_repos: list[str]) -> list[Check]:
         "diff a human may still want). If they are spent, remove each with:\n"
         "     git -C <origin repo> worktree remove --force "
         "<state/worktrees/...>\n"
-        "     git -C <origin repo> branch -D jarvis/<...>\n"
+        "     git -C <origin repo> branch -D marlowe/<...>\n"
         "   A pile of them also keeps old ghosts re-announcing on every boot "
         "(beat 9's known-open item)."))
     return out
@@ -577,7 +577,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     print("=" * 72)
-    print("JARVIS M3P2 milestone gate — PREFLIGHT")
+    print("Marlowe M3P2 milestone gate — PREFLIGHT")
     print(f"repo: {REPO_ROOT}")
     print("read-only: nothing is started, spawned, removed or redeemed here.")
     print("=" * 72)
@@ -594,7 +594,7 @@ def main(argv: list[str] | None = None) -> int:
                    f"{', '.join(sorted(dotenv)) or '(none)'}")
     else:
         dotenv = {}
-        report.add(".env", ERROR, f"{env_path} is missing — bin/jarvis sources "
+        report.add(".env", ERROR, f"{env_path} is missing — bin/marlowe sources "
                                   f"it, so the server would start with no "
                                   f"proxy and no keys at all",
                    "create ~/jarvis/.env with HTTPS_PROXY, HTTP_PROXY, "
@@ -618,7 +618,7 @@ def main(argv: list[str] | None = None) -> int:
             report.add(
                 "proxy reachable", ERROR,
                 f"nothing is listening on {host}:{port}. The env vars are "
-                f"fine, so JARVIS will happily spawn — and the worker will "
+                f"fine, so Marlowe will happily spawn — and the worker will "
                 f"die on `403 Request not allowed` somewhere inside beat 2 "
                 f"with no explanation.",
                 "start FlClash and confirm it is serving on "
@@ -628,17 +628,17 @@ def main(argv: list[str] | None = None) -> int:
         report.checks.append(c)
 
     # --- config + state ----------------------------------------------------
-    cfg_path = REPO_ROOT / "config" / "jarvis.json"
+    cfg_path = REPO_ROOT / "config" / "marlowe.json"
     port = 7777
     try:
         cfg = load_config(cfg_path)
         port = cfg.port
-        report.add("config/jarvis.json", OK,
+        report.add("config/marlowe.json", OK,
                    f"loads (schema v{cfg.schema_version}, port {cfg.port}); "
                    f"hook bearer and session hash present: "
                    f"{bool(cfg.hook_bearer)}/{bool(cfg.session_token_hash)}")
     except Exception as e:  # noqa: BLE001
-        report.add("config/jarvis.json", ERROR,
+        report.add("config/marlowe.json", ERROR,
                    f"{cfg_path} could not be loaded: {e}",
                    "the server calls ensure_config() and would fail to boot. "
                    "Move the file aside to regenerate it — note that this "
@@ -695,12 +695,12 @@ def main(argv: list[str] | None = None) -> int:
             f"something already holds {port}:\n     "
             + "\n     ".join(holder.splitlines()),
             f"the gate needs a clean boot (beat 9 restarts the server, and "
-            f"bin/jarvis skips the bootstrap URL when /health already "
+            f"bin/marlowe skips the bootstrap URL when /health already "
             f"answers). Stop it first: kill the PID above, or "
             f"`pkill -f 'uvicorn server.app'`")
 
     # --- beat 7's access log ----------------------------------------------
-    launcher = REPO_ROOT / "bin" / "jarvis"
+    launcher = REPO_ROOT / "bin" / "marlowe"
     try:
         launcher_text = launcher.read_text(encoding="utf-8")
     except OSError:
@@ -794,7 +794,7 @@ def main(argv: list[str] | None = None) -> int:
         print("no warnings.")
     print("\nNext: open a second terminal and run")
     print("      cd ~/jarvis && uv run python scripts/gate_observer.py")
-    print("then run `jarvis` and follow scripts/gate_checklist.md.")
+    print("then run `marlowe` and follow scripts/gate_checklist.md.")
     return exit_code(report)
 
 

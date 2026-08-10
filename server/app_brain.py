@@ -36,7 +36,7 @@ FLEET_TIMEOUT_S = 90   # spawn = worktree + connect + first query; generous but 
 # a hung git must cost this turn, never the loop.
 WORKTREE_TIMEOUT_S = 90
 # Same argument, applied to every other await in the loop. The loop is SERIAL:
-# one await that never returns is one JARVIS that never answers again. A TTS
+# one await that never returns is one Marlowe that never answers again. A TTS
 # socket that connects and then goes quiet, or an ElevenLabs pre-warm against a
 # black-holed network, hangs indefinitely -- try/except catches the raise it
 # never makes. Bound them.
@@ -158,7 +158,7 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
     async def _preconnect():
         # Same reasoning as _speak: a 401, a DNS failure or a dropped network on
         # the TTS pre-warm would otherwise raise straight out of this loop and
-        # end the task -- JARVIS goes deaf until the process restarts, silently,
+        # end the task -- Marlowe goes deaf until the process restarts, silently,
         # because nothing publishes on that path. M1's fire-and-forget
         # create_task(preconnect()) could not kill the loop either.
         try:
@@ -196,7 +196,7 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
         # This publishes metrics.error, NOT butler.error: the console's
         # butler.error handler clears #answer and #citations, so routing a
         # metrics hiccup there would wipe a correct, already-rendered answer off
-        # screen while JARVIS is still speaking it (tts.done arrives mid-speech).
+        # screen while Marlowe is still speaking it (tts.done arrives mid-speech).
         # Every _safe call site is a turnlog path, so the event type is fixed
         # here rather than parameterized.
         try:
@@ -347,7 +347,7 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                 # probe, an unknown session — none of it was ever spoken. And
                 # UNKNOWN counts as `live`, so the corpse permanently blocks
                 # admission: a project Keke was told is "queued at position 1"
-                # never starts, and JARVIS never mentions it again.
+                # never starts, and Marlowe never mentions it again.
                 #
                 # THE RULE, chosen to be honest without being chatty:
                 #   * an error that NAMES a worker is a fact about a project
@@ -672,7 +672,7 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                             # Fleet dispatch. Inside the surrounding dispatch
                             # try — any raise costs this turn ("that command
                             # failed"), never the loop. FLEET_TIMEOUT_S bounds
-                            # the awaits: a wedged spawn must not wedge JARVIS.
+                            # the awaits: a wedged spawn must not wedge Marlowe.
                             if command.verb == "spawn":
                                 if not command.path:
                                     spoken = "Which project, sir?"

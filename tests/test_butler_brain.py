@@ -152,7 +152,7 @@ async def test_hung_ask_times_out_instead_of_wedging_the_loop(tmp_path, monkeypa
 
 # --- guards added after the M2 Task 6 review --------------------------------
 # Every await and every callback inside the loop must be guarded: an unguarded
-# raise ends run_butler_brain, the lifespan never restarts it, and JARVIS goes
+# raise ends run_butler_brain, the lifespan never restarts it, and Marlowe goes
 # deaf until the process restarts -- silently.
 
 async def test_failed_preconnect_does_not_kill_the_brain(tmp_path):
@@ -233,7 +233,7 @@ async def test_garbage_t_release_does_not_kill_the_brain(tmp_path):
 
     The ms->s division must happen INSIDE the guarded callable. As an argument
     expression it is evaluated in the loop's own frame, so a non-numeric value
-    raises past _safe, ends run_butler_brain, and JARVIS goes silently deaf.
+    raises past _safe, ends run_butler_brain, and Marlowe goes silently deaf.
     """
     bus = EventBus()
     butler, speaker, turnlog = FakeButler(), FakeSpeaker(), FakeTurnLog()

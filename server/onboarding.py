@@ -1,11 +1,12 @@
-"""The confirmation beat: JARVIS proposes a repo, Keke confirms it out loud.
+"""The confirmation beat: Marlowe proposes a repo, Keke confirms it out loud.
 
 Discovery is a guess. Nothing becomes usable — least of all the finance repo —
 until a human says yes, so this module is the only path to `confirmed`.
 
 Every registry mutation here is keyed by PATH, not name: two different
-directories on this machine are both named `jarvis`, and a name-keyed call
-resolves to whichever comes first. We hold the exact Project we asked about,
+directories on this machine are both named `jarvis` (a directory basename, not
+the assistant's name — the repo directory has not moved yet), and a name-keyed
+call resolves to whichever comes first. We hold the exact Project we asked about,
 so we always know its path precisely.
 """
 from __future__ import annotations

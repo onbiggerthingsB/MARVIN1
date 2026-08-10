@@ -478,7 +478,7 @@ async def test_the_applescript_literal_keeps_a_non_ascii_path_verbatim(monkeypat
     """AppleScript does not decode \\uXXXX. With json.dumps' default
     ensure_ascii, one non-ASCII character anywhere in the worktree path turns
     the whole `cd` into a literal backslash-u string — and osascript STILL
-    exits 0, so JARVIS says "yours in the terminal" over a shell that never
+    exits 0, so Marlowe says "yours in the terminal" over a shell that never
     left home."""
     seen = {}
 

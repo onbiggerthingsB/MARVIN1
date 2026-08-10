@@ -100,10 +100,10 @@ async def test_a_plain_yes_still_confirms(tmp_path, said):
 
 async def test_mutation_lands_on_the_exact_path_asked_about(tmp_path):
     r = Registry()
-    r.merge_candidates([Candidate(path="/one/jarvis", name="jarvis", sources=["a"]),
-                        Candidate(path="/two/jarvis", name="jarvis", sources=["a"])])
+    r.merge_candidates([Candidate(path="/one/marlowe", name="marlowe", sources=["a"]),
+                        Candidate(path="/two/marlowe", name="marlowe", sources=["a"])])
     ob = Onboarding(EventBus(), r, tmp_path / "projects.json")
-    # Reject the first jarvis, then confirm the second: a name-keyed mutation
+    # Reject the first marlowe, then confirm the second: a name-keyed mutation
     # would land on the first (rejected!) one, since both share a basename.
     await ob.ask_next()
     assert await ob.handle_reply("no") == "rejected"

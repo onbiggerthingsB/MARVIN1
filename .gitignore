@@ -4,4 +4,5 @@ __pycache__/
 state/
 static/clips/
 static/chimes/
-config/jarvis.json
+config/marlowe.json
+live_test.py

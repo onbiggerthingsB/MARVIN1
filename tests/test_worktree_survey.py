@@ -106,7 +106,7 @@ def add_worktree_stamped(repo, wts, task, stamp):
     from server.worktrees import _slug
     slug = _slug(task)
     dest = Path(wts) / f"{Path(repo).name}-{slug}-{stamp}"
-    branch = f"jarvis/{slug}-{stamp}"
+    branch = f"marlowe/{slug}-{stamp}"
     base = _git(repo, "rev-parse", "HEAD")
     dest.parent.mkdir(parents=True, exist_ok=True)
     _git(repo, "worktree", "add", "-q", "-b", branch, str(dest), base)
@@ -121,16 +121,16 @@ def move_head_off_the_worktrees(repo):
     commits — a human switching branches, nothing more exotic.
 
     `git branch -d` measures merged-ness against HEAD, so after this every
-    jarvis branch cut from main is 'not fully merged' and git refuses to
+    marlowe branch cut from main is 'not fully merged' and git refuses to
     delete it. That refusal is what the batch used to swallow."""
     _git(repo, "checkout", "-q", "--orphan", "elsewhere")
     _commit(repo, "somewhere else entirely")
 
 
 # ---------------------------------------------------------- classification --
-async def test_a_fresh_worktree_with_only_jarvis_plumbing_is_empty(repo, tmp_path):
+async def test_a_fresh_worktree_with_only_marlowe_plumbing_is_empty(repo, tmp_path):
     # The hook settings and the bearer shield are written BEFORE the CLI ever
-    # runs. If they counted as work, every worktree JARVIS ever made would
+    # runs. If they counted as work, every worktree Marlowe ever made would
     # classify as holds-work and the empty bucket would be permanently empty —
     # the feature would surface a pile it could never offer to clear.
     wt = await add_worktree(repo, tmp_path / "wts", "did nothing")
@@ -204,7 +204,7 @@ async def test_a_stray_file_in_the_worktrees_directory_is_reported(
 
 
 async def test_a_foreign_branch_is_unrecognized_and_never_removable(repo, tmp_path):
-    # Something in the worktrees directory that JARVIS did not create. It is
+    # Something in the worktrees directory that Marlowe did not create. It is
     # reported (silence would be worse) but it is in neither removable bucket.
     wts = tmp_path / "wts"
     wts.mkdir(parents=True)
@@ -296,7 +296,7 @@ async def test_the_batch_removes_the_empties_and_their_branches(repo, tmp_path):
     spoken = await gate.remove_empty()
     assert "2" in spoken
     assert not Path(a.path).exists() and not Path(b.path).exists()
-    branches = _git(repo, "branch", "--list", "jarvis/*")
+    branches = _git(repo, "branch", "--list", "marlowe/*")
     assert branches == ""                       # nothing beyond base to keep
     # The claim is only allowed BECAUSE git agreed. HEAD is still main here,
     # which contains both base commits; the test below is the same batch with
@@ -317,7 +317,7 @@ async def test_the_batch_never_claims_a_branch_git_refused_to_delete(
     await gate.report()
     spoken = await gate.remove_empty()
     assert not Path(wt.path).exists()                   # the directory did go
-    assert wt.branch in _git(repo, "branch", "--list", "jarvis/*")
+    assert wt.branch in _git(repo, "branch", "--list", "marlowe/*")
     assert "and its branch." not in spoken              # the lie
     assert "kept" in spoken.lower()
     assert wt.branch in spoken                          # names what survived
@@ -348,13 +348,13 @@ async def test_an_orphan_branch_is_refused_by_name(repo, tmp_path):
     await gate.remove_empty()                   # leaves the branch behind
     await gate.report()                         # now it is an orphan branch
     spoken = await gate.remove_named("soccer captain page")
-    assert wt.branch in _git(repo, "branch", "--list", "jarvis/*")
+    assert wt.branch in _git(repo, "branch", "--list", "marlowe/*")
     assert "branch" in spoken.lower()
 
 
 async def test_the_prune_leaves_a_registration_the_survey_never_mentioned(
         repo, tmp_path):
-    # A human's own worktree on the same repo, outside the directory JARVIS
+    # A human's own worktree on the same repo, outside the directory Marlowe
     # cleans, whose checkout is temporarily missing — an unplugged drive, a
     # moved directory, the case `git worktree repair` exists for. The survey
     # never mentioned it, so the batch must not clear its registration; the
@@ -431,7 +431,7 @@ async def test_the_batch_prunes_stale_registrations(repo, tmp_path):
     assert "prunable" not in listed
     # Pruning destroys nothing: the branch is the record, and the directory it
     # named is already gone, so this is the ONE trace left of that worker.
-    assert wt.branch in _git(repo, "branch", "--list", "jarvis/*")
+    assert wt.branch in _git(repo, "branch", "--list", "marlowe/*")
 
 
 # ------------------------------------------- per-item: naming one of them ---
@@ -444,7 +444,7 @@ async def test_naming_a_worktree_that_holds_work_removes_it_and_keeps_the_branch
     await gate.report()
     spoken = await gate.remove_named("soccer captain page")
     assert not Path(wt.path).exists()
-    assert wt.branch in _git(repo, "branch", "--list", "jarvis/*")
+    assert wt.branch in _git(repo, "branch", "--list", "marlowe/*")
     assert wt.branch in spoken                  # says where the work still is
 
 
@@ -603,7 +603,7 @@ async def test_a_foreign_checkout_is_refused_before_the_destructive_call(
 # ------------------------------------------------------------- containment --
 async def test_removal_refuses_a_target_outside_the_worktrees_directory(
         repo, tmp_path):
-    # A worktree that is a real jarvis one but lives somewhere else entirely.
+    # A worktree that is a real marlowe one but lives somewhere else entirely.
     # Only the configured directory is ever cleaned; the offer is built from a
     # survey of it, so this can only happen to a forged offer — refuse anyway.
     outside = tmp_path / "elsewhere"

@@ -242,7 +242,7 @@ async def test_json_in_an_earlier_message_is_still_found(tmp_path):
 #                  terminal_reason='api_error'
 #                  result='Failed to authenticate. API Error: 401 OAuth ...'
 # and Butler.ask returned that text as a normal answer, which the brain then
-# SPOKE ALOUD in the JARVIS voice. Detection must key on the structured fields
+# SPOKE ALOUD in the Marlowe voice. Detection must key on the structured fields
 # (is_error / api_error_status / terminal_reason), never the text.
 
 async def test_api_error_result_raises_instead_of_answering(tmp_path):

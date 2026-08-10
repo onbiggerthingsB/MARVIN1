@@ -61,7 +61,7 @@ class FakeClient:
 
 
 def make_fleet(tmp_path, monkeypatch, max_workers=1, forbidden=None):
-    monkeypatch.setenv("JARVIS_SKIP_PROXY_CHECK", "1")
+    monkeypatch.setenv("MARLOWE_SKIP_PROXY_CHECK", "1")
     bus, router = EventBus(), Router()
     clients: list[FakeClient] = []
 
@@ -73,14 +73,14 @@ def make_fleet(tmp_path, monkeypatch, max_workers=1, forbidden=None):
     async def fake_worktree(repo, task, wtdir):
         dest = Path(wtdir) / f"wt-{len(clients)}"
         dest.mkdir(parents=True, exist_ok=True)
-        return Worktree(repo=str(repo), path=str(dest), branch="jarvis/test-x",
+        return Worktree(repo=str(repo), path=str(dest), branch="marlowe/test-x",
                         base_commit="abc1234def5678")
 
     fleet = Fleet(bus=bus, router=router,
                   log=FleetLog(tmp_path / "state" / "fleet.jsonl"),
                   worktrees_dir=tmp_path / "state" / "worktrees",
                   forbidden=forbidden or (str(tmp_path / "vault"),
-                                          str(tmp_path / "jarvis")),
+                                          str(tmp_path / "marlowe")),
                   max_workers=max_workers, client_factory=factory,
                   worktree_factory=fake_worktree,
                   settings_writer=lambda p, port, bearer: Path(p) / "unused",
@@ -121,11 +121,11 @@ async def test_spawn_speaks_on_it_only_after_the_worker_exists(tmp_path, monkeyp
         await cleanup(fleet)
 
 
-async def test_spawn_refuses_the_vault_and_the_jarvis_repo(tmp_path, monkeypatch):
+async def test_spawn_refuses_the_vault_and_the_marlowe_repo(tmp_path, monkeypatch):
     fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
     (tmp_path / "vault").mkdir()
-    (tmp_path / "jarvis").mkdir()
-    for bad in (str(tmp_path / "vault"), str(tmp_path / "jarvis")):
+    (tmp_path / "marlowe").mkdir()
+    for bad in (str(tmp_path / "vault"), str(tmp_path / "marlowe")):
         spoken = await fleet.spawn("thing", bad, "do work")
         assert "don't run workers" in spoken
     assert fleet.workers == [] and clients == []
@@ -133,7 +133,7 @@ async def test_spawn_refuses_the_vault_and_the_jarvis_repo(tmp_path, monkeypatch
 
 async def test_spawn_refuses_without_proxy_vars(tmp_path, monkeypatch):
     fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
-    monkeypatch.delenv("JARVIS_SKIP_PROXY_CHECK", raising=False)
+    monkeypatch.delenv("MARLOWE_SKIP_PROXY_CHECK", raising=False)
     for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
         monkeypatch.delenv(var, raising=False)
     spoken = await fleet.spawn("soccer", repo(tmp_path), "task")
@@ -990,7 +990,7 @@ async def test_a_worker_registered_without_an_in_flight_spawn_is_not_starting(tm
     fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
     path = repo(tmp_path, "soccer")
     wt = Worktree(repo=path, path=str(tmp_path / "wt-recovered"),
-                  branch="jarvis/recovered", base_commit="abc1234def5678")
+                  branch="marlowe/recovered", base_commit="abc1234def5678")
     w = Worker(project="soccer", path=path, task_text="task", wt=wt, bus=bus,
                router=router, log=fleet._log_writer,
                client_factory=fleet._client_factory, now=fleet._now)
@@ -1108,7 +1108,7 @@ async def test_spawn_steer_stop_leaves_an_untorn_ordered_log(tmp_path, monkeypat
 async def test_a_worker_free_session_does_not_erase_the_last_one(tmp_path,
                                                                  monkeypatch):
     """Compaction keeps exactly ONE rotated generation, so an unconditional
-    snapshot at every shutdown would let a JARVIS session that never spawned
+    snapshot at every shutdown would let a Marlowe session that never spawned
     anything rotate its own empty log over the previous session's history.
     Nothing to compact means no compaction."""
     fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
@@ -1157,7 +1157,7 @@ async def test_a_transient_refusal_puts_the_queued_item_back(tmp_path,
     assert len(fleet.queue) == 1
     cid, q = bus.subscribe()
     try:
-        monkeypatch.delenv("JARVIS_SKIP_PROXY_CHECK", raising=False)
+        monkeypatch.delenv("MARLOWE_SKIP_PROXY_CHECK", raising=False)
         for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
             monkeypatch.delenv(var, raising=False)
         await fleet.stop(path1)                       # frees the slot, drains
@@ -1255,7 +1255,7 @@ def test_the_snapshot_is_durable_before_the_log_rotates(tmp_path):
 # ---------- the spoken readback IS the containment (spec §5) ----------
 def test_the_readback_elides_the_middle_and_keeps_a_commands_tail():
     """A trailing cut removes exactly the dangerous half of a shell line — and
-    _risk_note scans the FULL blob, so JARVIS would say "Careful, sir" and then
+    _risk_note scans the FULL blob, so Marlowe would say "Careful, sir" and then
     read out a sentence with the thing it is warning about missing."""
     cmd = ("npm run build -- --verbose " + "--flag=value " * 20
            + "&& rm -rf /tmp/scratch-repo")
@@ -1269,11 +1269,11 @@ def test_the_readback_elides_the_middle_and_keeps_a_commands_tail():
 def test_the_readback_keeps_a_paths_distinguishing_suffix():
     """Two worktrees for the same task differ ONLY in the `-<timestamp>` tail;
     the live smoke read both aloud as the same truncated prefix."""
-    p = ("/Users/keke/jarvis/state/worktrees/scratch-repo-create-a-file-named-"
+    p = ("/Users/keke/marlowe/state/worktrees/scratch-repo-create-a-file-named-"
          "done-txt-containing-exactly-the-word-done-20260808-141523/DONE.txt")
     spoken = _short_args({"file_path": p})
     assert spoken.endswith("20260808-141523/DONE.txt")
-    assert spoken.startswith("/Users/keke/jarvis")
+    assert spoken.startswith("/Users/keke/marlowe")
     assert "…" in spoken and len(spoken) < len(p)
 
 
@@ -1304,7 +1304,7 @@ async def test_the_card_carries_the_full_command_and_both_warnings(
         tmp_path, monkeypatch):
     """The click path was told LESS than the voice path: `_short_args` on the
     card too, and neither the risk note nor the outside-the-worktree note
-    anywhere on it. There was no surface in JARVIS showing the full command."""
+    anywhere on it. There was no surface in Marlowe showing the full command."""
     fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
     await fleet.spawn("soccer", repo(tmp_path), "task")
     w = fleet.workers[0]
@@ -1369,18 +1369,18 @@ async def test_an_approval_says_when_the_target_is_outside_the_worktree(
         await cleanup(fleet)
 
 
-async def test_the_readback_names_the_vault_and_the_jarvis_repo(tmp_path,
+async def test_the_readback_names_the_vault_and_the_marlowe_repo(tmp_path,
                                                                 monkeypatch):
     """One generic sentence made a Write into the owner's Obsidian vault sound
     exactly like a Write into /tmp/DONE.txt — "Outside its worktree, sir." for
-    both. Fleet.forbidden already held the resolved vault root and the JARVIS
+    both. Fleet.forbidden already held the resolved vault root and the Marlowe
     repo; it was consulted only at spawn, never in the readback."""
-    vault, jarvis = tmp_path / "vault", tmp_path / "jarvis"
+    vault, marlowe = tmp_path / "vault", tmp_path / "marlowe"
     vault.mkdir()
-    jarvis.mkdir()
+    marlowe.mkdir()
     fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
     fleet.protected = ((str(vault), "your Obsidian vault"),
-                       (str(jarvis), "the JARVIS repo itself"))
+                       (str(marlowe), "the Marlowe repo itself"))
     await fleet.spawn("soccer", repo(tmp_path), "task")
     w = fleet.workers[0]
     w.protected = fleet.protected
@@ -1388,7 +1388,7 @@ async def test_the_readback_names_the_vault_and_the_jarvis_repo(tmp_path,
     try:
         for tool, args in (
                 ("Write", {"file_path": str(vault / "Daily" / "2026-08-09.md")}),
-                ("Bash", {"command": f"git -C {jarvis} push --force"}),
+                ("Bash", {"command": f"git -C {marlowe} push --force"}),
                 ("Write", {"file_path": "/tmp/DONE.txt"})):
             t = asyncio.create_task(w._on_tool_request(
                 tool, args, SimpleNamespace(title=None)))
@@ -1401,9 +1401,9 @@ async def test_the_readback_names_the_vault_and_the_jarvis_repo(tmp_path,
             if ev and ev["type"] == "approval.request":
                 said.append(ev["data"]["question"])
         assert "inside your Obsidian vault" in said[0]
-        assert "inside the JARVIS repo itself" in said[1]
+        assert "inside the Marlowe repo itself" in said[1]
         assert said[2].count("Outside its worktree, sir.") == 1   # still generic
-        assert "vault" not in said[2] and "JARVIS repo" not in said[2]
+        assert "vault" not in said[2] and "Marlowe repo" not in said[2]
     finally:
         await cleanup(fleet)
 

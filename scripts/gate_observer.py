@@ -1,14 +1,14 @@
 """M3P2 milestone gate — the evidence observer.
 
 Run:   cd ~/jarvis && uv run python scripts/gate_observer.py
-       (second terminal, started BEFORE `jarvis`)
+       (second terminal, started BEFORE `marlowe`)
 Then:  perform scripts/gate_checklist.md at the microphone. Ctrl-C at the end.
 Also:  `--once` reads the logs that already exist, prints the same transcript
        and exits — for regenerating the evidence after the demo is over.
 
 WHAT THIS IS FOR
 The gate is a live human demo. Without a recorder its result is a memory, and
-"I think the hooks kept arriving" is not evidence. This tails what JARVIS
+"I think the hooks kept arriving" is not evidence. This tails what Marlowe
 already writes to disk, timestamps it, maps it onto the nine beats, and leaves
 a transcript Keke can paste into the milestone report.
 
@@ -33,7 +33,7 @@ THE THREE FILES, AND WHAT EACH BEAT LEAVES BEHIND
                       checksummed JSON record per line. Beats 2, 3, 6, 7, 9.
   state/server.log    uvicorn's output. `POST /hooks` lines are beat 7's
                       first evidence lane; the shutdown/startup banner pair is
-                      beat 9's. NOTE: bin/jarvis starts uvicorn with
+                      beat 9's. NOTE: bin/marlowe starts uvicorn with
                       --no-access-log, so lane A is SILENT unless the server
                       was started with access logging on — gate_preflight.py
                       checks exactly this and prints the fix, and the banner
@@ -44,7 +44,7 @@ THE THREE FILES, AND WHAT EACH BEAT LEAVES BEHIND
 BEAT 7 GETS TWO LANES, because it is the beat with no automated proof:
   A. `POST /hooks` in the access log — proves HTTP hook traffic arrived.
   B. fleet records for a worker whose state is DETACHED. After the handoff,
-     JARVIS holds no SDK stream for that session at all (fleet.handoff closes
+     Marlowe holds no SDK stream for that session at all (fleet.handoff closes
      the client and verifies the exit), so the ONLY thing that can still move
      that tile is a hook POST from the CLI process in the worktree. A record
      with state=DETACHED arriving after the `detached` record is therefore
@@ -542,7 +542,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--state-dir", default=str(REPO_ROOT / "state"))
     ap.add_argument("--registry", default=str(REPO_ROOT / "config" /
                                               "projects.json"))
-    ap.add_argument("--launcher", default=str(REPO_ROOT / "bin" / "jarvis"))
+    ap.add_argument("--launcher", default=str(REPO_ROOT / "bin" / "marlowe"))
     ap.add_argument("--out", default="")
     ap.add_argument("--poll", type=float, default=0.4)
     ap.add_argument("--once", action="store_true",
@@ -563,7 +563,7 @@ def main(argv: list[str] | None = None) -> int:
 
     started = time.time()
     header = [
-        "# JARVIS M3P2 milestone gate — observer transcript",
+        "# Marlowe M3P2 milestone gate — observer transcript",
         "",
         f"- started: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(started))}",
         f"- fleet log: `{state / 'fleet.jsonl'}`",
@@ -586,7 +586,7 @@ def main(argv: list[str] | None = None) -> int:
     print("-" * 72, flush=True)
 
     if access_log_disabled(launcher_text):
-        emit("gate", "NOTE: bin/jarvis starts uvicorn with --no-access-log, so "
+        emit("gate", "NOTE: bin/marlowe starts uvicorn with --no-access-log, so "
                      "`POST /hooks` will NOT appear in state/server.log.")
         emit("gate", "      Beat 7 lane A is silent; lane B (records reaching a "
                      "DETACHED worker) still proves it.")

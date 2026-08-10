@@ -1,4 +1,4 @@
-"""The project registry: what JARVIS knows about Keke's repos, and which of
+"""The project registry: what Marlowe knows about Keke's repos, and which of
 those a human has actually confirmed. Discovery proposes; only Keke disposes."""
 from __future__ import annotations
 

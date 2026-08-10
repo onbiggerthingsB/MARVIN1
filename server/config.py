@@ -1,4 +1,4 @@
-"""Versioned config for JARVIS. Secrets are generated once and persisted."""
+"""Versioned config for Marlowe. Secrets are generated once and persisted."""
 from __future__ import annotations
 
 import json

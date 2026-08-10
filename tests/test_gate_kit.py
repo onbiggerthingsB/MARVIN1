@@ -176,7 +176,7 @@ def test_spawn_record_is_beat_2():
     board, corr = board_and_correlator()
     corr.on_fleet_record(rec("spawned", {
         "worker": "w1", "project": "alethic", "state": "IDLE_AT_PROMPT",
-        "worktree": "/wt/1", "branch": "jarvis/x-1", "base_commit": "abc1234"}))
+        "worktree": "/wt/1", "branch": "marlowe/x-1", "base_commit": "abc1234"}))
     assert board.evidence[2] and not board.evidence[7]
 
 
@@ -213,7 +213,7 @@ def test_a_detach_with_no_session_id_is_a_deviation():
 
 
 def test_records_reaching_a_detached_worker_are_beat_7():
-    """The whole point of beat 7: after the handoff JARVIS holds no stream for
+    """The whole point of beat 7: after the handoff Marlowe holds no stream for
     that session, so only a /hooks POST can still move the tile."""
     board, corr = board_and_correlator()
     corr.on_fleet_record(rec("detached", {"worker": "w1", "state": DETACHED,
@@ -405,7 +405,7 @@ def test_check_proxy_env_passes_a_correct_environment():
 
 
 def test_skipping_the_proxy_check_is_a_warning_not_a_pass():
-    c = pre.check_proxy_env({"JARVIS_SKIP_PROXY_CHECK": "1"})
+    c = pre.check_proxy_env({"MARLOWE_SKIP_PROXY_CHECK": "1"})
     assert c.level == pre.WARN and "403" in c.detail
 
 
@@ -416,7 +416,7 @@ def test_deepgram_is_a_blocker_and_elevenlabs_is_only_a_warning():
     assert "say" in checks["TTS (ElevenLabs)"].detail
 
 
-def test_both_elevenlabs_keys_are_required_for_the_jarvis_voice():
+def test_both_elevenlabs_keys_are_required_for_the_marlowe_voice():
     """SpeakEngine._eleven_enabled needs BOTH; one alone still falls back."""
     checks = {c.name: c for c in pre.check_voice(
         {"DEEPGRAM_API_KEY": "k", "ELEVENLABS_API_KEY": "k"})}
@@ -432,14 +432,14 @@ def test_both_elevenlabs_keys_are_required_for_the_jarvis_voice():
 def test_forcing_the_say_voice_is_reported_as_a_warning():
     checks = {c.name: c for c in pre.check_voice(
         {"DEEPGRAM_API_KEY": "k", "ELEVENLABS_API_KEY": "k",
-         "ELEVENLABS_VOICE_ID": "v", "JARVIS_VOICE": "say"})}
+         "ELEVENLABS_VOICE_ID": "v", "MARLOWE_VOICE": "say"})}
     assert checks["TTS (ElevenLabs)"].level == pre.WARN
 
 
 def test_access_log_check_flags_the_launcher_as_shipped():
     c = pre.access_log_check("uvicorn ... --port 7777 --no-access-log\n")
     assert c.level == pre.ERROR
-    assert "--access-log" in c.fix and "Do NOT edit bin/jarvis" in c.fix
+    assert "--access-log" in c.fix and "Do NOT edit bin/marlowe" in c.fix
     assert pre.access_log_check("uvicorn ... --port 7777\n").level == pre.OK
     assert pre.access_log_check("").level == pre.WARN
 
@@ -571,7 +571,7 @@ def test_observer_once_writes_a_transcript_and_a_beat_summary(tmp_path):
     state.mkdir()
     write_log(state / "fleet.jsonl", [
         ("spawned", {"worker": "w1", "project": "alethic", "state": "IDLE",
-                     "worktree": str(tmp_path / "wt"), "branch": "jarvis/x"}),
+                     "worktree": str(tmp_path / "wt"), "branch": "marlowe/x"}),
         ("permission_wait", {"worker": "w1", "state": "WAITING_PERMISSION"}),
         ("permission_done", {"worker": "w1", "state": "ACTIVE_TURN"}),
         ("detached", {"worker": "w1", "state": DETACHED,
@@ -587,7 +587,7 @@ def test_observer_once_writes_a_transcript_and_a_beat_summary(tmp_path):
          "data_source": "/q/picks.sqlite"}]}))
     out = tmp_path / "transcript.md"
     code = obs.main(["--state-dir", str(state), "--registry", str(reg),
-                     "--launcher", str(REPO_ROOT / "bin" / "jarvis"),
+                     "--launcher", str(REPO_ROOT / "bin" / "marlowe"),
                      "--out", str(out), "--once"])
     assert code == 0
     text = out.read_text()

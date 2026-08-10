@@ -1,4 +1,4 @@
-"""The §16 data-source confirmation: before the FIRST brief, JARVIS names the
+"""The §16 data-source confirmation: before the FIRST brief, Marlowe names the
 file it intends to read and Keke says yes out loud.
 
 This lives OUTSIDE finance.py on purpose: finance.py is source-scanned by a

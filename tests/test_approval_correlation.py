@@ -1,4 +1,4 @@
-"""A yes may only resolve the request JARVIS actually READ ALOUD.
+"""A yes may only resolve the request Marlowe actually READ ALOUD.
 
 The spoken approval line is the whole safety model: the worktree is not a
 sandbox, so what contains a worker is the human hearing what it wants and
@@ -201,7 +201,7 @@ async def test_an_evicted_readback_leaves_the_yes_with_nothing_to_approve():
 
 
 async def test_a_readback_that_was_actually_spoken_is_resolvable_by_voice():
-    """The positive control: without it every test above passes on a JARVIS
+    """The positive control: without it every test above passes on a Marlowe
     that simply never resolves anything by voice again."""
     bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
     router, fleet = Router(), FakeFleet()

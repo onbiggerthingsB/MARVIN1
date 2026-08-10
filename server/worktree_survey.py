@@ -4,13 +4,13 @@ part of it that is provably worthless.
 Nothing in `server/` has ever removed a worktree, deliberately: `remove_worktree`
 is explicit cleanup only, because "the worktree holds the diff a human may still
 want to merge back". The consequence is that every task ever run leaves a
-directory and a `jarvis/*` branch behind, with nothing to surface it and no way
+directory and a `marlowe/*` branch behind, with nothing to surface it and no way
 to clear it. This module is the surfacing, and a consent path narrow enough that
 losing a diff Keke wanted is not one of its outcomes.
 
 THIS IS NOT AUTOMATIC DELETION. Nothing here runs on a timer, at boot, or on
 shutdown. Every removal is reached by an utterance whose whole job is removal,
-and only after a SEPARATE utterance made JARVIS read the survey out loud.
+and only after a SEPARATE utterance made Marlowe read the survey out loud.
 
 The four classifications, and why each is safe:
 
@@ -34,7 +34,7 @@ The four classifications, and why each is safe:
                     `git worktree prune` would take the whole repo with it,
                     including registrations the survey never mentioned and a
                     human may be about to `git worktree repair`.
-  orphan-branch     A `jarvis/*` branch with no worktree and no registration
+  orphan-branch     A `marlowe/*` branch with no worktree and no registration
                     anywhere. REPORT-ONLY: nothing here ever deletes it. It
                     exists because `git branch -d` is allowed to refuse — when
                     it does, the directory is already gone, and without this
@@ -44,14 +44,14 @@ The four classifications, and why each is safe:
                     branch that survives a removal stays visible instead.
 
 There is a FIFTH bucket, `unrecognized`, for anything in the worktrees
-directory that is not a jarvis worktree: a foreign branch, a symlink, a plain
+directory that is not a marlowe worktree: a foreign branch, a symlink, a plain
 directory, or a checkout git cannot answer questions about. It is REPORTED
 (silence about a thing you cannot classify is worse than naming it) and it is
 in no removable bucket. `remove_worktree` would refuse it anyway; this makes
 the refusal happen before the destructive call rather than inside it.
 
 `ahead` is counted as "commits on this branch that are reachable from NO
-non-jarvis ref", which needs no recorded base_commit and degrades in the safe
+non-marlowe ref", which needs no recorded base_commit and degrades in the safe
 direction: if the commit this branch was cut from has itself become
 unreachable, its ancestors count as ahead too, and the worktree classifies as
 holds-work rather than empty.
@@ -93,7 +93,7 @@ OFFER_TTL_S = 600.0
 # console. Speech is the expensive channel; the console shows all of them.
 SPEAK_ITEM_LIMIT = 3
 
-# `jarvis/<slug>-YYYYmmdd-HHMMSS` — create_worktree's own stamp, which dates a
+# `marlowe/<slug>-YYYYmmdd-HHMMSS` — create_worktree's own stamp, which dates a
 # worktree more honestly than any mtime (a mtime moves when anything reads or
 # writes; the stamp is when the worker was spawned).
 _STAMP = re.compile(r"-(\d{8}-\d{6})$")
@@ -130,7 +130,7 @@ class SurveyEntry:
     branch: str = ""
     base_commit: str = ""
     kind: str = KIND_UNRECOGNIZED
-    ahead: int = 0            # commits reachable from no non-jarvis ref
+    ahead: int = 0            # commits reachable from no non-marlowe ref
     dirty: int = 0            # tracked modifications
     untracked: int = 0        # untracked ENTRIES (a directory collapses to one)
     age_s: float = 0.0
@@ -161,7 +161,7 @@ class SurveyEntry:
         hyphens become spaces, so the label is speech.
 
         It must ROUND-TRIP: _explains builds its vocabulary from this same
-        directory name, so every label JARVIS offers is a name the per-item
+        directory name, so every label Marlowe offers is a name the per-item
         instruction can match back. Two worktrees cut for the same task on the
         same repo would otherwise share a label outright — `alias`, assigned
         once per survey by _disambiguate, is what keeps every spoken name
@@ -172,8 +172,8 @@ class SurveyEntry:
             return self.project
         name = _STAMP.sub("", Path(self.path).name or "")
         # An orphan branch has no directory; its branch is the only name it
-        # has, and "jarvis/" is a namespace, not something anybody says.
-        name = name or _STAMP.sub("", self.branch.removeprefix("jarvis/"))
+        # has, and "marlowe/" is a namespace, not something anybody says.
+        name = name or _STAMP.sub("", self.branch.removeprefix("marlowe/"))
         return name.replace("-", " ").replace("_", " ").strip() or self.path
 
 
@@ -285,15 +285,15 @@ async def _classify(entry_dir: Path, live: _Live, now: float) -> SurveyEntry:
         return e
     if live.holds(entry_dir, top):
         e.kind = KIND_LIVE
-    elif not branch.startswith("jarvis/"):
-        e.note = f"branch {branch!r} is outside the jarvis/ namespace"
+    elif not branch.startswith("marlowe/"):
+        e.note = f"branch {branch!r} is outside the marlowe/ namespace"
         return e
     # Facts, gathered for EVERY entry including live ones: the report has to
     # say what a live worker has accumulated too, or "leave it alone" reads as
     # "there is nothing there".
     try:
         ahead = await _git(entry_dir, "rev-list", "HEAD", "--not",
-                           "--exclude=jarvis/*", "--branches", "--tags",
+                           "--exclude=marlowe/*", "--branches", "--tags",
                            "--remotes", "--boundary")
         status = await _git(entry_dir, "status", "--porcelain")
     except (WorktreeError, asyncio.TimeoutError, OSError) as exc:
@@ -332,7 +332,7 @@ async def _repo_scan(repos, root: Path, seen: set[str],
     because neither has a directory:
 
       stale-registration  git still registers it, the directory is gone.
-      orphan-branch       a `jarvis/*` branch with no registration at all —
+      orphan-branch       a `marlowe/*` branch with no registration at all —
                           which is what a branch becomes the moment its
                           worktree is removed and `git branch -d` refuses.
                           Without this it would never be surfaced again.
@@ -370,7 +370,7 @@ async def _repo_scan(repos, root: Path, seen: set[str],
                 path = branch = ""
         try:
             refs = await _git(Path(repo), "for-each-ref",
-                              "--format=%(refname:short)", "refs/heads/jarvis/")
+                              "--format=%(refname:short)", "refs/heads/marlowe/")
         except (WorktreeError, asyncio.TimeoutError, OSError):
             continue
         for name in refs.splitlines():
@@ -539,9 +539,9 @@ def spoken_report(entries: list[SurveyEntry]) -> str:
                      f"{len(stale)} registrations point at directories that "
                      f"are already gone.")
     if orphans:
-        parts.append("One jarvis branch has no worktree left — it's on screen "
+        parts.append("One marlowe branch has no worktree left — it's on screen "
                      "and I'm keeping it." if len(orphans) == 1 else
-                     f"{len(orphans)} jarvis branches have no worktrees left "
+                     f"{len(orphans)} marlowe branches have no worktrees left "
                      f"— they're on screen and I'm keeping them.")
     if odd:
         parts.append("One isn't mine — it's on screen and I'll leave it alone."
@@ -596,7 +596,7 @@ class WorktreeCleanup:
     by a destructive VERB ("remove the empty worktrees", "remove the worktree
     for X") that no affirmation vocabulary can produce and that none of the
     other three gates recognises. It cannot steal their yes and they cannot
-    steal its verb; a yes said anywhere in JARVIS removes nothing, ever.
+    steal its verb; a yes said anywhere in Marlowe removes nothing, ever.
 
     The correlation rule survives intact: an instruction may only act on what
     the survey SPOKE (the offer), the offer expires, it is redeemable once, and
@@ -808,7 +808,7 @@ class WorktreeCleanup:
         that removes, not of the code that looked.
 
         Everything after that is `remove_worktree`'s own guard, reused rather
-        than reimplemented — the jarvis/ namespace check, the absolute-path
+        than reimplemented — the marlowe/ namespace check, the absolute-path
         check, and the branch-is-checked-out-there check are four proven
         failures' worth of reasoning and this module adds nothing to them."""
         if not entry.removable:

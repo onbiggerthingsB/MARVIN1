@@ -4,7 +4,7 @@ from server.config import Config, ensure_config, load_config, load_keyterms
 
 
 def test_ensure_config_creates_versioned_file_with_secrets(tmp_path: Path):
-    p = tmp_path / "jarvis.json"
+    p = tmp_path / "marlowe.json"
     cfg = ensure_config(p)
     assert p.exists()
     raw = json.loads(p.read_text())
@@ -20,7 +20,7 @@ def test_ensure_config_creates_versioned_file_with_secrets(tmp_path: Path):
 
 
 def test_load_config_rejects_future_schema(tmp_path: Path):
-    p = tmp_path / "jarvis.json"
+    p = tmp_path / "marlowe.json"
     p.write_text(json.dumps({"schema_version": 99}))
     try:
         load_config(p)
