@@ -11,6 +11,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.websockets import WebSocketState
 
 from server import auth
 from server.app_brain import run_butler_brain
@@ -60,6 +61,35 @@ def _existing_note_titles(titles, vault_root: Path) -> set:
             if len(found) == len(wanted):
                 break
     return found
+
+
+async def close_quietly(ws: WebSocket) -> None:
+    """Close `ws` if it is still there, and never raise while trying.
+
+    Both halves are load-bearing, and neither is enough alone.
+
+    The state check answers "have we already SEEN the peer leave". Starlette
+    flips its states only when a disconnect message is read or a send fails, so
+    this catches the reload / network-blip shape, where the reader drained the
+    disconnect before we got here — there we must not send at all.
+
+    The suppression catches the ordinary end of a press-and-hold, which is the
+    one the live log was full of: the relay returns on the browser's `stop`
+    frame, the browser closes its socket a moment later, and nobody is reading
+    any more, so BOTH starlette states still say CONNECTED while the socket is
+    already dead. The close only discovers that on the wire — uvicorn raises
+    ClientDisconnected, an OSError, which starlette re-raises as
+    WebSocketDisconnect(1006) out of the handler. State cannot see that coming.
+
+    RuntimeError covers the third shape: a close that already went out (starlette
+    refuses a second one), which a future second teardown path would hit.
+    """
+    if ws.client_state is not WebSocketState.CONNECTED:
+        return
+    if ws.application_state is not WebSocketState.CONNECTED:
+        return
+    with contextlib.suppress(WebSocketDisconnect, RuntimeError, OSError):
+        await ws.close()
 
 
 def create_app(base_dir: Path) -> FastAPI:
@@ -386,8 +416,22 @@ def create_app(base_dir: Path) -> FastAPI:
         relay = SttRelay(api_key=key,
                          keyterms=load_keyterms(base_dir / "config" / "keyterms.json"),
                          base_url=os.environ.get("DEEPGRAM_URL", "wss://api.deepgram.com"))
-        await relay.run(inbound(), app.state.bus.publish)
-        await ws.close()
+        try:
+            await relay.run(inbound(), app.state.bus.publish)
+        except StopAsyncIteration:
+            # The socket opened and died before the browser's `start` frame:
+            # a tap released mid-handshake, or a reload. SttRelay's opening
+            # `anext(inbound)` has nothing to take. Nothing was heard — say so.
+            app.state.bus.publish("stt.error", {"reason": "no audio captured"})
+        except Exception:
+            # A relay that dies on its way up is the loudest silence there is:
+            # a stale DEEPGRAM_API_KEY raises InvalidStatus, which is not an
+            # OSError and so slips past SttRelay's own guard. Before this, that
+            # went to the log and the console got nothing at all — the mic just
+            # "didn't work". Every failure is surfaced, never raised.
+            app.state.bus.publish("stt.error", {"reason": "transcription failed"})
+        finally:
+            await close_quietly(ws)
 
     @app.websocket("/audio")
     async def audio(ws: WebSocket):

@@ -92,6 +92,23 @@ window.jarvis.onEvent("wake", () => {
 // ---- press-and-hold mic → /mic WebSocket -------------------------------
 let micWS = null, micStream = null, micNode = null, analyser = null;
 let micAborting = false;
+// The socket of the PREVIOUS hold, still open on its flush grace. Tracked so a
+// new press can retire it: two open /mic sockets mean two Deepgram relays
+// publishing stt.* into one bus, and the tail of the last utterance landing on
+// top of this one.
+let micDraining = null;
+// Is a press outstanding? micWS is not that answer — it is still null while
+// setup is in flight, and it is nulled the instant a release starts. A hold
+// whose release event never arrives (window switch, cmd-tab to the terminal)
+// has to be recoverable, and this is what the recovery reads.
+let micHeld = false;
+
+function closeDraining() {
+  if (!micDraining) return;
+  const ws = micDraining;
+  micDraining = null;
+  ws.close();
+}
 
 // Shared, null-safe teardown. Does NOT close micWS if it has already been
 // nulled by the caller (graceful stop hands the socket off to a delayed close).
@@ -108,6 +125,8 @@ function teardownMic() {
 
 async function startTalking() {
   if (micWS) return;
+  micHeld = true;
+  closeDraining();   // one live relay at a time
   micAborting = false;
   try {
     window.jarvis.playChime("listen");
@@ -122,15 +141,27 @@ async function startTalking() {
     src.connect(analyser);
     micNode = new AudioWorkletNode(ctx, "mic-processor");
     src.connect(micNode);
-    micWS = new WebSocket(`ws://${location.host}/mic`);
-    micWS.binaryType = "arraybuffer";
-    micWS.onopen = () => {
-      micWS.send(JSON.stringify({ type: "start", encoding: "linear16",
+    // `ws` is captured, not read back off micWS. A release lands during the
+    // handshake often enough — it is the last unguarded gap in this setup —
+    // and it nulls micWS, so a handler that reached for the global fired
+    // `null.send(...)` and died. Compare against micWS instead: not the
+    // current socket, nothing to do.
+    const ws = new WebSocket(`ws://${location.host}/mic`);
+    micWS = ws;
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => {
+      if (micWS !== ws) { ws.close(); return; } // released while CONNECTING
+      ws.send(JSON.stringify({ type: "start", encoding: "linear16",
         sample_rate: 16000, channels: 1, t_hold: Date.now() }));
       micNode.port.onmessage = (e) => {
-        if (micWS && micWS.readyState === 1) micWS.send(e.data);
+        if (micWS === ws && ws.readyState === 1) ws.send(e.data);
       };
     };
+    // An abnormal close used to leave micWS pointing at a dead socket, and
+    // every later press returned at the guard above — hold-to-talk simply
+    // stopped, until a reload. Reset instead, so the next press starts clean.
+    ws.onclose = () => { if (micWS === ws) teardownMic(); };
+    ws.onerror = () => { if (micWS === ws) teardownMic(); };
     drawWave();
   } catch (err) {
     teardownMic();
@@ -140,6 +171,7 @@ async function startTalking() {
 }
 
 function stopTalking() {
+  micHeld = false;
   if (!micWS) {
     // Setup still in flight (or already torn down): signal the abort AND stop
     // whatever the in-flight setup may have already opened, so the mic can't
@@ -148,11 +180,21 @@ function stopTalking() {
     teardownMic();
     return;
   }
-  if (micWS.readyState === 1)
-    micWS.send(JSON.stringify({ type: "stop", t_release: Date.now() }));
-  const ws = micWS; micWS = null; // null first so teardownMic won't close it
-  teardownMic();                  // stops tracks, disconnects node, clears .live
-  setTimeout(() => ws.close(), 3000); // give server time to flush finals
+  const ws = micWS;
+  const open = ws.readyState === 1;
+  if (open) ws.send(JSON.stringify({ type: "stop", t_release: Date.now() }));
+  micWS = null;    // null first so teardownMic won't close it
+  teardownMic();   // stops tracks, disconnects node, clears .live
+  if (open) {
+    micDraining = ws;
+    // Give the server time to flush finals — but only until the next press.
+    setTimeout(() => { if (micDraining === ws) closeDraining(); }, 3000);
+  } else {
+    // Released before the handshake finished. No `start` frame ever went out,
+    // so there is no session and nothing to flush; parking the socket for the
+    // grace period would just leave the server holding a mic that never spoke.
+    ws.close();
+  }
   window.jarvis.setStatus("thinking…");
 }
 
@@ -171,15 +213,52 @@ function drawWave() {
 }
 
 const ptt = $("#ptt");
-ptt.addEventListener("pointerdown", startTalking);
-ptt.addEventListener("pointerup", stopTalking);
-ptt.addEventListener("pointerleave", stopTalking);
+let pttPointer = null;   // pointerId of the press that owns the mic
+
+ptt.addEventListener("pointerdown", (e) => {
+  pttPointer = e.pointerId;
+  // Capture the pointer. Without it the button only hears a release that
+  // happens ON the button, so `pointerleave` had to stand in as the safety
+  // net — and it fires on any drift, which cut the mic mid-sentence for
+  // anyone who moved the mouse while talking. With capture, pointerup and
+  // pointercancel come here wherever the cursor ended up, and leave never
+  // fires during the hold at all.
+  try { ptt.setPointerCapture(e.pointerId); } catch (err) { /* backstop below */ }
+  startTalking();
+});
+
+function releasePointer(e) {
+  if (pttPointer === null || (e && e.pointerId !== pttPointer)) return;
+  pttPointer = null;
+  stopTalking();
+}
+ptt.addEventListener("pointerup", releasePointer);
+ptt.addEventListener("pointercancel", releasePointer);
+// Backstop for a browser that refused the capture: the release still reaches
+// window. Guarded by pttPointer, so a click anywhere else cannot cut a hold.
+window.addEventListener("pointerup", releasePointer);
+window.addEventListener("pointercancel", releasePointer);
+
 document.addEventListener("keydown", (e) => {
   if (e.code === "Space" && !e.repeat && !$("#setup-overlay").hidden) return;
   if (e.code === "Space" && !e.repeat) { e.preventDefault(); startTalking(); }
 });
 document.addEventListener("keyup", (e) => {
   if (e.code === "Space") { e.preventDefault(); stopTalking(); }
+});
+
+// A hold whose release never arrives: hold Space, cmd-tab to the terminal, and
+// keyup lands in the other window. micWS stayed set, the mic stayed hot, and
+// every later press returned at the `if (micWS) return` guard — hold-to-talk
+// dead until a reload. Losing the window ends the hold.
+function endHoldOnLostFocus() {
+  if (!micHeld && !micWS) return;
+  pttPointer = null;
+  stopTalking();
+}
+window.addEventListener("blur", endHoldOnLostFocus);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) endHoldOnLostFocus();
 });
 
 window.jarvis.onEvent("stt.interim", (d) => {
