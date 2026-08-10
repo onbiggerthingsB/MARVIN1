@@ -1,8 +1,7 @@
 #!/bin/bash
 # Marlowe launcher: start server if down, open the console, send /wake.
 set -euo pipefail
-# TODO: becomes $HOME/marlowe when the directory moves
-MARLOWE_DIR="$HOME/jarvis"
+MARLOWE_DIR="$HOME/marlowe"
 cd "$MARLOWE_DIR"
 [ -f .env ] && set -a && source .env && set +a
 

@@ -6,3 +6,4 @@ static/clips/
 static/chimes/
 config/marlowe.json
 live_test.py
+config/projects.json

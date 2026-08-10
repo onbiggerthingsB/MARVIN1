@@ -1,6 +1,6 @@
 """M3P2 milestone gate — preflight.
 
-Run:   cd ~/jarvis && uv run python scripts/gate_preflight.py
+Run:   cd ~/marlowe && uv run python scripts/gate_preflight.py
        (add --skip-tests to skip the suite when you have just run it)
 
 WHY THIS EXISTS
@@ -154,7 +154,7 @@ def check_proxy_env(env: dict) -> Check:
             "proxy env", ERROR,
             f"proxy_problem() says: {problem}. Marlowe would refuse the beat-2 "
             f"spawn with \"I can't spawn safely, sir\".",
-            "in ~/jarvis/.env set HTTPS_PROXY=http://127.0.0.1:7890, "
+            "in ~/marlowe/.env set HTTPS_PROXY=http://127.0.0.1:7890, "
             "HTTP_PROXY=http://127.0.0.1:7890 and "
             "NO_PROXY=localhost,127.0.0.1 (BOTH hosts — curl matches the "
             "literal URL host, so `localhost` alone still proxies the hook "
@@ -263,7 +263,7 @@ def check_beat1(wired: bool, projects: list) -> Check:
             "this is a real M3P2 finding — write it into the report. To run "
             "the REST of the gate, seed the registry by hand (config data, "
             "not code — do not patch server/):\n"
-            "     cd ~/jarvis && uv run python - <<'PY'\n"
+            "     cd ~/marlowe && uv run python - <<'PY'\n"
             "     import asyncio\n"
             "     from pathlib import Path\n"
             "     from server.discovery import discover\n"
@@ -400,7 +400,7 @@ def check_voice(env: dict) -> list[Check]:
             "DEEPGRAM_API_KEY is not set. The /mic WebSocket publishes "
             "stt.error and closes with code 4500, so nothing you say reaches "
             "Marlowe — this is a voice gate and it cannot start.",
-            "add DEEPGRAM_API_KEY=<key> to ~/jarvis/.env (it is currently "
+            "add DEEPGRAM_API_KEY=<key> to ~/marlowe/.env (it is currently "
             "present but commented out)"))
     forced = (env.get("MARLOWE_VOICE") or "").strip().lower()
     has_pair = bool(env.get("ELEVENLABS_API_KEY")
@@ -426,7 +426,7 @@ def check_voice(env: dict) -> list[Check]:
             f"performable — beat 3's readback and beat 4's fleet line are "
             f"still spoken — it just sounds like the system voice, which is "
             f"worth a sentence in the report so nobody thinks TTS failed.",
-            "add ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID to ~/jarvis/.env "
+            "add ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID to ~/marlowe/.env "
             "if you want the Marlowe voice on the recording"))
     return out
 
@@ -452,7 +452,7 @@ def access_log_check(launcher_text: str) -> Check:
         "evidence, and the beat with no automated proof anywhere else.",
         "start the server yourself BEFORE running `marlowe`, with the access "
         "log on (do the same for beat 9's restart):\n"
-        "     cd ~/jarvis && set -a && . ./.env && set +a && \\\n"
+        "     cd ~/marlowe && set -a && . ./.env && set +a && \\\n"
         "       nohup uv run uvicorn server.app:app_factory --factory \\\n"
         "         --host 127.0.0.1 --port 7777 --access-log \\\n"
         "         >> state/server.log 2>&1 &\n"
@@ -558,7 +558,7 @@ def check_state_dir(state: Path) -> list[Check]:
     if not state.is_dir():
         out.append(Check(
             "state/", ERROR, f"{state} does not exist",
-            "mkdir -p ~/jarvis/state  (the server creates it at boot, but the "
+            "mkdir -p ~/marlowe/state  (the server creates it at boot, but the "
             "observer wants to tail it from before the boot)"))
         return out
     if not os.access(state, os.R_OK | os.W_OK):
@@ -597,7 +597,7 @@ def main(argv: list[str] | None = None) -> int:
         report.add(".env", ERROR, f"{env_path} is missing — bin/marlowe sources "
                                   f"it, so the server would start with no "
                                   f"proxy and no keys at all",
-                   "create ~/jarvis/.env with HTTPS_PROXY, HTTP_PROXY, "
+                   "create ~/marlowe/.env with HTTPS_PROXY, HTTP_PROXY, "
                    "NO_PROXY and DEEPGRAM_API_KEY")
     env = merged_env(dict(os.environ), dotenv)
 
@@ -607,7 +607,7 @@ def main(argv: list[str] | None = None) -> int:
         report.add("proxy reachable", ERROR,
                    "no proxy URL in the environment, so there is nothing to "
                    "probe",
-                   "set HTTPS_PROXY=http://127.0.0.1:7890 in ~/jarvis/.env")
+                   "set HTTPS_PROXY=http://127.0.0.1:7890 in ~/marlowe/.env")
     else:
         host, port = endpoint
         if tcp_open(host, port):
@@ -793,7 +793,7 @@ def main(argv: list[str] | None = None) -> int:
     if not report.warnings:
         print("no warnings.")
     print("\nNext: open a second terminal and run")
-    print("      cd ~/jarvis && uv run python scripts/gate_observer.py")
+    print("      cd ~/marlowe && uv run python scripts/gate_observer.py")
     print("then run `marlowe` and follow scripts/gate_checklist.md.")
     return exit_code(report)
 
