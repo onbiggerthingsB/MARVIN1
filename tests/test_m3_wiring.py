@@ -650,3 +650,43 @@ async def test_the_brain_survives_a_source_gate_explosion(tmp_path):
     await fut
     assert not task.done()
     task.cancel()
+
+
+# ---- separator-free spawn + the spawn hint (live demo defect, 2026-08) ----
+
+async def test_a_separator_free_spawn_is_routed_not_answered():
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=confirmed_registry("soccer")))
+    await asyncio.sleep(0)
+    fut = asyncio.ensure_future(_drain(bus, "router.command"))
+    bus.publish("command.received",
+                {"text": "begin work on soccer add a comment to the readme"})
+    ev = await fut
+    assert ev["data"]["verb"] == "spawn" and ev["data"]["project"] == "soccer"
+    assert ev["data"]["argument"] == "add a comment to the readme"
+    assert butler.asked == []          # the model was never consulted
+    task.cancel()
+
+
+async def test_a_spawn_shaped_fallthrough_is_explained_not_answered():
+    # The dangerous half of the live defect: an unresolvable spawn used to be
+    # answered CONVERSATIONALLY by the butler, so the failure read like
+    # intended behaviour. The brain now speaks the router's deterministic
+    # hint instead, and the model is never consulted.
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=confirmed_registry("soccer")))
+    await asyncio.sleep(0)
+    bus.publish("command.received",
+                {"text": "begin work on flimflam do the thing"})
+
+    async def spoken():
+        while not spk.spoke:
+            await asyncio.sleep(0.01)
+    await asyncio.wait_for(spoken(), 2.0)
+    assert butler.asked == []          # never became a conversational answer
+    assert "start work" in spk.spoke[0].lower()   # tells Keke how to retry
+    task.cancel()

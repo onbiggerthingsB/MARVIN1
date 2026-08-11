@@ -888,3 +888,249 @@ def test_no_affirmation_vocabulary_can_ever_OPEN_a_worktree_verb():
             said = word + tail
             c = router.parse(said, registry)
             assert c is None or not c.verb.startswith("worktree"), said
+
+
+# ---------- separator-free spawn (live demo defect, 2026-08) ----------
+# _SPAWN required a literal "," or ":" between project and task, and Deepgram
+# does not reliably emit one from a spoken pause. Both live utterances below
+# fell through to the butler and were answered as CONVERSATION — a silently
+# unrouted command that read like intended behaviour. The router now finds the
+# project/task boundary with the registry instead of punctuation; the
+# separator form keeps working unchanged.
+
+def demo_registry():
+    """The real fleet's shape: confirmed multi-word names, a shared word
+    ("agent"), a hyphenated name, and two directories both named jarvis."""
+    r = Registry()
+    r.merge_candidates([
+        Candidate(path="/Users/likerun/marlowe", name="marlowe", sources=["t"]),
+        Candidate(path="/p/worldcup", name="worldcup", sources=["t"]),
+        Candidate(path="/p/health-translator", name="health-translator", sources=["t"]),
+        Candidate(path="/p/globe", name="globe", sources=["t"]),
+        Candidate(path="/p/dei", name="dei", sources=["t"]),
+        Candidate(path="/p/prompt", name="prompt", sources=["t"]),
+        Candidate(path="/p/probe", name="probe", sources=["t"]),
+        Candidate(path="/p/sat-agent", name="SAT agent", sources=["t"]),
+        Candidate(path="/p/quant-agent", name="quant agent", sources=["t"]),
+        Candidate(path="/Users/likerun/jarvis", name="jarvis", sources=["t"]),
+        Candidate(path="/Users/likerun/Desktop/jarvis", name="jarvis", sources=["t"]),
+    ])
+    for p in r.projects:
+        p.confirmed = True
+    return r
+
+
+def test_beat_1_transcript_spawns_without_a_separator():
+    # Said: "Start work in Marlowe, add a comment at the top of the README".
+    # Deepgram heard: verb corrupted to "Star", no comma, "add a" -> "added".
+    c = Router().parse(
+        "Star work in Marlowe added a comment at the top of the read me",
+        demo_registry())
+    assert c is not None and c.verb == "spawn"
+    assert c.project == "marlowe" and c.path == "/Users/likerun/marlowe"
+    assert c.argument == "added a comment at the top of the read me"
+    assert c.needs_disambiguation == []
+
+
+def test_beat_2_transcript_spawns_without_a_separator():
+    # Said with a deliberate pause after "Marlowe"; Deepgram emitted no comma.
+    c = Router().parse(
+        "Begin work on Marlowe Add a common at the top of the ReadMe.",
+        demo_registry())
+    assert c is not None and c.verb == "spawn"
+    assert c.project == "marlowe"
+    assert c.argument == "Add a common at the top of the ReadMe."
+
+
+@pytest.mark.parametrize("said", [
+    "start work in marlowe add a comment at the top of the readme",
+    "start working in marlowe add a comment at the top of the readme",
+    "begin work on marlowe add a comment at the top of the readme",
+    "kick off work on marlowe add a comment at the top of the readme",
+    "star work in marlowe add a comment at the top of the readme",
+    "start on marlowe add a comment at the top of the readme",
+])
+def test_every_spawn_opener_works_without_a_separator(said):
+    c = Router().parse(said, demo_registry())
+    assert c is not None and c.verb == "spawn", said
+    assert c.project == "marlowe", said
+    assert c.argument == "add a comment at the top of the readme", said
+
+
+def test_the_separator_form_still_works_unchanged():
+    c = Router().parse("start work in marlowe: fix the login redirect",
+                       demo_registry())
+    assert c.verb == "spawn" and c.project == "marlowe"
+    assert c.argument == "fix the login redirect"
+    # lazy project group: the FIRST separator is still the boundary
+    c = Router().parse("start work in marlowe, add a note, then push",
+                       demo_registry())
+    assert c.project == "marlowe" and c.argument == "add a note, then push"
+
+
+def test_star_is_accepted_in_the_separator_form_too():
+    c = Router().parse("star work in marlowe: add tests", demo_registry())
+    assert c is not None and c.verb == "spawn" and c.project == "marlowe"
+
+
+def test_star_never_claims_ordinary_speech():
+    # "star" is whitelisted ONLY as the observed corruption of "start" — the
+    # full spawn shape (in/on + confirmed project + task) still gates it.
+    r = demo_registry()
+    assert Router().parse("star wars is on tonight", r) is None
+    assert Router().parse("star gazing tonight", r) is None
+
+
+def test_a_multiword_name_takes_the_whole_name_not_the_first_word():
+    c = Router().parse("begin work on SAT agent fix the flashcard deck",
+                       demo_registry())
+    assert c.verb == "spawn" and c.project == "SAT agent"
+    assert c.argument == "fix the flashcard deck"
+    c = Router().parse("start work on quant agent rebalance the paper portfolio",
+                       demo_registry())
+    assert c.project == "quant agent"
+    assert c.argument == "rebalance the paper portfolio"
+
+
+def test_a_word_shared_by_two_names_asks_instead_of_picking():
+    # "agent" is a token of BOTH "SAT agent" and "quant agent".
+    c = Router().parse("begin work on agent fix the deck", demo_registry())
+    assert c is not None and c.verb == "spawn" and c.project is None
+    assert len(c.needs_disambiguation) == 2
+
+
+def test_a_name_that_prefixes_another_takes_the_longer_name():
+    r = Registry()
+    r.merge_candidates([
+        Candidate(path="/p/globe", name="globe", sources=["t"]),
+        Candidate(path="/p/globe-viewer", name="globe viewer", sources=["t"])])
+    for p in r.projects:
+        p.confirmed = True
+    c = Router().parse("start work on globe viewer add dark mode", r)
+    assert c.project == "globe viewer" and c.argument == "add dark mode"
+    c = Router().parse("start work on globe add clouds", r)
+    assert c.project == "globe" and c.argument == "add clouds"
+
+
+def test_the_longer_name_wins_even_when_only_fuzzy_matches_it():
+    # By ear "world cup ..." is the longer project's name; the shorter exact
+    # match ("world") explains strictly less of the utterance.
+    r = Registry()
+    r.merge_candidates([
+        Candidate(path="/p/world", name="world", sources=["t"]),
+        Candidate(path="/p/worldcup", name="worldcup", sources=["t"])])
+    for p in r.projects:
+        p.confirmed = True
+    c = Router().parse("begin work on world cup add the bracket page", r)
+    assert c.project == "worldcup" and c.argument == "add the bracket page"
+    c = Router().parse("begin work on world update the map", r)
+    assert c.project == "world" and c.argument == "update the map"
+
+
+def test_fuzzy_extension_never_swallows_the_first_task_word():
+    # ratio("marlowe a", "marlowe") = 0.875 >= the 0.82 cutoff — a bare
+    # longest-span rule would absorb the task's first word into the project
+    # span. The token-exact match at the shorter span must win for the SAME
+    # project, keeping the task intact.
+    c = Router().parse("begin work on marlowe a comment at the top",
+                       demo_registry())
+    assert c.project == "marlowe"
+    assert c.argument == "a comment at the top"
+
+
+def test_a_task_mentioning_another_project_does_not_misroute():
+    c = Router().parse("begin work on marlowe add a note about worldcup",
+                       demo_registry())
+    assert c.verb == "spawn" and c.project == "marlowe"
+    assert c.path == "/Users/likerun/marlowe"
+    assert c.argument == "add a note about worldcup"
+
+
+def test_an_unconfirmed_repo_never_spawns_separator_free():
+    r = demo_registry()
+    r.merge_candidates([Candidate(path="/p/secret", name="secret", sources=["t"])])
+    assert Router().parse("begin work on secret add tests", r) is None
+
+
+def test_a_spawn_shaped_utterance_naming_nothing_known_falls_through():
+    assert Router().parse("begin work on flimflam do the thing",
+                          demo_registry()) is None
+
+
+def test_an_empty_task_never_spawns():
+    assert Router().parse("begin work on marlowe", demo_registry()) is None
+    assert Router().parse("start work in SAT agent", demo_registry()) is None
+
+
+def test_twin_checkouts_ask_rather_than_guessing_separator_free():
+    c = Router().parse("begin work on jarvis add a test", demo_registry())
+    assert c is not None and c.verb == "spawn"
+    assert c.project is None and c.path is None
+    assert len(c.needs_disambiguation) == 2
+    assert c.needs_disambiguation[0] != c.needs_disambiguation[1]
+
+
+def test_a_recorded_mishearing_resolves_separator_free():
+    r = demo_registry()
+    r.add_mishearing("marlowe", "mar lo")
+    c = Router().parse("begin work on mar lo add a test", r)
+    assert c.project == "marlowe" and c.argument == "add a test"
+
+
+def test_a_near_miss_transcription_of_the_name_still_resolves():
+    # ratio("marlow", "marlowe") = 0.923 — the same fuzzy tolerance
+    # Registry.match already extends to the separator form.
+    c = Router().parse("begin work on marlow add a test", demo_registry())
+    assert c.project == "marlowe" and c.argument == "add a test"
+
+
+# ---------- the spoken hint for spawn-shaped fallthroughs ----------
+# The dangerous half of the live defect: an unresolvable spawn fell through to
+# the butler, whose helpful conversational answer made the failure read like
+# intended behaviour. parse() still returns None for these (pinned above —
+# never guess), but the brain can now ask the router WHY, and speak it.
+
+def test_an_unrecognized_project_earns_a_spoken_hint():
+    r = Router()
+    assert r.parse("begin work on flimflam do the thing", demo_registry()) is None
+    hint = r.spawn_hint("begin work on flimflam do the thing", demo_registry())
+    assert hint is not None and "project" in hint.lower()
+
+
+def test_a_missing_task_earns_a_hint_naming_the_project():
+    r = Router()
+    assert r.parse("begin work on marlowe", demo_registry()) is None
+    hint = r.spawn_hint("begin work on marlowe", demo_registry())
+    assert hint is not None and "marlowe" in hint
+
+
+def test_the_separator_form_with_an_unknown_project_earns_the_hint():
+    # test_unknown_project_does_not_become_a_spawn pins parse() -> None for
+    # this exact shape; the hint is how it stops VANISHING into conversation.
+    hint = Router().spawn_hint("start work in nonexistent: do a thing",
+                               demo_registry())
+    assert hint is not None
+
+
+@pytest.mark.parametrize("said", [
+    "where did I leave the Tibet study?",
+    "note that I should begin working on my essay",
+    "what's running right now?",
+    "how are the picks doing?",
+    "star wars is on tonight",
+])
+def test_ordinary_speech_never_earns_a_hint(said):
+    assert Router().spawn_hint(said, demo_registry()) is None, said
+
+
+def test_a_resolved_spawn_never_earns_a_hint():
+    r = Router()
+    assert r.spawn_hint("start work in marlowe: add tests", demo_registry()) is None
+    assert r.spawn_hint("begin work on marlowe add tests", demo_registry()) is None
+
+
+def test_a_trade_never_earns_a_hint():
+    # parse() claims trades as refuse_trade, so the hint must stay silent even
+    # if a caller asks out of order.
+    assert Router().spawn_hint("begin work on buy 10 shares of NVDA",
+                               demo_registry()) is None

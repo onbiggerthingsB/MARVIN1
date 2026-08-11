@@ -7,16 +7,33 @@ natural phrasing still works for questions, search and conversation.
 """
 from __future__ import annotations
 
+import difflib
 import re
 import secrets
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
+# One cutoff and one containment floor, shared with Registry.match so the
+# separator-free boundary below can never drift from what "resolves" means.
+from server.registry import FUZZY_CUTOFF, MIN_CONTAINMENT_LEN
+
 APPROVAL_TTL_S = 600.0
 
+# "star" is NOT a wider verb policy — it is the one corruption of "start"
+# Deepgram produced on a live microphone ("Star work in Marlowe ..."), added
+# the way the registry records mishearings: one observed token, whitelisted.
+# It cannot loosen the gate on its own because the full spawn shape still
+# stands behind it — in/on, a CONFIRMED project, and a non-empty task.
+_SPAWN_PREFIX = r"^\s*(?:start|star|begin|kick off)\s+(?:work|working)?\s*(?:in|on)\s+"
 _SPAWN = re.compile(
-    r"^\s*(?:start|begin|kick off)\s+(?:work|working)?\s*(?:in|on)\s+(?P<project>.+?)"
-    r"\s*[:,]\s*(?P<task>.+)$", re.I)
+    _SPAWN_PREFIX + r"(?P<project>.+?)\s*[:,]\s*(?P<task>.+)$", re.I)
+# The same opener WITHOUT the separator. Deepgram does not reliably emit a
+# "," or ":" from a spoken pause (observed live, twice), so depending on one
+# is a design defect in a voice-first product. The project/task boundary for
+# this form comes from the REGISTRY (see _spawn_boundary), never from
+# punctuation and never from a model. The separator form above stays first:
+# when the owner's pause does produce one, it is unambiguous.
+_SPAWN_FREE = re.compile(_SPAWN_PREFIX + r"(?P<tail>.+?)\s*$", re.I)
 _STEER = re.compile(r"^\s*tell\s+(?P<project>.+?)\s+to\s+(?P<task>.+)$", re.I)
 _PULL_UP = re.compile(r"^\s*(?:pull\s+up|show\s+me|open)\s+(?P<project>.+?)\s*$", re.I)
 # Named so the fail-closed property test can enumerate them: every verb here
@@ -281,6 +298,34 @@ def _approval_vocabulary(a, spoken_tokens: set[str]) -> frozenset[str]:
     return frozenset(vocabulary)
 
 
+def _name_tier(span: str, span_tokens: list[str], project) -> int | None:
+    """The strength with which the WHOLE of `span` names `project`:
+    0 = token-exact (the span IS one of its spoken forms), 1 = partial-name
+    containment (every span token belongs to one form: "SAT" for "SAT agent"),
+    2 = whole-span fuzzy (Registry.match's own cutoff: "marlow" for
+    "marlowe"). None = does not name it.
+
+    This is Registry.match MINUS its query-contains-form direction, and that
+    omission is the whole point: here the words after the name are the TASK,
+    so a test that lets the query carry extra words would "resolve" a span
+    with leftovers — and a name with leftovers is not a name. `span` must be
+    lowercased normalized text; `span_tokens` its _tokens()."""
+    tier = None
+    for form in project.spoken_forms():
+        f_tokens = _tokens(form)
+        if not f_tokens:
+            continue
+        if span_tokens == f_tokens:
+            return 0
+        if (len(span) >= MIN_CONTAINMENT_LEN          # never trust voice filler
+                and set(span_tokens) <= set(f_tokens)):
+            tier = 1
+        elif tier is None and difflib.SequenceMatcher(
+                None, span, form.lower()).ratio() >= FUZZY_CUTOFF:
+            tier = 2
+    return tier
+
+
 def _distinct_path_tokens(p, matches) -> set[str]:
     """Tokens of p's path that appear in NO other match's path — the words that
     can single it out ("desktop" for /Users/likerun/Desktop/jarvis)."""
@@ -383,6 +428,87 @@ class Router:
             return None, [_label(m, matches) for m in matches]
         return None, []
 
+    def _spawn_boundary(self, tail: str, registry):
+        """-> (Project | None, task | None, ambiguous_labels). The registry,
+        not punctuation, finds where the project ends and the task begins.
+
+        THE BOUNDARY RULE. For every CONFIRMED project, find the leading
+        word-span of `tail` that best names it: the lowest _name_tier wins
+        first (token-exact beats partial beats fuzzy — so "marlowe" at one
+        word beats the fuzzy "marlowe a" at two, and the task keeps its first
+        word), then the longest span (so alias "sat" never strands "agent" in
+        the task when "SAT agent" is fully present). Across projects the
+        LONGEST claimed span wins — the claim that explains more of the
+        utterance ("globe viewer" over "globe", the fuzzy "world cup" over
+        the exact "world") — and a tie on length breaks by tier, the same
+        precedence Registry.match applies globally: "globe" IS one project's
+        exact name and merely half of "globe viewer"'s. A tie on BOTH is
+        genuine ambiguity (two checkouts named jarvis; "agent" naming both
+        agents): refuse and return spoken labels rather than picking one.
+
+        Why this cannot misroute: a span only ever claims a project whose own
+        spoken forms account for the WHOLE span (_name_tier has no
+        query-contains-form direction), spans are leading-only (a project
+        named in the task text is never a claim), only confirmed projects
+        compete, and every collision returns labels instead of a winner."""
+        words = tail.split()
+        claims: list[tuple] = []                    # (Project, span_length, tier)
+        for p in registry.projects:
+            if not p.confirmed:
+                continue
+            best = None                             # (tier, span_length)
+            for j in range(1, len(words) + 1):
+                span = " ".join(words[:j]).lower()
+                span_tokens = _tokens(span)
+                if not span_tokens:
+                    continue
+                tier = _name_tier(span, span_tokens, p)
+                if tier is None:
+                    continue
+                if best is None or (tier, -j) < (best[0], -best[1]):
+                    best = (tier, j)
+            if best is not None:
+                claims.append((p, best[1], best[0]))
+        if not claims:
+            return None, None, []
+        longest = max(j for _, j, _t in claims)
+        best_tier = min(t for _, j, t in claims if j == longest)
+        finalists = [p for p, j, t in claims if j == longest and t == best_tier]
+        task = " ".join(words[longest:])
+        if len(finalists) == 1:
+            return finalists[0], task, []
+        return None, task, [_label(p, finalists) for p in finalists]
+
+    def spawn_hint(self, spoken: str, registry) -> str | None:
+        """A spoken sentence for a spawn-SHAPED utterance parse() returned
+        None for — or None when the utterance is not spawn-shaped and the
+        butler genuinely owns it.
+
+        Half of what made the live defect confusing was the SILENT
+        fallthrough: an unrouted spawn became a coherent butler conversation,
+        so the failure read like intended behaviour. parse()'s contract stays
+        pure (None = not a command; it never guesses), and the brain calls
+        this afterwards to turn that silence into an honest sentence. The
+        wording is decided here, deterministically — never by the model."""
+        text = _normalized((spoken or "").strip())
+        if not text or _TRADE.search(text):
+            return None                # trades are refused by parse(), loudly
+        m = _SPAWN_FREE.match(text)
+        if m is None:
+            return None                # not spawn-shaped — the butler's turn
+        proj, task, ambiguous = self._spawn_boundary(m.group("tail"), registry)
+        if ambiguous:
+            return None                # parse() returned a Command; brain asked
+        if proj is not None and not task:
+            return (f"That sounded like a start-work order for {proj.name}, "
+                    f"sir, but I didn't hear a task — say start work in "
+                    f"{proj.name}, then the task.")
+        if proj is None:
+            return ("That sounded like a start-work order, sir, but I don't "
+                    "recognize the project — say start work in, then a "
+                    "project I know, then the task.")
+        return None                    # resolved with a task: parse() claimed it
+
     def parse(self, spoken: str, registry, has_fleet: bool = False) -> Command | None:
         # Normalized before ANY pattern runs: several patterns here spell an
         # apostrophe inline ("what'?s", "don'?t"), and nova-3's curly form
@@ -418,17 +544,56 @@ class Router:
             return Command(verb="worktree_remove_named",
                            argument=m.group("name").strip())
 
-        for pattern, verb, arg_group in((_SPAWN, "spawn", "task"), (_STEER, "steer", "task")):
-            m = pattern.match(text)
-            if m:
-                proj, ambiguous = self._resolve(m.group("project"), registry)
-                if proj is None and not ambiguous:
-                    return None            # unknown/unconfirmed project → not a command
-                return Command(verb=verb,
+        # ---- spawn: two paths, one verb. The separator form first — when the
+        # owner's pause DOES produce a "," or ":" it is unambiguous. When it
+        # does not (Deepgram, observed live, twice), the registry finds the
+        # project/task boundary instead of punctuation. Nothing here ever
+        # guesses: unresolved shapes fail closed, and the brain may then ask
+        # spawn_hint() why, so the fallthrough is spoken instead of silently
+        # becoming a butler conversation.
+        m_sep = _SPAWN.match(text)
+        if m_sep:
+            proj, ambiguous = self._resolve(m_sep.group("project"), registry)
+            if proj is not None or ambiguous:
+                return Command(verb="spawn",
                                project=proj.name if proj else None,
                                path=proj.path if proj else None,
-                               argument=m.group(arg_group).strip(),
+                               argument=m_sep.group("task").strip(),
                                needs_disambiguation=ambiguous)
+            # separator present but its project part resolves nothing — try
+            # the registry boundary (the separator may sit inside the task)
+        m = _SPAWN_FREE.match(text)
+        if m:
+            proj, task, ambiguous = self._spawn_boundary(m.group("tail"), registry)
+            if ambiguous:
+                return Command(verb="spawn", argument=task or None,
+                               needs_disambiguation=ambiguous)
+            if proj is not None and task:
+                return Command(verb="spawn", project=proj.name,
+                               path=proj.path, argument=task)
+            # Unknown project, or a name with no task: an empty task must
+            # never spawn a real worker. Fail closed.
+        if m_sep:
+            # Today's contract, kept: a separator spawn that resolves nothing
+            # is NOT a command and STOPS parsing (it must not leak into the
+            # later patterns — "start work in the portfolio: ..." is not a
+            # portfolio question). The brain may speak spawn_hint() for it.
+            return None
+        # The separator-FREE shape falls through unchanged: utterances the
+        # boundary cannot claim keep exactly the routing they had before this
+        # path existed ("begin working on the picks" stays a portfolio
+        # question), and the butler fallthrough is what spawn_hint() covers.
+
+        m = _STEER.match(text)
+        if m:
+            proj, ambiguous = self._resolve(m.group("project"), registry)
+            if proj is None and not ambiguous:
+                return None            # unknown/unconfirmed project → not a command
+            return Command(verb="steer",
+                           project=proj.name if proj else None,
+                           path=proj.path if proj else None,
+                           argument=m.group("task").strip(),
+                           needs_disambiguation=ambiguous)
 
         for pattern, verb in ((_PULL_UP, "pull_up"), (_STOP, "stop")):
             m = pattern.match(text)

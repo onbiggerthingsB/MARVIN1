@@ -785,6 +785,24 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                         await _speak("Sorry sir, that command failed.")
                     continue
 
+                # A spawn-SHAPED utterance the router could not resolve must
+                # not silently become a butler conversation — that silence is
+                # half of what made the live separator defect read like
+                # intended behaviour. The router (deterministic layer) decides
+                # both the detection and the wording; the brain only speaks
+                # it. Guarded like every other router touch: a hint fault
+                # falls through to the butler, exactly the old behaviour.
+                if router is not None and registry is not None:
+                    hint = None
+                    try:
+                        hint = router.spawn_hint(text, registry)
+                    except Exception as e:  # noqa: BLE001 — a hint fault must never kill the brain
+                        bus.publish("butler.error",
+                                    {"reason": f"spawn hint failed: {_reason(e)}"})
+                    if hint:
+                        await _speak(hint)
+                        continue
+
                 try:
                     answer = await asyncio.wait_for(butler.ask(text), ASK_TIMEOUT_S)
                 except ButlerUnavailable as e:
