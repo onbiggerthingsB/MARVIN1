@@ -68,6 +68,16 @@ class Onboarding:
         self.registry = registry
         self.path = Path(registry_path)
         self._asking: Project | None = None
+        # Set TRUE only after the brain's confirm.request _speak await returns —
+        # i.e. only once THIS repo question has actually been read to Keke. The
+        # exact parallel of Approval.spoken for the fleet's approvals, and for
+        # the same reason: ask_next() sets `awaiting` synchronously but appends
+        # confirm.request to the TAIL of the bus queue, so an utterance already
+        # sitting ahead of it (an impatient "yeah, go ahead") lands with
+        # awaiting=True before the question was ever spoken. handle_reply
+        # refuses to resolve until this is set, so consent can never precede the
+        # question — the barrier the confirm.next indirection was meant to be.
+        self._asking_spoken: bool = False
         self._rejected: set[str] = set()  # paths, not names — names can collide
 
     @property
@@ -75,6 +85,17 @@ class Onboarding:
         """True while a spoken confirmation is pending. The brain uses this to
         make the pending question OWN every bare yes/no-shaped utterance."""
         return self._asking is not None
+
+    def mark_spoken(self) -> bool:
+        """Record that the pending repo question was READ ALOUD. Called by the
+        brain only after the confirm.request readback's await returns — never on
+        the strength of having published it. Returns False when nothing is
+        pending (already resolved, or never asked). The mirror of
+        Router.mark_spoken for approvals."""
+        if self._asking is None:
+            return False
+        self._asking_spoken = True
+        return True
 
     def _publish_counts(self) -> None:
         self.bus.publish("registry.updated", {
@@ -104,8 +125,12 @@ class Onboarding:
         prompt = self.next_prompt()
         if prompt is None:
             self._asking = None
+            self._asking_spoken = False
             return False
         self._asking = next(p for p in self.registry.projects if p.path == prompt["path"])
+        # A fresh question, not yet read aloud: the brain marks it spoken only
+        # after the confirm.request below has actually been voiced.
+        self._asking_spoken = False
         # `kind` tags WHOSE question this is. The §16 data-source gate publishes
         # the same event type for the same console widget, but it speaks its own
         # question in the turn that asked it; the brain reads THIS one aloud and
@@ -120,6 +145,15 @@ class Onboarding:
 
     async def handle_reply(self, spoken: str) -> str:
         if self._asking is None:
+            return "ignored"
+        if not self._asking_spoken:
+            # The question has not been read aloud yet. ask_next() appends
+            # confirm.request to the TAIL of the bus queue, so this utterance
+            # was queued AHEAD of it and cannot be its answer — resolving now
+            # would confirm a repo (maybe the finance one) whose question was
+            # never spoken. Refuse and stay pending; the question is voiced next
+            # and only then may a yes confirm. handle_reply is the same barrier
+            # resolve_approval enforces with "unspoken".
             return "ignored"
         asked, text = self._asking, (spoken or "").strip()
         outcome = "ignored"
@@ -167,6 +201,7 @@ class Onboarding:
             self.registry.save(self.path)
             self.bus.publish("confirm.result", {"name": asked.name, "outcome": outcome})
             self._asking = None
+            self._asking_spoken = False
             self._publish_counts()
         return outcome
 

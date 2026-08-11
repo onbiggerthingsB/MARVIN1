@@ -243,6 +243,16 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                     question = ""
                 if question:
                     await _speak(question)
+                    # AFTER the await returns, never before it — the same
+                    # barrier Approval.spoken gives the fleet: only once THIS
+                    # repo question has been read may a yes confirm it, so an
+                    # utterance queued ahead of this event cannot resolve it.
+                    if onboarding is not None:
+                        try:
+                            onboarding.mark_spoken()
+                        except Exception as e:  # noqa: BLE001 — a mark fault must not kill the brain
+                            bus.publish("butler.error",
+                                        {"reason": f"confirm readback failed: {_reason(e)}"})
                 continue
             if etype == "confirm.next":
                 # Propose the next discovered repo. Boot discovery, the

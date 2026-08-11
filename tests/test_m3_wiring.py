@@ -278,6 +278,7 @@ async def test_okay_answers_the_repo_question_not_the_tool_approval(tmp_path):
     reg.merge_candidates([C(path="/p/soccer", name="soccer", sources=["t"])])
     ob = Onboarding(bus, reg, tmp_path / "projects.json")
     await ob.ask_next()                              # repo question now pending
+    ob.mark_spoken()                                 # ...and read aloud (the barrier)
     router = Router()
     open_spoken(router, "alethic", "rm -rf build", now=time.time())
     task = asyncio.create_task(run_butler_brain(
