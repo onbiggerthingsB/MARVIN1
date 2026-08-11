@@ -238,7 +238,12 @@ async def test_a_refusal_the_router_never_heard_of_never_runs_the_tool():
         assert all(c[0] != "deliver" for c in fleet.calls), said
         assert len(router.pending_approvals()) == 1, said
         assert "Approved, sir." not in spk.spoke, said
-        assert any("yes and a no" in s for s in spk.spoke), said
+        # The brain re-prompts rather than resolving: a deny word reads as a
+        # polarity conflict ("both a yes and a no"), an unknown refusal verb as
+        # an unaccounted-for leftover ("didn't catch part"). Either is a
+        # clarifying question; neither runs the tool.
+        assert any(("yes and a no" in s) or ("didn't catch part" in s)
+                   for s in spk.spoke), said
         task.cancel()
 
 

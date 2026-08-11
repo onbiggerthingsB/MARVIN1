@@ -586,10 +586,18 @@ class Router:
             # only when the match explains EVERY word in it (see
             # _approval_vocabulary). One unaccounted-for word — a refusal verb
             # nobody has added to a list yet, or anything else — and we say so
-            # instead of guessing: "unclear" leaves the approval pending and
-            # the card on screen for the brain to ask about.
+            # instead of guessing: "partial" leaves the approval pending and the
+            # card on screen for the brain to ask about.
+            #
+            # "partial", NOT "unclear": a leftover word is a DIFFERENT failure
+            # from a genuine both-yes-and-no ("sure, cancel that"), which
+            # _polarity_conflict already returned "unclear" for above. The brain
+            # speaks a different sentence for each — a natural approval that only
+            # used an unaccounted word ("go ahead with soccer") must not be told
+            # it "sounded like both a yes and a no", which is false and
+            # misdirects the owner's recovery.
             if _unexplained(text, _approval_vocabulary(target, spoken_tokens)):
-                return ("unclear", None)
+                return ("partial", None)
         else:
             # A bare "yes"/"no" can only answer a single unambiguous question —
             # and only one that was ASKED. A second, unread approval opened

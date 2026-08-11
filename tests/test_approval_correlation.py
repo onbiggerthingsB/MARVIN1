@@ -200,6 +200,96 @@ async def test_an_evicted_readback_leaves_the_yes_with_nothing_to_approve():
     task.cancel()
 
 
+# ---------------- IMPORTANT 4: TTS failure leaves the request UNSPOKEN --------
+class FailingSpeaker(FakeSpeaker):
+    """speak() raises — the failure this file explicitly anticipates via
+    SPEAK_TIMEOUT_S. The old _speak swallowed it to butler.error and the handler
+    marked the nonce spoken anyway, so a later yes delivered a command the owner
+    never heard."""
+    async def speak(self, t):
+        self.spoke.append(t)
+        raise RuntimeError("TTS socket died on the readback")
+
+
+async def test_a_readback_whose_tts_failed_is_not_marked_spoken():
+    bus, butler, spk = EventBus(), FakeButler(), FailingSpeaker()
+    router, fleet = Router(), FakeFleet()
+    a = router.open_approval("soccer", DESTRUCTIVE, now=time.time(),
+                             path="/p/soccer")
+    task = await brain(bus, butler, spk, router=router,
+                       registry=confirmed_registry("soccer"), fleet=fleet)
+    bus.publish("approval.request", card(
+        a, "soccer wants Bash — rm -rf /Users/likerun/Documents. "
+           "Approve or deny, sir?"))
+    await asyncio.sleep(0.05)
+    # the TTS raised, so the request must NOT be marked spoken — the TTL backstops
+    assert router.pending_approvals()[0].spoken is False
+    # and a later yes finds nothing it may resolve
+    bus.publish("command.received", {"text": "yes"})
+    await asyncio.sleep(0.05)
+    assert all(c[0] != "deliver" for c in fleet.calls)
+    assert len(router.pending_approvals()) == 1
+    assert any("haven't read" in s for s in spk.spoke)
+    task.cancel()
+
+
+async def test_a_confirm_readback_whose_tts_failed_is_not_marked_spoken(tmp_path):
+    """Same class on the onboarding path: a repo question whose readback raised
+    must stay unspoken, so a later yes cannot confirm a repo never heard."""
+    from server.discovery import Candidate
+    from server.onboarding import Onboarding
+    from server.registry import Registry
+    bus, butler, spk = EventBus(), FakeButler(), FailingSpeaker()
+    r = Registry()
+    r.merge_candidates([Candidate(path="/p/quant agent", name="quant agent",
+                                  sources=["a", "b"])])
+    ob = Onboarding(bus, r, tmp_path / "projects.json")
+    task = await brain(bus, butler, spk, router=Router(),
+                       registry=r, onboarding=ob)
+    await ob.ask_next()                                  # publishes confirm.request
+    await asyncio.sleep(0.05)                            # brain speaks it — and raises
+    assert ob._asking_spoken is False                    # never marked spoken
+    bus.publish("command.received", {"text": "yes"})
+    await asyncio.sleep(0.05)
+    assert not any(p.confirmed for p in r.projects)      # nothing confirmed
+    task.cancel()
+
+
+# ---------------- the leftover cause speaks an honest message, not a false one -
+async def test_a_leftover_word_is_not_told_it_contained_a_no():
+    """resolve_approval returns 'partial' (not 'unclear') for a natural approval
+    that merely used an unaccounted-for word, so the brain says 'I didn't catch
+    part of that' — never the false 'that sounded like both a yes and a no'."""
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    router, fleet = Router(), FakeFleet()
+    a = router.open_approval("soccer", "Bash: npm test", now=time.time(),
+                             path="/p/soccer")
+    router.mark_spoken(a.nonce)
+    task = await brain(bus, butler, spk, router=router,
+                       registry=confirmed_registry("soccer"), fleet=fleet)
+    bus.publish("command.received", {"text": "go ahead with soccer"})
+    await asyncio.sleep(0.05)
+    assert not any("both a yes and a no" in s for s in spk.spoke)    # the false line
+    assert any("didn't catch part" in s for s in spk.spoke)          # the honest one
+    assert len(router.pending_approvals()) == 1                      # still pending
+    task.cancel()
+
+
+async def test_a_genuine_polarity_conflict_still_says_both_a_yes_and_a_no():
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    router, fleet = Router(), FakeFleet()
+    a = router.open_approval("soccer", "Bash: rm -rf build", now=time.time(),
+                             path="/p/soccer")
+    router.mark_spoken(a.nonce)
+    task = await brain(bus, butler, spk, router=router,
+                       registry=confirmed_registry("soccer"), fleet=fleet)
+    bus.publish("command.received", {"text": "sure, cancel that"})
+    await asyncio.sleep(0.05)
+    assert any("both a yes and a no" in s for s in spk.spoke)
+    assert len(router.pending_approvals()) == 1
+    task.cancel()
+
+
 async def test_a_readback_that_was_actually_spoken_is_resolvable_by_voice():
     """The positive control: without it every test above passes on a Marlowe
     that simply never resolves anything by voice again."""

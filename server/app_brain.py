@@ -146,14 +146,24 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
         # reason and read as "speak failed: " on the console.
         return "timed out" if isinstance(e, asyncio.TimeoutError) else str(e)
 
-    async def _speak(text):
+    async def _speak(text) -> bool:
         # A TTS failure is not a reason to lose the brain for the rest of the
         # session; surface it and keep looping. wait_for because a hang is not a
         # failure this try/except would ever see.
+        #
+        # Returns whether speech actually SUCCEEDED. Callers that record "Keke
+        # heard this" — the approval readback (Approval.spoken) and the repo
+        # confirm (Onboarding.mark_spoken) — must consult it: a swallowed TTS
+        # failure that still marked a request spoken let a later "yes" deliver a
+        # command the owner never heard. On failure the request stays unspoken;
+        # the TTL backstops it, and fail-closed is free because the console
+        # click path ignores `spoken`.
         try:
             await asyncio.wait_for(speaker.speak(text), SPEAK_TIMEOUT_S)
+            return True
         except Exception as e:  # noqa: BLE001
             bus.publish("butler.error", {"reason": f"speak failed: {_reason(e)}"})
+            return False
 
     async def _preconnect():
         # Same reasoning as _speak: a 401, a DNS failure or a dropped network on
@@ -242,12 +252,14 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                 except Exception:  # noqa: BLE001 — a malformed event costs the sentence
                     question = ""
                 if question:
-                    await _speak(question)
-                    # AFTER the await returns, never before it — the same
-                    # barrier Approval.spoken gives the fleet: only once THIS
-                    # repo question has been read may a yes confirm it, so an
-                    # utterance queued ahead of this event cannot resolve it.
-                    if onboarding is not None:
+                    spoke = await _speak(question)
+                    # AFTER the await returns, never before it, and ONLY when the
+                    # readback actually succeeded — the same barrier
+                    # Approval.spoken gives the fleet: only once THIS repo
+                    # question has been read may a yes confirm it, so an utterance
+                    # queued ahead of this event (or arriving after a failed TTS)
+                    # cannot resolve it.
+                    if onboarding is not None and spoke:
                         try:
                             onboarding.mark_spoken()
                         except Exception as e:  # noqa: BLE001 — a mark fault must not kill the brain
@@ -323,17 +335,19 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                         question, nonce = "", ""
                     if not verified:
                         continue
-                await _speak(question or "A worker needs permission, sir — "
-                                         "the card is on screen.")
-                # AFTER the await returns, never before it: `spoken` means the
-                # sentence finished, and only then may a bare yes resolve THIS
-                # nonce. An event with no nonce (a malformed publish) is spoken
-                # as the generic alert and marks nothing — so it can still warn
-                # Keke without making anything voice-resolvable. A click-only
+                spoke = await _speak(question or "A worker needs permission, "
+                                                 "sir — the card is on screen.")
+                # AFTER the await returns, never before it, and ONLY when speech
+                # SUCCEEDED: `spoken` means the sentence was actually read, so a
+                # swallowed TTS failure must NOT flip it — the readback is the
+                # whole containment, and a "yes" may only resolve a request Keke
+                # truly heard. On failure the request stays unspoken and the TTL
+                # backstops it. An event with no nonce (a malformed publish) is
+                # spoken as the generic alert and marks nothing. A click-only
                 # command (voice_ok False) is never marked: the owner heard "it's
-                # on the card", not the command, so no yes may resolve it — the
-                # router refuses it as "too_long" regardless, this is the belt.
-                if nonce and router is not None and voice_ok:
+                # on the card", not the command — the router refuses it as
+                # "too_long" regardless, this is the belt.
+                if nonce and router is not None and voice_ok and spoke:
                     try:
                         router.mark_spoken(nonce)
                     except Exception as e:  # noqa: BLE001 — see above
@@ -604,6 +618,15 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                     # the router refused to resolve. The approval is still
                     # pending and the card is still on screen — ask.
                     await _speak("Sir, that sounded like both a yes and a no "
+                                 "— approve or deny?")
+                    continue
+                if state == "partial":
+                    # A whitelist leftover, NOT a polarity conflict: a natural
+                    # approval used a word the match couldn't account for ("go
+                    # ahead with soccer"). Saying it "sounded like both a yes
+                    # and a no" would be false and misdirect the recovery — say
+                    # what actually happened. The approval stays pending.
+                    await _speak("I didn't catch part of that, sir "
                                  "— approve or deny?")
                     continue
                 if state == "expired":

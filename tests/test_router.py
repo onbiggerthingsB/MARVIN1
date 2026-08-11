@@ -406,7 +406,10 @@ UNKNOWN_REFUSALS = [
 def test_a_refusal_the_guard_never_heard_of_never_approves(said):
     router = one_pending()
     state, appr = router.resolve_approval(said, now=NOW + 5)
-    assert state == "unclear" and appr is None, said
+    # A deny word ("don't") reads as a polarity conflict; every other unknown
+    # refusal leaves an unexplained leftover. Both fail closed and stay pending;
+    # only the SPOKEN message differs.
+    assert state in ("unclear", "partial") and appr is None, (said, state)
     assert len(router.pending_approvals()) == 1, said     # card stays on screen
 
 
@@ -458,7 +461,7 @@ def test_any_unaccounted_word_refuses_to_resolve(verb):
     thought of yet. Not one of these is known to the router."""
     router = one_pending()
     state, appr = router.resolve_approval(f"sure, {verb} soccer", now=NOW + 5)
-    assert state == "unclear" and appr is None, verb
+    assert state == "partial" and appr is None, verb
     assert len(router.pending_approvals()) == 1, verb
 
 
@@ -518,7 +521,7 @@ def test_the_missing_axis_reproduces_the_exact_reported_bypasses():
     ]:
         router = one_pending(tool)
         state, appr = router.resolve_approval(said, now=NOW + 5)
-        assert state == "unclear" and appr is None, (said, tool, state)
+        assert state == "partial" and appr is None, (said, tool, state)
         assert len(router.pending_approvals()) == 1, (said, tool)
 
 
@@ -592,6 +595,35 @@ def test_voice_ok_defaults_true_so_normal_approvals_are_unaffected():
     assert router.resolve_approval("yes", now=NOW + 5)[0] == "approved"
 
 
+# ---------- the leftover cause is NOT a polarity conflict (honest message) ----
+# resolve_approval used to return "unclear" for BOTH a real both-yes-and-no
+# ("sure, cancel that") AND a whitelist leftover ("go ahead with soccer"), and
+# the brain said "that sounded like both a yes and a no" for both — false for
+# the natural approvals that merely used a word the match couldn't account for.
+@pytest.mark.parametrize("said", [
+    "go ahead with soccer", "yes, let soccer run",
+    "approve the soccer one", "okay, allow soccer",
+    "yes, run soccer for me", "sure, kick off soccer please",
+])
+def test_a_leftover_word_reports_partial_not_a_polarity_conflict(said):
+    from server.router import _polarity_conflict
+    router = one_pending("npm test")
+    state, appr = router.resolve_approval(said, now=NOW + 5)
+    assert state == "partial" and appr is None, (said, state)
+    assert len(router.pending_approvals()) == 1, said
+    assert _polarity_conflict(said) is False, said       # no deny word at all
+
+
+@pytest.mark.parametrize("said", [
+    "sure, cancel that", "yeah, stop it", "no, go ahead", "okay, cancel that"])
+def test_a_genuine_polarity_conflict_still_reports_unclear(said):
+    """The both-yes-and-no message is CORRECT for these — a deny word stapled to
+    an affirm. They must stay 'unclear', not become 'partial'."""
+    router = one_pending("npm test")
+    state, appr = router.resolve_approval(said, now=NOW + 5)
+    assert state == "unclear" and appr is None, (said, state)
+
+
 # ---------- the whitelist must NOT over-block legitimate consent ----------
 @pytest.mark.parametrize("said", [
     "yes", "go ahead", "approve", "do it", "yeah", "yep", "sure", "okay",
@@ -632,7 +664,7 @@ def test_naming_the_wrong_tool_no_longer_approves_the_right_project():
     consent to the pending one."""
     router = one_pending(DANGEROUS)
     state, appr = router.resolve_approval("approve soccer npm test", now=NOW + 5)
-    assert state == "unclear" and appr is None
+    assert state == "partial" and appr is None      # a leftover word, not a conflict
     assert len(router.pending_approvals()) == 1
     # and the same words DO approve when they describe the real tool
     ok = one_pending("npm test")
