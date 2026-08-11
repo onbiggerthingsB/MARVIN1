@@ -33,7 +33,11 @@ THE THREE FILES, AND WHAT EACH BEAT LEAVES BEHIND
                       checksummed JSON record per line. Beats 2, 3, 6, 7, 9.
   state/server.log    uvicorn's output. `POST /hooks` lines are beat 7's
                       first evidence lane; the shutdown/startup banner pair is
-                      beat 9's. NOTE: bin/marlowe starts uvicorn with
+                      beat 9's — credited only when a worker was LIVE (neither
+                      CLOSED nor DETACHED) at the down signal, because beat 9
+                      is "kill MID-WORKER" and a detached ghost is re-announced
+                      as "already detached", not as interrupted.
+                      NOTE: bin/marlowe starts uvicorn with
                       --no-access-log, so lane A is SILENT unless the server
                       was started with access logging on — gate_preflight.py
                       checks exactly this and prints the fix, and the banner
@@ -76,7 +80,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # definition of "this record verifies", and a second copy here would drift
 # from the server's the first time the record shape changes.
 from server.fleet_log import SCHEMA_VERSION, _checksum   # noqa: E402
-from server.fleet_state import DETACHED                  # noqa: E402
+from server.fleet_state import CLOSED, DETACHED          # noqa: E402
 from server.registry import Registry                     # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -364,6 +368,14 @@ class Correlator:
         # outcome arrives, so a raised card is held here (keyed by nonce) and
         # credited only when its permission_done says approved=True.
         self.pending_approvals: dict[str, str] = {}
+        # Beat 9 is "kill MID-WORKER": a down signal (the shutdown banner, or
+        # a fleet.jsonl rotation — the only signal kill -9 leaves) captures
+        # which workers were live at that instant, and the next startup line
+        # credits the beat only if that capture is non-empty. A restart with
+        # nothing live (all CLOSED, or DETACHED — re-announced as "already
+        # detached", not interrupted) is a deviation, not evidence.
+        self.down_seen = False
+        self.pending_interrupted: list[str] = []
 
     # ---- fleet.jsonl
     def on_fleet_record(self, rec: dict) -> list[str]:
@@ -492,13 +504,27 @@ class Correlator:
         if "Shutting down" in text or "Finished server process" in text:
             self.saw_shutdown = True
             out.append(f"server: {text}")
+            self._down_signal(out, "shutdown")
             return out
         if "Started server process" in text or "startup complete" in text:
             self.boots += 1
             out.append(f"server: {text}")
-            if self.saw_shutdown and self.boots >= 1:
-                self._note(out, 9, "the server came back up after a shutdown "
-                                   "— the restart half of beat 9")
+            if self.pending_interrupted:
+                names = ", ".join(self.pending_interrupted)
+                self._note(out, 9, f"the server came back up after a kill "
+                                   f"that interrupted a live worker: {names}")
+                self.pending_interrupted = []
+                self.down_seen = False
+            elif self.down_seen:
+                # One verdict per down/up pair: consume the signal so the
+                # "Application startup complete" line does not repeat it.
+                self.down_seen = False
+                self.deviate(out, "the server restarted, but no worker was "
+                                  "live at the kill — every known worker was "
+                                  "CLOSED or DETACHED (a detached ghost is "
+                                  "re-announced as 'already detached', not "
+                                  "interrupted), so this restart is NOT "
+                                  "beat 9")
             return out
         if text:
             out.append(f"server: {text}")
@@ -523,7 +549,48 @@ class Correlator:
                 self.deviate(out, f"{name} changed path under us")
         return out
 
+    # ---- fleet.jsonl rotation (beat 9's down signal for kill -9)
+    def on_fleet_rotation(self) -> list[str]:
+        """A rotation is FleetLog.snapshot's rename on clean shutdown, or the
+        torn-log repair on the boot after a kill -9 — the DOWN half of beat 9
+        at most, and the ONLY down signal kill -9 leaves (no 'Shutting down'
+        banner is ever written). It credits nothing by itself: the capture
+        below waits for the startup line, and only if a worker was live."""
+        out: list[str] = []
+        if not self.crediting:
+            return out
+        self._down_signal(out, "rotation")
+        return out
+
     # ---- helpers
+    def _live_workers(self) -> list[str]:
+        """Workers whose last recorded state is neither CLOSED nor DETACHED —
+        the fold Fleet.recover would call interrupted=True. Workers with no
+        recorded state at all are excluded: no state, no claim."""
+        return [f"{info.get('project') or '?'} ({wid})"
+                for wid, info in self.workers.items()
+                if (info.get("state") or "") not in ("", CLOSED, DETACHED)]
+
+    def _down_signal(self, out: list[str], source: str) -> None:
+        """The server (or its log) went down: remember who was live RIGHT NOW,
+        because that — not the restart itself — is what beat 9 is about.
+        Idempotent per outage: 'Shutting down', 'Finished server process' and
+        the snapshot rotation all land within one shutdown, and one capture
+        line is enough."""
+        live = self._live_workers()
+        if self.down_seen and live == self.pending_interrupted:
+            return
+        self.down_seen = True
+        if live:
+            self.pending_interrupted = live
+            out.append(f"    {source} with a live worker mid-flight "
+                       f"({', '.join(live)}) — the kill half of beat 9; "
+                       f"waiting for the restart")
+        else:
+            out.append(f"    {source} with no live worker (every known "
+                       f"worker CLOSED or DETACHED) — not beat 9 evidence "
+                       f"by itself")
+
     def _note(self, out: list[str], beat: int, why: str) -> None:
         first = self.board.note(beat, why)
         out.append(f"    {'*** ' if first else '    '}beat {beat}"
@@ -678,11 +745,11 @@ def main(argv: list[str] | None = None) -> int:
         lines, note = fleet_tail.poll()
         if note:
             emit("fleet", note, now)
-            if "ROTATED" in note and corr.crediting:
-                board.note(9, "fleet.jsonl rotated — a snapshot compaction "
-                              "(clean shutdown) or a torn log moved aside")
-                emit("fleet", "    beat 9: rotation observed (snapshot on "
-                              "clean shutdown, or torn-log repair)", now)
+            if "ROTATED" in note:
+                # The down half of beat 9 at most (snapshot on clean shutdown,
+                # or torn-log repair after kill -9) — never the beat itself.
+                for text in corr.on_fleet_rotation():
+                    emit("fleet", text, now)
         for raw in lines:
             rec, status = parse_fleet_line(raw)
             if rec is None:

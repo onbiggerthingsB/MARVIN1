@@ -356,12 +356,87 @@ def test_once_mode_lane_b_still_credits_beat_7():
 
 
 def test_restart_after_a_shutdown_is_beat_9():
+    """Beat 9 is 'kill MID-WORKER': the shutdown/startup pair only counts when
+    a worker was live (neither CLOSED nor DETACHED) at the kill."""
     board, corr = board_and_correlator()
     corr.on_server_line("INFO:     Started server process [1]", time.time())
     assert not board.evidence[9]               # first boot proves nothing
+    corr.on_fleet_record(rec("spawned", {"worker": "w2", "project": "alethic",
+                                         "state": "ACTIVE_TURN"}))
     corr.on_server_line("INFO:     Shutting down", time.time())
+    assert not board.evidence[9]               # the kill alone is half a beat
     corr.on_server_line("INFO:     Started server process [2]", time.time())
     assert board.evidence[9]
+    assert any("alethic" in row for row in board.evidence[9])
+
+
+def test_restart_with_only_a_detached_worker_is_not_beat_9():
+    """The checklist's own sequencing trap: a DETACHED ghost is re-announced
+    as 'already detached before the restart', NOT as interrupted. A glitch
+    restart with nothing live must stay a finding, not become evidence."""
+    board, corr = board_and_correlator()
+    corr.on_fleet_record(rec("detached", {"worker": "w1", "project": "alethic",
+                                          "state": DETACHED,
+                                          "session_id": "s1"}))
+    corr.on_server_line("INFO:     Shutting down", time.time())
+    corr.on_server_line("INFO:     Started server process [2]", time.time())
+    assert not board.evidence[9]
+    assert any("NOT beat 9" in d for d in corr.deviations)
+
+
+def test_restart_with_a_closed_worker_is_not_beat_9():
+    board, corr = board_and_correlator()
+    corr.on_fleet_record(rec("session_end", {"worker": "w1",
+                                             "state": "CLOSED"}))
+    corr.on_server_line("INFO:     Shutting down", time.time())
+    corr.on_server_line("INFO:     Started server process [2]", time.time())
+    assert not board.evidence[9]
+
+
+def test_restart_with_zero_fleet_records_is_not_beat_9():
+    """The scenario the OLD shipped test pinned as correct: three server-log
+    lines, no fleet records at all, and beat 9 got evidence. It must not."""
+    board, corr = board_and_correlator()
+    corr.on_server_line("INFO:     Started server process [1]", time.time())
+    corr.on_server_line("INFO:     Shutting down", time.time())
+    corr.on_server_line("INFO:     Started server process [2]", time.time())
+    assert not board.evidence[9]
+    assert any("NOT beat 9" in d for d in corr.deviations)
+
+
+def test_rotation_alone_is_not_beat_9():
+    """A fleet.jsonl rotation is the DOWN half at best (snapshot on clean
+    shutdown, or torn-log repair) — with no live worker and no restart it is
+    context, not evidence."""
+    board, corr = board_and_correlator()
+    corr.on_fleet_rotation()
+    assert not board.evidence[9]
+    board2, corr2 = board_and_correlator()
+    corr2.on_fleet_record(rec("spawned", {"worker": "w2", "project": "alethic",
+                                          "state": "ACTIVE_TURN"}))
+    corr2.on_fleet_rotation()
+    assert not board2.evidence[9]              # still waiting for the restart
+
+
+def test_rotation_then_restart_is_beat_9_for_a_live_worker():
+    """The kill -9 lane: no 'Shutting down' line ever appears — the torn-log
+    repair's rotation is the only down signal the observer gets."""
+    board, corr = board_and_correlator()
+    corr.on_fleet_record(rec("spawned", {"worker": "w2", "project": "alethic",
+                                         "state": "ACTIVE_TURN"}))
+    corr.on_fleet_rotation()
+    corr.on_server_line("INFO:     Started server process [2]", time.time())
+    assert board.evidence[9]
+    assert any("alethic" in row for row in board.evidence[9])
+
+
+def test_rotation_with_no_live_worker_never_becomes_beat_9():
+    board, corr = board_and_correlator()
+    corr.on_fleet_record(rec("detached", {"worker": "w1", "state": DETACHED,
+                                          "session_id": "s1"}))
+    corr.on_fleet_rotation()
+    corr.on_server_line("INFO:     Started server process [2]", time.time())
+    assert not board.evidence[9]
 
 
 def test_registry_confirm_is_beat_1_and_a_pin_is_beat_8():
