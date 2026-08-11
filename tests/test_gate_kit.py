@@ -488,6 +488,65 @@ def test_crediting_resumes_cleanly_after_the_history_replay():
     assert board.evidence[6] and board.evidence[7]
 
 
+def test_a_fully_successful_demo_still_credits_every_creditable_beat():
+    """The over-strictness guard. An observer that refuses to credit a demo
+    performed PERFECTLY is worse than the bugs these rules fixed — Keke would
+    run the gate flawlessly and the transcript would say it failed. This is
+    the whole nine-beat happy path in live order; every beat that can be
+    credited must be, and a perfect demo must record ZERO deviations."""
+    board, corr = board_and_correlator()
+    t = time.time()
+    # beat 1: discovery confirms the two repos in the registry
+    corr.on_registry({}, {
+        "alethic": {"path": "/a", "confirmed": True, "data_source": None},
+        "quant": {"path": "/q", "confirmed": True, "data_source": None}})
+    # beat 2: spawn w1
+    corr.on_fleet_record(rec("spawned", {
+        "worker": "w1", "project": "alethic", "state": "IDLE_AT_PROMPT",
+        "worktree": "/wt/1", "branch": "marlowe/x-1",
+        "base_commit": "abc1234"}, 1))
+    # beat 3: card raised → approved by voice → worker finishes the turn
+    corr.on_fleet_record(rec("permission_wait", {
+        "worker": "w1", "project": "alethic", "state": "WAITING_PERMISSION",
+        "nonce": "n1"}, 2))
+    corr.on_fleet_record(rec("permission_done", {
+        "worker": "w1", "project": "alethic", "state": "ACTIVE_TURN",
+        "nonce": "n1", "approved": True}, 3))
+    corr.on_fleet_record(rec("turn_done", {
+        "worker": "w1", "project": "alethic", "state": "IDLE_AT_PROMPT"}, 4))
+    # beat 6: [Open in Terminal] — w1 detaches with a session id
+    corr.on_fleet_record(rec("detached", {
+        "worker": "w1", "project": "alethic", "state": DETACHED,
+        "session_id": "sess-abcdef123456"}, 5))
+    # beat 7: lane B (a record reaching the DETACHED worker) AND lane A
+    # (a POST in the access log, live tail = ordered)
+    corr.on_fleet_record(rec("activity", {
+        "worker": "w1", "project": "alethic", "state": DETACHED}, 6))
+    corr.on_server_line('INFO: 127.0.0.1:1 - "POST /hooks HTTP/1.1" 200 OK', t)
+    # beat 8: the finance source is pinned after the spoken yes
+    corr.on_registry(
+        {"quant": {"path": "/q", "confirmed": True, "data_source": None}},
+        {"quant": {"path": "/q", "confirmed": True,
+                   "data_source": "/q/picks.sqlite"}})
+    # beat 9: fresh worker w2 live mid-flight, clean kill, restart
+    corr.on_fleet_record(rec("spawned", {
+        "worker": "w2", "project": "alethic", "state": "ACTIVE_TURN",
+        "worktree": "/wt/2", "branch": "marlowe/x-2",
+        "base_commit": "def5678"}, 7))
+    corr.on_server_line("INFO:     Shutting down", t)
+    corr.on_fleet_rotation()                   # FleetLog.snapshot's rename
+    corr.on_server_line("INFO:     Started server process [2]", t)
+    corr.on_server_line("INFO:     Application startup complete.", t)
+
+    for n in (1, 2, 3, 6, 7, 8, 9):
+        assert board.evidence[n], f"beat {n} lost its evidence"
+    assert corr.deviations == []               # a perfect demo deviates never
+    text = "\n".join(board.summary_lines())
+    for n in (1, 2, 3, 6, 7, 8, 9):
+        assert f"[EVIDENCE] {n}." in text
+    assert "[BLIND   ] 4." in text and "[BLIND   ] 5." in text
+
+
 def test_beats_4_and_5_are_reported_blind_not_failed():
     board = obs.BeatBoard()
     text = "\n".join(board.summary_lines())
@@ -749,10 +808,17 @@ def test_observer_once_writes_a_transcript_and_a_beat_summary(tmp_path):
         ("detached", {"worker": "w1", "state": DETACHED,
                       "session_id": "sess-1"}),
         ("activity", {"worker": "w1", "state": DETACHED}),
+        # beat 9's kill -9 lane survives in the CURRENT log: the torn-tail
+        # repair rewrites it from the verified prefix, so w2's live records
+        # are still here when --once reads it.
+        ("spawned", {"worker": "w2", "project": "alethic",
+                     "state": "ACTIVE_TURN", "worktree": str(tmp_path / "w2")}),
     ])
     (state / "server.log").write_text(
         'INFO:     Started server process [1]\n'
-        'INFO:     127.0.0.1:1 - "POST /hooks HTTP/1.1" 200 OK\n')
+        'INFO:     127.0.0.1:1 - "POST /hooks HTTP/1.1" 200 OK\n'
+        'INFO:     Shutting down\n'
+        'INFO:     Started server process [2]\n')
     reg = tmp_path / "projects.json"
     reg.write_text(json.dumps({"schema_version": 1, "projects": [
         {"name": "quant", "path": "/q", "confirmed": True, "kind": "finance",
@@ -764,7 +830,7 @@ def test_observer_once_writes_a_transcript_and_a_beat_summary(tmp_path):
     assert code == 0
     text = out.read_text()
     assert "## Beat summary" in text
-    for n in (2, 3, 6, 7):
+    for n in (2, 3, 6, 7, 9):
         assert f"[EVIDENCE] {n}." in text
     assert "[BLIND   ] 4." in text
     # --once cannot order access-log lines against the detach: the POST is
