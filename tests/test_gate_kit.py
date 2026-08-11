@@ -181,12 +181,77 @@ def test_spawn_record_is_beat_2():
 
 
 def test_approval_pair_is_beat_3():
+    """A GRANTED approval credits beat 3 with both halves: the card that was
+    raised and the grant that resolved it. The fixture carries exactly what
+    fleet.py's _apply writes: permission_done always has `approved`."""
     board, corr = board_and_correlator()
-    corr.on_fleet_record(rec("permission_wait", {"worker": "w1",
-                                                 "state": "WAITING_PERMISSION"}))
-    corr.on_fleet_record(rec("permission_done", {"worker": "w1",
-                                                 "state": "ACTIVE_TURN"}, 2))
+    corr.on_fleet_record(rec("permission_wait", {
+        "worker": "w1", "state": "WAITING_PERMISSION", "nonce": "n1"}))
+    corr.on_fleet_record(rec("permission_done", {
+        "worker": "w1", "state": "ACTIVE_TURN", "nonce": "n1",
+        "approved": True}, 2))
     assert len(board.evidence[3]) == 2
+
+
+def test_a_denied_approval_is_not_beat_3():
+    """Beat 3 is the CONSENT beat: card raised → approved BY VOICE → worker
+    finishes. Keke saying NO is a real event worth a visible line, but it
+    cannot satisfy a beat whose whole point is that consent was granted."""
+    board, corr = board_and_correlator()
+    corr.on_fleet_record(rec("permission_wait", {
+        "worker": "w1", "project": "alethic",
+        "state": "WAITING_PERMISSION", "nonce": "n1"}))
+    corr.on_fleet_record(rec("permission_done", {
+        "worker": "w1", "project": "alethic", "state": "ACTIVE_TURN",
+        "nonce": "n1", "approved": False}, 2))
+    corr.on_fleet_record(rec("turn_done", {
+        "worker": "w1", "project": "alethic", "state": "IDLE_AT_PROMPT"}, 3))
+    assert not board.evidence[3]
+    assert any("denied" in d for d in corr.deviations)
+    text = "\n".join(board.summary_lines())
+    assert "[NONE    ] 3." in text
+
+
+def test_a_cancelled_approval_is_not_beat_3():
+    """fleet.py's CancelledError path writes approved=False, cancelled=True —
+    the SDK tore the callback down, nobody consented to anything."""
+    board, corr = board_and_correlator()
+    corr.on_fleet_record(rec("permission_wait", {
+        "worker": "w1", "state": "WAITING_PERMISSION", "nonce": "n1"}))
+    corr.on_fleet_record(rec("permission_done", {
+        "worker": "w1", "state": "ACTIVE_TURN", "nonce": "n1",
+        "approved": False, "cancelled": True}, 2))
+    assert not board.evidence[3]
+    assert any("cancelled" in d for d in corr.deviations)
+
+
+def test_an_expired_approval_is_not_beat_3():
+    """The TTL path writes the same record as a denial (approved=False, no
+    cancelled flag): an approval nobody answered is not consent either."""
+    board, corr = board_and_correlator()
+    corr.on_fleet_record(rec("permission_done", {
+        "worker": "w1", "state": "ACTIVE_TURN", "nonce": "n1",
+        "approved": False}, 2))
+    assert not board.evidence[3]
+
+
+def test_a_grant_after_a_denial_still_credits_beat_3():
+    """Saying no to a scary request and yes to the next one is the checklist's
+    own advice — the denial must not poison the later, genuine grant."""
+    board, corr = board_and_correlator()
+    corr.on_fleet_record(rec("permission_wait", {
+        "worker": "w1", "state": "WAITING_PERMISSION", "nonce": "n1"}))
+    corr.on_fleet_record(rec("permission_done", {
+        "worker": "w1", "state": "ACTIVE_TURN", "nonce": "n1",
+        "approved": False}, 2))
+    corr.on_fleet_record(rec("permission_wait", {
+        "worker": "w1", "state": "WAITING_PERMISSION", "nonce": "n2"}, 3))
+    corr.on_fleet_record(rec("permission_done", {
+        "worker": "w1", "state": "ACTIVE_TURN", "nonce": "n2",
+        "approved": True}, 4))
+    corr.on_fleet_record(rec("turn_done", {"worker": "w1",
+                                           "state": "IDLE_AT_PROMPT"}, 5))
+    assert len(board.evidence[3]) == 3      # card + grant + finished turn
 
 
 def test_turn_done_only_counts_for_beat_3_after_an_approval():
@@ -572,8 +637,10 @@ def test_observer_once_writes_a_transcript_and_a_beat_summary(tmp_path):
     write_log(state / "fleet.jsonl", [
         ("spawned", {"worker": "w1", "project": "alethic", "state": "IDLE",
                      "worktree": str(tmp_path / "wt"), "branch": "marlowe/x"}),
-        ("permission_wait", {"worker": "w1", "state": "WAITING_PERMISSION"}),
-        ("permission_done", {"worker": "w1", "state": "ACTIVE_TURN"}),
+        ("permission_wait", {"worker": "w1", "state": "WAITING_PERMISSION",
+                             "nonce": "n1"}),
+        ("permission_done", {"worker": "w1", "state": "ACTIVE_TURN",
+                             "nonce": "n1", "approved": True}),
         ("detached", {"worker": "w1", "state": DETACHED,
                       "session_id": "sess-1"}),
         ("activity", {"worker": "w1", "state": DETACHED}),

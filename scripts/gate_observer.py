@@ -348,6 +348,10 @@ class Correlator:
         self.saw_shutdown = False
         self.boots = 0
         self.deviations: list[str] = []
+        # Beat 3 is the CONSENT beat: the card alone proves nothing until the
+        # outcome arrives, so a raised card is held here (keyed by nonce) and
+        # credited only when its permission_done says approved=True.
+        self.pending_approvals: dict[str, str] = {}
 
     # ---- fleet.jsonl
     def on_fleet_record(self, rec: dict) -> list[str]:
@@ -373,10 +377,35 @@ class Correlator:
             out.append(f"    branch   {branch} @ {base}")
             self._note(out, 2, f"spawned {project} into {wt} ({branch})")
         elif kind == "permission_wait":
-            self._note(out, 3, f"approval card raised for {project} "
-                               f"(seq {seq})")
+            # Not beat-3 evidence YET: beat 3 is "approved BY VOICE", and a
+            # card that ends in a denial, a cancellation or an unanswered TTL
+            # must not leave a row that reads like consent. Hold it until the
+            # outcome arrives.
+            key = str(data.get("nonce") or wid)
+            self.pending_approvals[key] = (f"approval card raised for "
+                                           f"{project} (seq {seq})")
+            out.append(f"    approval card raised for {project} (seq {seq}) — "
+                       f"beat 3 waits for the outcome; only a GRANTED "
+                       f"approval credits it")
         elif kind == "permission_done":
-            self._note(out, 3, f"approval resolved for {project} (seq {seq})")
+            # fleet.py writes `approved` on every permission_done (and
+            # `cancelled: True` on the SDK-teardown path); the TTL expiry
+            # writes approved=False like a denial. Only approved=True is
+            # consent — everything else is a visible finding, not evidence.
+            key = str(data.get("nonce") or wid)
+            raised = self.pending_approvals.pop(key, None)
+            if data.get("approved") is True:
+                if raised:
+                    self._note(out, 3, raised)
+                self._note(out, 3, f"approval GRANTED for {project} "
+                                   f"(seq {seq})")
+            else:
+                outcome = ("cancelled (the SDK tore the request down)"
+                           if data.get("cancelled")
+                           else "denied, or expired unanswered")
+                self.deviate(out, f"the approval for {project} was {outcome} "
+                                  f"(seq {seq}) — an unapproved request does "
+                                  f"NOT satisfy beat 3")
         elif kind == "turn_done" and self.board.evidence.get(3):
             self._note(out, 3, f"{project} finished a turn after the "
                                f"approval (seq {seq})")
