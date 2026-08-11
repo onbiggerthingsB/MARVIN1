@@ -534,6 +534,64 @@ def test_naming_the_whole_tool_still_resolves_even_when_it_holds_a_verb():
     assert state == "approved" and appr is not None
 
 
+# ---------- CRITICAL 2: a command too long to read aloud is click-only ----------
+def test_a_click_only_approval_refuses_a_bare_voice_yes():
+    """A command the owner cannot hear in full must not be approvable by ear:
+    the fleet flags it voice_ok=False and the router refuses voice resolution
+    outright, pointing at the card — even after mark_spoken (the readback said
+    'it's on the card', not the command)."""
+    router = Router()
+    a = router.open_approval("soccer", "Bash: <long>", now=NOW,
+                             path="/p/soccer", voice_ok=False)
+    router.mark_spoken(a.nonce)
+    state, appr = router.resolve_approval("yes", now=NOW + 5)
+    assert state == "too_long" and appr is None
+    assert len(router.pending_approvals()) == 1
+
+
+def test_a_click_only_approval_refuses_an_addressed_voice_yes():
+    router = Router()
+    a = router.open_approval("soccer", "Bash: <long>", now=NOW,
+                             path="/p/soccer", voice_ok=False)
+    router.mark_spoken(a.nonce)
+    state, appr = router.resolve_approval("approve soccer", now=NOW + 5)
+    assert state == "too_long" and appr is None
+    assert len(router.pending_approvals()) == 1
+
+
+def test_a_click_only_approval_is_still_resolvable_by_nonce():
+    """Click-only means the CONSOLE still resolves it precisely — the card
+    carries the full command and clicking Approve on it IS reading it."""
+    router = Router()
+    a = router.open_approval("soccer", "Bash: <long>", now=NOW,
+                             path="/p/soccer", voice_ok=False)
+    assert router.take_nonce(a.nonce, now=NOW + 5) is a
+    assert router.pending_approvals() == []
+
+
+def test_a_click_only_approval_beside_a_normal_one_does_not_block_it():
+    """A bare yes with one click-only and one normal (spoken) approval still
+    resolves the normal one — the too-long refusal is scoped to the approval
+    the utterance actually addresses, not the whole pending set."""
+    router = Router()
+    big = router.open_approval("soccer", "Bash: <long>", now=NOW,
+                               path="/p/soccer", voice_ok=False)
+    router.mark_spoken(big.nonce)
+    ok = router.open_approval("alethic", "npm test", now=NOW, path="/p/alethic")
+    router.mark_spoken(ok.nonce)
+    state, appr = router.resolve_approval("approve alethic npm test", now=NOW + 5)
+    assert state == "approved" and appr.nonce == ok.nonce
+    assert [x.nonce for x in router.pending_approvals()] == [big.nonce]
+
+
+def test_voice_ok_defaults_true_so_normal_approvals_are_unaffected():
+    router = Router()
+    a = router.open_approval("soccer", "npm test", now=NOW, path="/p/soccer")
+    assert a.voice_ok is True
+    router.mark_spoken(a.nonce)
+    assert router.resolve_approval("yes", now=NOW + 5)[0] == "approved"
+
+
 # ---------- the whitelist must NOT over-block legitimate consent ----------
 @pytest.mark.parametrize("said", [
     "yes", "go ahead", "approve", "do it", "yeah", "yep", "sure", "okay",

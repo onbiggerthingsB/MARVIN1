@@ -282,12 +282,16 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                 # this is the spoken half (readback of project, tool, args,
                 # risk — composed by the fleet). Guarded: a malformed event
                 # must cost this speech, never the loop.
-                question, nonce = "", ""
+                question, nonce, voice_ok = "", "", True
                 try:
                     question = str((data or {}).get("question") or "")[:400]
                     nonce = str((data or {}).get("nonce") or "")
+                    # Click-only (too long to read aloud): the fleet spoke a
+                    # "it's on the card" line INSTEAD of the command, so this
+                    # readback must NOT be marked spoken — nothing was read.
+                    voice_ok = bool((data or {}).get("voice_ok", True))
                 except Exception:  # noqa: BLE001
-                    question, nonce = "", ""
+                    question, nonce, voice_ok = "", "", True
                 # Stale requests are never read aloud (M3P2 review, C3). This
                 # event may have been queued behind a 120-second butler.ask
                 # while `stop soccer` rejected the future and TOOK the nonce,
@@ -315,8 +319,11 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                 # sentence finished, and only then may a bare yes resolve THIS
                 # nonce. An event with no nonce (a malformed publish) is spoken
                 # as the generic alert and marks nothing — so it can still warn
-                # Keke without making anything voice-resolvable.
-                if nonce and router is not None:
+                # Keke without making anything voice-resolvable. A click-only
+                # command (voice_ok False) is never marked: the owner heard "it's
+                # on the card", not the command, so no yes may resolve it — the
+                # router refuses it as "too_long" regardless, this is the belt.
+                if nonce and router is not None and voice_ok:
                     try:
                         router.mark_spoken(nonce)
                     except Exception as e:  # noqa: BLE001 — see above
@@ -570,6 +577,13 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                     # lost to a bus eviction the console is where it lives.
                     await _speak("One moment, sir — I haven't read that "
                                  "request to you yet; it's on the console.")
+                    continue
+                if state == "too_long":
+                    # A command too long to read aloud is click-only: the
+                    # readback said "it's on the card", and a voice yes is
+                    # refused rather than approving a command never heard.
+                    await _speak("That command is too long to read aloud, sir "
+                                 "— approve or deny it on the card.")
                     continue
                 if state == "ambiguous":
                     await _speak("More than one approval is pending, sir — "

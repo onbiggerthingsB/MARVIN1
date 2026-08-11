@@ -341,6 +341,14 @@ class Approval:
     # The CLICK path (take_nonce) deliberately does NOT consult this: the card
     # carries the full command, and clicking Approve on it IS reading it.
     spoken: bool = False
+    # False means CLICK-ONLY: the command is too long to read aloud in full, so
+    # the fleet spoke a "too long — it's on the card" line INSTEAD of the
+    # command, and a voice yes may never resolve it. The spoken readback is the
+    # whole containment (the worktree is not a sandbox); a sentence the owner
+    # cannot hear in full must not be approvable by ear, or a destructive clause
+    # elided out of the middle rides an inaudible ellipsis to a "yes". The
+    # console still resolves it precisely by nonce — the card shows every char.
+    voice_ok: bool = True
 
 
 class Router:
@@ -454,9 +462,10 @@ class Router:
     def _sweep(self, now: float) -> None:
         self._approvals = [a for a in self._approvals if now - a.created <= APPROVAL_TTL_S]
 
-    def open_approval(self, project: str, tool: str, now: float, path: str = "") -> Approval:
+    def open_approval(self, project: str, tool: str, now: float, path: str = "",
+                      voice_ok: bool = True) -> Approval:
         a = Approval(nonce=secrets.token_hex(8), project=project, tool=tool,
-                     created=now, path=path)
+                     created=now, path=path, voice_ok=voice_ok)
         self._approvals.append(a)
         return a
 
@@ -501,6 +510,21 @@ class Router:
         if not self._approvals:
             return ("expired", None) if had else ("none", None)
 
+        # CLICK-ONLY refusal, decided BEFORE any spoken/polarity/whitelist
+        # reasoning so it wins over the generic replies and can never be flipped
+        # open by a later branch. A command too long to read aloud (voice_ok
+        # False) was never spoken to the owner — the fleet said "it's on the
+        # card" instead — so a voice yes must be turned away with that same
+        # instruction. Scoped to the approval(s) the utterance actually
+        # addresses: a bare yes beside one click-only AND one normal approval
+        # still resolves the normal one, and a click-only approval alone (bare
+        # or named) yields "too_long", never "unspoken" guesswork.
+        lowered = text.lower()
+        candidates = ([a for a in self._approvals if a.project.lower() in lowered]
+                      if _is_addressed(text) else list(self._approvals))
+        if candidates and all(not a.voice_ok for a in candidates):
+            return ("too_long", None)
+
         # THE CORRELATION. Consent answers a QUESTION, and a question that was
         # never asked cannot have been answered. Only approvals whose readback
         # has actually finished are resolvable by voice — in BOTH branches
@@ -524,10 +548,10 @@ class Router:
         if _polarity_conflict(text):
             return ("unclear", None)
 
-        lowered = text.lower()
         # One tokenization of the utterance, reused for narrowing AND for the
         # whitelist's "did the owner name the whole tool/path" test — the two
-        # must agree on what counts as naming a command.
+        # must agree on what counts as naming a command. (`lowered` is computed
+        # above for the click-only scope check.)
         spoken_tokens = set(_tokens(text))
         matched = [a for a in heard if a.project.lower() in lowered]
         if len(matched) > 1:

@@ -1300,6 +1300,67 @@ def test_the_full_command_survives_somewhere_even_when_speech_elides_it():
     assert _full_args("not-a-dict") == "not-a-dict"
 
 
+# ---------- CRITICAL 2: the spoken readback is never defeated by length ----------
+async def test_a_long_command_is_click_only_and_never_read_with_the_middle_cut(
+        tmp_path, monkeypatch):
+    """A 200+ char command with a destructive clause parked in the middle used
+    to be read aloud with exactly that clause elided — the ellipsis is
+    inaudible in TTS, so the sentence sounded complete and a voice yes deleted
+    the vault. The spoken line must NOT elide the middle: too long to read in
+    full → refuse voice approval, say so, and point at the card. The approval
+    is flagged voice_ok=False so the router refuses a voice yes."""
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch)
+    await fleet.spawn("soccer", repo(tmp_path), "task")
+    w = fleet.workers[0]
+    evil = ("python3 -c 'import shutil,os;"
+            "shutil.rmtree(os.path.expanduser(\"~/vault\"))'")
+    cmd = ("npm run lint && npm run typecheck && npm run build && "
+           + "npm run test -- --coverage --runInBand --reporter verbose && "
+           + evil + " && echo finishing-the-pipeline-run-now-okay-done")
+    assert len(cmd) > 200
+    cid, q = bus.subscribe()
+    try:
+        t = asyncio.create_task(w._on_tool_request(
+            "Bash", {"command": cmd}, SimpleNamespace(title=None)))
+        await asyncio.sleep(0.05)
+        approval = router.pending_approvals()[0]
+        assert approval.voice_ok is False                 # click-only
+        card = None
+        while not q.empty():
+            ev = q.get_nowait()
+            if ev and ev["type"] == "approval.request":
+                card = ev["data"]
+        assert card is not None
+        # The spoken question must NOT contain a middle-elided command, and it
+        # must SAY it is too long and name the card.
+        assert "rmtree" not in card["question"]           # never a torn clause
+        assert "…" not in card["question"]                # no inaudible ellipsis
+        assert "too long" in card["question"].lower()
+        assert card.get("voice_ok") is False
+        assert card["full_args"] == cmd                   # the card still has it all
+        fleet.deliver_approval(approval.nonce, False)
+        await asyncio.wait_for(t, 1)
+    finally:
+        await cleanup(fleet)
+
+
+def test_the_risk_scanner_sees_interpreter_form_destruction():
+    """`python3 -c '...shutil.rmtree(...)'` names no path token the shell
+    scanner recognises AND misses the rm blacklist — so it drew NO warning at
+    all. The risk scanner now recognises interpreter-form deletion."""
+    from server.fleet import _opaque_note
+    assert _risk_note("Bash", {"command":
+        'python3 -c "import shutil; shutil.rmtree(v)"'})
+    # and the opaque note fires for interpreter one-liners and unknown shell vars
+    assert _opaque_note({"command": 'python3 -c "print(1)"'})
+    assert _opaque_note({"command": "rm -rf $VAULT/Daily"})
+    assert _opaque_note({"command": "rm -rf $(cat target.txt)"})
+    # a plain, fully-legible command draws no opaque note
+    assert _opaque_note({"command": "npm test && rm -rf build"}) == ""
+    # $HOME is resolved by the path scanner, so it is not "opaque"
+    assert _opaque_note({"command": "rm -rf $HOME/Documents"}) == ""
+
+
 async def test_the_card_carries_the_full_command_and_both_warnings(
         tmp_path, monkeypatch):
     """The click path was told LESS than the voice path: `_short_args` on the

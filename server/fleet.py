@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import shlex
 import time
 import uuid
@@ -51,7 +52,19 @@ ARGS_BUDGET = 120        # a path, a pattern, a URL
 COMMAND_BUDGET = 200     # a shell line: two ends that both matter
 
 _RISKY = ("rm ", "rm -", "mv ", "sudo", "--force", "--hard", "sed -i",
-          "chmod", "chown", "curl", "git push")
+          "chmod", "chown", "curl", "git push",
+          # Interpreter-form destruction the shell-token path scanner cannot
+          # see: `python -c '...shutil.rmtree(...)'`, `node -e 'fs.rmSync(...)'`.
+          # These name no path-shaped token AND miss the `rm` prefixes, so a
+          # long enough one drew NO warning at all — the CRITICAL-2 vault wipe.
+          "rmtree", "os.remove", "os.unlink", "os.rmdir", "unlink(",
+          "rmsync", "fs.rm", "shutil", "> /dev/", "dd if=", "mkfs", ":(){")
+
+# Interpreter one-liners and heredocs whose payload the path scanner cannot
+# read at all — flagged so the readback SAYS it can't fully vet them.
+_INTERPRETER = ("python -c", "python3 -c", "sh -c", "bash -c", "zsh -c",
+                "node -e", "node --eval", "perl -e", "ruby -e", "-eval ",
+                " eval ", "eval(")
 
 _HOOK_KINDS = {
     "SessionStart": "spawned",
@@ -120,9 +133,53 @@ def _full_args(args) -> str:
 
 
 def _risk_note(tool: str, args) -> str:
+    # Scans the WHOLE blob (str(args) carries the full command, never the elided
+    # form) so length never hides a match — the CRITICAL-2 rule that the risk
+    # scanner runs over the full text on every path.
     blob = f"{tool} {args}".lower()
     return ("Careful, sir — this one can destroy things. "
             if any(w in blob for w in _RISKY) else "")
+
+
+def _opaque_note(args) -> str:
+    """A caution for a command whose TARGET the path scanner cannot resolve —
+    interpreter one-liners (`python -c`, `sh -c`, `node -e`), heredocs, and
+    shell/command-substitution variables (`$VAULT`, `$(cat x)`). _named_paths
+    finds no path-shaped token in any of these, so `_outside_note` stayed
+    SILENT — and silence on the consent surface is the worse failure (a
+    `python3 -c '...rmtree(...)'` named nothing and warned nothing). Advisory,
+    spoken, never a refusal — and scanned over the FULL command text."""
+    if not isinstance(args, dict) or not args.get("command"):
+        return ""
+    text = str(args["command"])
+    low = text.lower()
+    if any(m in low for m in _INTERPRETER) or "<<" in text:
+        return "I can't fully vet what this runs, sir — read the card. "
+    # $HOME is the one variable _named_paths resolves to a real path, so it
+    # already gets a precise outside-note; strip it and see if anything else
+    # variable-shaped remains, which the path scanner cannot resolve.
+    stripped = re.sub(r"\$\{?HOME\}?", "", text)
+    if re.search(r"\$\(|`|\$\{?[A-Za-z_]", stripped):
+        return ("This points at a shell variable I can't resolve, sir — "
+                "check the card. ")
+    return ""
+
+
+def _spoken_arg(args) -> tuple[str, bool]:
+    """(text, voice_ok) for the SPOKEN readback. NEVER elides the middle.
+
+    A command over its budget is not read aloud at all: voice_ok False makes it
+    CLICK-ONLY. The old spoken path used _short_args, which cuts the MIDDLE — so
+    a destructive clause parked there vanished from the sentence while the
+    ellipsis stayed inaudible in TTS, and a voice yes ran a command the owner
+    never heard (a 309-char line whose middle was `rmtree` on the vault). The
+    card (`_full_args`) still carries every character; the console approves it."""
+    full = _full_args(args)
+    budget = (COMMAND_BUDGET if (isinstance(args, dict) and args.get("command"))
+              else ARGS_BUDGET)
+    if len(full) <= budget:
+        return full, True
+    return "", False
 
 
 def _named_paths(args) -> list[str]:
@@ -633,9 +690,12 @@ class Worker:
         if self.locked:
             return PermissionResultDeny(
                 message="Marlowe handoff in progress", interrupt=True)
+        # The SPOKEN rendering, decided FIRST: a command too long to read in
+        # full is click-only (voice_ok False), never elided into the middle.
+        spoken, voice_ok = _spoken_arg(tool_input)
         approval = self._router.open_approval(
             self.project, f"{tool_name}: {_short_args(tool_input)}",
-            now=self._now(), path=self.path)
+            now=self._now(), path=self.path, voice_ok=voice_ok)
         fut = asyncio.get_running_loop().create_future()
         self._futures[approval.nonce] = fut
         self._apply("permission_wait",
@@ -648,26 +708,36 @@ class Worker:
         # outside note + this + COMMAND_BUDGET + the closing clause all fit.
         title = str(getattr(context, "title", None) or
                     f"{self.project} wants {tool_name}")[:80]
-        # The worktree confines nothing on its own — cwd is set, absolute paths
-        # ignore it. If the target is outside, Keke hears that BEFORE the yes.
+        # All three scanners run over the FULL text (they take the raw args, not
+        # the elided form). `outside` handles path-shaped targets; `opaque`
+        # covers the interpreter/shell-variable forms `outside` cannot resolve —
+        # which otherwise produced NO warning at all, not an imprecise one.
         outside = _outside_note(tool_input, self.worktree.path, self.protected)
         risk = _risk_note(tool_name, tool_input)
-        # The card carries MORE than the sentence, not less. Speech is elided
-        # (from the MIDDLE, so a long shell line can lose the very clause the
-        # risk note is warning about) and both notes used to live only in the
-        # spoken half — so a console click approved a command the console had
-        # never fully shown. `full_args` is unelided and rendered with
-        # textContent; `risk`/`outside`/`worktree` put the warnings on screen.
+        opaque = _opaque_note(tool_input)
+        warnings_prefix = f"{risk}{outside}{opaque}"
+        # The readback: the full command when it fits, otherwise an explicit
+        # "too long — it's on the card" and voice approval is refused. The
+        # warnings always lead, so a click-only command still SAYS what it is
+        # (risk/outside/opaque) before it declines to read the body aloud.
+        if voice_ok:
+            body = f"{title} — {spoken}. Approve or deny, sir?"
+        else:
+            body = (f"{title} — that command is too long to read aloud, sir; "
+                    f"it's on the card. Approve or deny it there.")
+        # The card carries MORE than the sentence, not less. `full_args` is
+        # unelided and rendered with textContent; `risk`/`outside`/`opaque`/
+        # `worktree` put the warnings on screen; `voice_ok` tells the brain not
+        # to mark a click-only command spoken.
         card = {
             "nonce": approval.nonce, "worker": self.id,
             "project": self.project, "path": self.path, "tool": tool_name,
             "args": _short_args(tool_input),
             "full_args": _full_args(tool_input),
             "risk": risk.strip(), "outside": outside.strip(),
+            "opaque": opaque.strip(), "voice_ok": voice_ok,
             "worktree": self.worktree.path,
-            "question": (f"{risk}{outside}"
-                         f"{title} — {_short_args(tool_input)}. "
-                         f"Approve or deny, sir?")}
+            "question": f"{warnings_prefix}{body}"}
         self._cards[approval.nonce] = card
         self._bus.publish("approval.request", dict(card))
         approved = False

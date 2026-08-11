@@ -242,6 +242,33 @@ async def test_a_stale_approval_request_is_never_read_aloud():
     task.cancel()
 
 
+# ---------------- CRITICAL 2: a click-only command is never voice-approvable --
+async def test_a_click_only_readback_is_never_marked_spoken_and_refuses_a_yes():
+    """The fleet flags a too-long command voice_ok=False and speaks a 'too long,
+    it's on the card' line. The brain must NOT mark it spoken (it never read the
+    command) and a later voice yes must be refused, not deliver the tool."""
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    router, fleet = Router(), FakeFleet()
+    a = router.open_approval("soccer", "Bash: <long>", now=time.time(),
+                             path="/p/soccer", voice_ok=False)
+    task = await brain(bus, butler, spk, router=router,
+                       registry=confirmed_registry("soccer"), fleet=fleet)
+    bus.publish("approval.request", {
+        "nonce": a.nonce, "worker": "w1", "project": "soccer", "path": "/p/soccer",
+        "tool": "Bash", "args": "…", "voice_ok": False,
+        "question": ("soccer wants Bash — that command is too long to read "
+                     "aloud, sir; it's on the card. Approve or deny it there.")})
+    await asyncio.sleep(0.05)
+    assert router.pending_approvals()[0].spoken is False       # never marked read
+    assert any("too long" in s.lower() for s in spk.spoke)     # said so
+    bus.publish("command.received", {"text": "yes"})
+    await asyncio.sleep(0.05)
+    assert all(c[0] != "deliver" for c in fleet.calls)         # nothing approved
+    assert len(router.pending_approvals()) == 1
+    assert any("on the card" in s.lower() for s in spk.spoke)  # refusal points to card
+    task.cancel()
+
+
 async def test_an_expired_approval_request_is_never_read_aloud():
     """Same rule for the TTL path: _on_tool_request sweeps the nonce and
     publishes `expired`, and the queued card must not be asked about."""
