@@ -238,26 +238,46 @@ def _mentions_tool(tool: str, spoken_tokens: set[str]) -> bool:
     return bool(tool_tokens) and all(t in spoken_tokens for t in tool_tokens)
 
 
-def _approval_vocabulary(a) -> frozenset[str]:
+def _approval_vocabulary(a, spoken_tokens: set[str]) -> frozenset[str]:
     """Every word an addressed utterance may contain and still resolve `a`.
 
     THE WHITELIST. An addressed utterance names something, so it may only
     resolve an approval it matched — but "matched" was a substring test on the
     project name, which says nothing about the REST of the sentence. "yeah,
-    kill soccer" matched soccer and approved an `rm -rf`. The rule instead: the
-    match must account for every word said — the project name, the tool, the
-    checkout path, plus the polarity vocabulary and politeness in
-    _BARE_FILLER. A word explained by NONE of those is a word this code did
-    not understand, and consent is never inferred from that.
+    kill soccer" matched soccer and approved a `kill -9 $(pgrep node)`.
 
-    Whitelists degrade in the safe direction. An unknown refusal ("halt",
-    "pause", or whatever the next one turns out to be) leaves a leftover word
-    and the approval stays pending; an unknown POLITENESS costs one clarifying
-    question. A blacklist degrades the other way — four rounds of this bug
-    family are four demonstrations."""
+    The rule: the match must account for every word said. The project name is
+    always folded — it is a human-confirmed label the owner is addressing. The
+    polarity vocabulary and politeness in _BARE_FILLER are always folded. But
+    the tool and path text are folded ONLY when the utterance names the WHOLE
+    tool (or the whole path) — every one of its tokens present. That is the
+    difference between "approve soccer npm test" (the owner naming the command
+    to disambiguate) and "yeah, kill soccer" (a refusal verb that merely
+    COLLIDES with one token of `kill -9 $(pgrep node)`). A partial collision
+    never earns a word its explanation, so a refusal verb sitting inside the
+    pending command can no longer masquerade as "accounted for".
+
+    Why gate on the whole tool rather than blacklist refusal verbs: enumerating
+    stop/refusal words is exactly the blacklist that has failed six times —
+    the next verb (`kill`, `drop`, `reset`, and whatever comes after) is always
+    the one nobody listed. Requiring the ENTIRE command to be named is a
+    positive, whitelist-shaped test that needs no such list: you cannot name
+    the whole of a destructive command by accident while trying to refuse it.
+
+    Whitelists degrade in the safe direction. An unknown refusal, or a token
+    that only partly overlaps the command, leaves a leftover word and the
+    approval stays pending; an unknown POLITENESS costs one clarifying
+    question. A blacklist degrades the other way — six rounds of this bug
+    family are six demonstrations."""
     vocabulary = set(_BARE_FILLER)
-    for said in (a.project, a.tool, a.path):
-        vocabulary.update(_words(said or ""))
+    vocabulary.update(_words(a.project or ""))
+    # Fold the tool/path words only when the utterance names the WHOLE thing —
+    # the same "every token present" test _mentions_tool uses for narrowing, so
+    # vocabulary and disambiguation agree on what counts as naming a command.
+    for said in (a.tool, a.path):
+        tokens = _tokens(said or "")
+        if tokens and all(t in spoken_tokens for t in tokens):
+            vocabulary.update(_words(said or ""))
     return frozenset(vocabulary)
 
 
@@ -505,11 +525,14 @@ class Router:
             return ("unclear", None)
 
         lowered = text.lower()
+        # One tokenization of the utterance, reused for narrowing AND for the
+        # whitelist's "did the owner name the whole tool/path" test — the two
+        # must agree on what counts as naming a command.
+        spoken_tokens = set(_tokens(text))
         matched = [a for a in heard if a.project.lower() in lowered]
         if len(matched) > 1:
             # FIX 2: several approvals for one project — narrow by tool text
             # (token overlap) so "approve soccer npm test" is not a deadlock.
-            spoken_tokens = set(_TOKEN.findall(lowered))
             narrowed = [a for a in matched if _mentions_tool(a.tool, spoken_tokens)]
             if len(narrowed) == 1:
                 matched = narrowed
@@ -541,7 +564,7 @@ class Router:
             # nobody has added to a list yet, or anything else — and we say so
             # instead of guessing: "unclear" leaves the approval pending and
             # the card on screen for the brain to ask about.
-            if _unexplained(text, _approval_vocabulary(target)):
+            if _unexplained(text, _approval_vocabulary(target, spoken_tokens)):
                 return ("unclear", None)
         else:
             # A bare "yes"/"no" can only answer a single unambiguous question —

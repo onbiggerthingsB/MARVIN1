@@ -472,6 +472,68 @@ def test_the_blacklist_genuinely_cannot_see_these():
         assert _polarity_conflict(said) is False, said
 
 
+# ---------- CRITICAL 1: a refusal verb that also appears in the pending
+# command's text must NOT be explained by that text (the missing axis) ----------
+# Every approval fixture in this file used to open `npm test` or `rm -rf build`,
+# so a refusal verb was never IN the pending tool's text — the exact blind spot
+# that let "yeah, kill soccer" approve `kill -9 $(pgrep node)`. These pair each
+# refusal verb with a real destructive command whose text CONTAINS it.
+REFUSAL_VERB_IN_TOOL = [
+    ("kill",   "Bash: kill -9 $(pgrep node)"),
+    ("delete", "Bash: kubectl delete pod soccer"),
+    ("remove", "Bash: git remote remove origin"),
+    ("drop",   "Bash: git stash drop"),
+    ("reset",  "Bash: git reset --hard HEAD"),
+    ("clean",  "Bash: rm -rf build; make clean"),
+    ("halt",   "Bash: halt --now"),
+    ("stop",   "Bash: systemctl stop nginx"),
+    ("cancel", "Bash: scancel 12345"),
+]
+
+
+@pytest.mark.parametrize("verb,tool", REFUSAL_VERB_IN_TOOL)
+@pytest.mark.parametrize("opener", ["yeah", "sure", "yes", "okay"])
+def test_a_refusal_sharing_a_verb_with_the_command_never_approves(verb, tool, opener):
+    """The reproduced fail-open: the refusal verb is a token of the pending
+    command, so folding tool tokens into the consent vocabulary 'explained' it
+    and the utterance resolved to approved. It must fail closed instead — the
+    verb is a leftover word the match cannot account for."""
+    router = one_pending(tool)
+    state, appr = router.resolve_approval(f"{opener}, {verb} soccer", now=NOW + 5)
+    assert state != "approved", (opener, verb, tool)
+    assert appr is None, (opener, verb, tool)
+    assert len(router.pending_approvals()) == 1, (opener, verb, tool)
+
+
+def test_the_missing_axis_reproduces_the_exact_reported_bypasses():
+    """The six rows from the report, each verified to have returned
+    ('approved', <destructive>) before the fix."""
+    for tool, said in [
+        ("Bash: kill -9 $(pgrep node)", "yeah, kill soccer"),
+        ("Bash: kubectl delete pod soccer", "yeah, delete soccer"),
+        ("Bash: git remote remove origin", "yeah, remove soccer"),
+        ("Bash: git stash drop", "sure, drop soccer"),
+        ("Bash: git reset --hard HEAD", "yeah, reset soccer"),
+        ("Bash: rm -rf build; make clean", "yeah, clean soccer"),
+    ]:
+        router = one_pending(tool)
+        state, appr = router.resolve_approval(said, now=NOW + 5)
+        assert state == "unclear" and appr is None, (said, tool, state)
+        assert len(router.pending_approvals()) == 1, (said, tool)
+
+
+def test_naming_the_whole_tool_still_resolves_even_when_it_holds_a_verb():
+    """The whitelist must not over-block: an owner who names the ENTIRE command
+    is genuinely addressing it, so the tool's own words (verb included) are
+    accounted for and a plain approval still resolves."""
+    router = Router()
+    a = router.open_approval("soccer", "Bash: git stash drop", now=NOW, path="/p/soccer")
+    router.mark_spoken(a.nonce)
+    state, appr = router.resolve_approval("approve soccer bash git stash drop",
+                                          now=NOW + 5)
+    assert state == "approved" and appr is not None
+
+
 # ---------- the whitelist must NOT over-block legitimate consent ----------
 @pytest.mark.parametrize("said", [
     "yes", "go ahead", "approve", "do it", "yeah", "yep", "sure", "okay",
