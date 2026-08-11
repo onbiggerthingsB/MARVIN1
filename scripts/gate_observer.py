@@ -49,7 +49,11 @@ BEAT 7 GETS TWO LANES, because it is the beat with no automated proof:
      that tile is a hook POST from the CLI process in the worktree. A record
      with state=DETACHED arriving after the `detached` record is therefore
      hook traffic, whether or not the access log is on. Lane B carries the
-     session id; the access log does not, so lane A is attributed by time.
+     session id; the access log does not, so lane A is attributed by time —
+     which only works while tailing LIVE, where wall-clock interleaving
+     orders the two files. In --once the whole fleet log is read before the
+     first server.log line and access-log lines carry no timestamps, so lane
+     A counts POSTs but credits nothing there; lane B is the authority.
 
 Not a pytest: it tails forever and watches the real state directory.
 `testpaths = ["tests"]` keeps `uv run pytest` away from it; the pure logic is
@@ -328,8 +332,16 @@ class Correlator:
     beat 7 and beat 9 need: who detached and when, and whether the server has
     been down and back up."""
 
-    def __init__(self, board: BeatBoard, crediting: bool = True):
+    def __init__(self, board: BeatBoard, crediting: bool = True,
+                 lane_a_ordered: bool = True):
         self.board = board
+        # True only when this correlator sees the two files interleaved in
+        # wall-clock order (the live tail). --once pumps the ENTIRE fleet log
+        # before the first server.log line, so "a detach exists" says nothing
+        # about whether a given access-log line came before or after it — and
+        # those lines carry no timestamps to compare. With this False, lane A
+        # counts POSTs but never credits beat 7; lane B is the authority.
+        self.lane_a_ordered = lane_a_ordered
         # False while replaying content that was ALREADY on disk when the
         # observer started. state/server.log survives across runs and ends in
         # a "Shutting down"/"Finished server process" block from the last one,
@@ -443,6 +455,18 @@ class Correlator:
             return [f"(pre-existing, not credited) {text[:160]}"]
         if "POST /hooks" in text:
             self.hooks_total += 1
+            if not self.lane_a_ordered:
+                # Refuse, out loud, rather than degrade into a false claim:
+                # workers POST hooks from beat 2 onward, so pre-detach traffic
+                # ALWAYS exists, and nothing in this line says which side of
+                # the detach it belongs to.
+                out.append(f"POST /hooks #{self.hooks_total} — ordering "
+                           f"against the detach is UNKNOWN in --once (the "
+                           f"access log carries no timestamps), so lane A "
+                           f"cannot credit beat 7 here; lane B (fleet "
+                           f"records reaching a DETACHED worker) is the "
+                           f"authority")
+                return out
             after = (self.first_detach_ts is not None)
             if after:
                 self.hooks_after_detach += 1
@@ -582,7 +606,9 @@ def main(argv: list[str] | None = None) -> int:
     out_path = Path(args.out) if args.out else (
         state / f"gate-transcript-{time.strftime('%Y%m%d-%H%M%S')}.md")
     board = BeatBoard()
-    corr = Correlator(board)
+    # --once reads the whole fleet log before the first server.log line, so
+    # lane A (access-log POSTs) has no ordering against the detach there.
+    corr = Correlator(board, lane_a_ordered=not args.once)
     transcript = Transcript(out_path)
 
     try:
@@ -621,6 +647,14 @@ def main(argv: list[str] | None = None) -> int:
                      "DETACHED worker) still proves it.")
         emit("gate", "      Run scripts/gate_preflight.py for the exact fix if "
                      "you want the access log too.")
+
+    if args.once:
+        emit("gate", "--once: replaying finished logs. Lane A (`POST /hooks` "
+                     "in the access log) cannot be ordered against the detach "
+                     "here — those lines carry no timestamps and the fleet "
+                     "log is read first — so POSTs are counted but NOT "
+                     "credited to beat 7. Lane B (fleet records reaching a "
+                     "DETACHED worker) is the authority.")
 
     fleet_tail = Tailer(state / "fleet.jsonl", "fleet.jsonl")
     server_tail = Tailer(state / "server.log", "server.log")
@@ -721,11 +755,16 @@ def main(argv: list[str] | None = None) -> int:
         emit("gate", "stopped by hand — writing the summary.")
     finally:
         summary = board.summary_lines()
+        hooks_line = (
+            f"POST /hooks seen: {corr.hooks_total} (ordering vs the detach "
+            f"unknown in --once — beat 7 rests on lane B)"
+            if args.once else
+            f"POST /hooks seen: {corr.hooks_total} "
+            f"({corr.hooks_after_detach} after the first detach)")
         summary += [
             "",
             f"fleet records damaged/unverifiable: {corr.damaged_lines}",
-            f"POST /hooks seen: {corr.hooks_total} "
-            f"({corr.hooks_after_detach} after the first detach)",
+            hooks_line,
             f"records reaching a DETACHED worker: {corr.post_detach_records}",
             f"log rotations: fleet.jsonl x{fleet_tail.rotations}, "
             f"server.log x{server_tail.rotations}",

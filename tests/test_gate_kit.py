@@ -325,6 +325,36 @@ def test_post_hooks_after_a_detach_is_beat_7():
     assert any("correlated by time" in line for line in out)
 
 
+def test_once_mode_never_credits_beat_7_from_the_access_log():
+    """In --once the whole fleet log is pumped before the first server.log
+    line, so first_detach_ts is always already set — and access-log lines
+    carry no timestamps to order against it. Workers POST hooks from beat 2
+    onward, so 'a detach exists somewhere in the log' proves nothing about
+    THIS line. Lane A must refuse rather than degrade into a false claim."""
+    board = obs.BeatBoard()
+    corr = obs.Correlator(board, lane_a_ordered=False)
+    corr.on_fleet_record(rec("detached", {"worker": "w1", "state": DETACHED,
+                                          "session_id": "s1"}))
+    out = corr.on_server_line('INFO: - "POST /hooks HTTP/1.1" 200 OK',
+                              time.time())
+    assert corr.hooks_total == 1               # still counted, still printed
+    assert corr.hooks_after_detach == 0        # but never claimed as ordered
+    assert not board.evidence[7]
+    assert any("lane B" in line for line in out)   # says who the authority is
+
+
+def test_once_mode_lane_b_still_credits_beat_7():
+    """Lane B is causally ordered by the records themselves (a DETACHED state
+    can only follow the `detached` record), so --once keeps it."""
+    board = obs.BeatBoard()
+    corr = obs.Correlator(board, lane_a_ordered=False)
+    corr.on_fleet_record(rec("detached", {"worker": "w1", "state": DETACHED,
+                                          "session_id": "s1"}))
+    corr.on_fleet_record(rec("activity", {"worker": "w1",
+                                          "state": DETACHED}, 2))
+    assert board.evidence[7]
+
+
 def test_restart_after_a_shutdown_is_beat_9():
     board, corr = board_and_correlator()
     corr.on_server_line("INFO:     Started server process [1]", time.time())
@@ -662,6 +692,13 @@ def test_observer_once_writes_a_transcript_and_a_beat_summary(tmp_path):
     for n in (2, 3, 6, 7):
         assert f"[EVIDENCE] {n}." in text
     assert "[BLIND   ] 4." in text
+    # --once cannot order access-log lines against the detach: the POST is
+    # counted but never claimed as post-detach — beat 7 above came from lane
+    # B (the `activity` record on the DETACHED worker), and the transcript
+    # says lane A is out.
+    assert "(AFTER the detach)" not in text     # the lane-A tag, not beat 7's title
+    assert "after the first detach" not in text
+    assert "lane B" in text
     # the pin was already on disk before the run: warned about, not claimed
     assert "ALREADY pinned" in text
     assert "[NONE    ] 8." in text
