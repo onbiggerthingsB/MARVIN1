@@ -4,7 +4,8 @@ from types import SimpleNamespace
 import pytest
 
 from server import fleet as fleet_mod
-from server.fleet_state import CLOSED, DETACHED, QUIET_AFTER_S, UNKNOWN
+from server.fleet_state import (CLOSED, DETACHED, QUIET_AFTER_S, UNKNOWN,
+                                WAITING_PERMISSION)
 from tests.test_app_auth import bootstrap, make_client
 from tests.test_fleet import (FakeClient, ResultMessage, cleanup, make_fleet,
                               repo)
@@ -323,13 +324,16 @@ async def test_a_stop_already_inside_its_interrupt_refuses_the_handoff(tmp_path,
     assert fleet.workers[0].machine.base == CLOSED   # ONE outcome, and the tile says it
 
 
-async def test_a_session_end_between_the_close_and_the_detached_apply_aborts(tmp_path, monkeypatch):
-    """WorkerStateMachine.apply BOUNCES every event but session_end off CLOSED
-    and returns without error. The handoff's own disconnect() kills the CLI, so
-    the CLI's SessionEnd hook can POST while the lockout is still inside that
-    disconnect — and an unverified `detached` then publishes the resume command,
-    opens a terminal and speaks "yours in the terminal" over a worker recorded
-    CLOSED. The transition is a step like any other: verify it landed."""
+async def test_a_session_end_between_the_close_and_the_detached_apply_detaches(tmp_path, monkeypatch):
+    """The handoff's own disconnect() kills the CLI, and the CLI's SessionEnd
+    hook POSTs while the lockout is still inside that disconnect. The first
+    shipped version read the resulting CLOSED as a failure and refused — 3 live
+    attempts out of 3 — but that CLOSED is the teardown WORKING: closing the
+    session on our side is a step of the handoff, and the transcript it leaves
+    on disk is exactly what `claude --resume` resumes. The lockout completed
+    and was verified, so the handoff must detach and publish the command. (A
+    session_end on the back of a teardown that FAILED still refuses — see
+    test_a_failed_teardown_never_detaches_even_when_the_session_closed.)"""
     fleet, bus, router, clients, path, opened = await spawned(tmp_path, monkeypatch)
     w = fleet.workers[0]
     real_disconnect = clients[0].disconnect
@@ -348,11 +352,16 @@ async def test_a_session_end_between_the_close_and_the_detached_apply_aborts(tmp
     types = [ev["type"] for ev in _drain(q)]
     bus.unsubscribe(cid)
 
-    assert result["ok"] is False and "command" not in result
-    assert opened == []                       # never a terminal on a closed session
-    assert w.machine.base == CLOSED           # honest: the CLI really did end
-    assert "fleet.handoff" not in types       # the console never gets the command
-    assert "closed" in result["spoken"].lower()
+    assert result["ok"] is True
+    assert w.machine.base == DETACHED         # zero drivers became exactly one
+    assert opened == [result["command"]]
+    assert "claude --resume sess-42" in result["command"]
+    assert "fleet.handoff" in types           # the console gets the command
+    # The teardown's session_end was consumed pre-detach, so no echo is owed:
+    # the NEXT SessionEnd is the terminal session's own end and must close.
+    fleet.handle_hook({"hook_event_name": "SessionEnd",
+                       "session_id": "sess-42", "cwd": w.worktree.path})
+    assert w.machine.base == CLOSED
 
 
 async def test_a_handoff_in_the_query_window_refuses_for_the_whole_spawn(tmp_path, monkeypatch):
@@ -452,6 +461,186 @@ async def test_steer_during_the_post_handoff_queue_drain_says_detached(tmp_path,
         assert "handing" not in steered.lower()
     finally:
         await cleanup(fleet)
+
+
+# ---------- the fake that behaves like the REAL CLI ----------
+class RealCLIClient(FakeClient):
+    """FakeClient plus the two behaviours of the real CLI that the live run
+    proved and every older fake omitted — the omission that let the shipped
+    handoff pass ~30 unit tests and then fail 3 attempts out of 3 against
+    real workers (state/fleet.jsonl seq 55-60):
+
+      1. a PermissionResultDeny is terminal: the real CLI exits the session on
+         a denial — globe's log shows `session_end` 19ms after the teardown's
+         own rejection (seq 56 -> 57), dei's 24ms (seq 76 -> 77);
+      2. the exiting CLI runs its SessionEnd hook, whose curl POSTs to /hooks
+         and is handled BEFORE the SDK disconnect returns — so `session_end`
+         reaches the state machine while the handoff is still inside its own
+         shutdown, in all three live attempts.
+
+    `hooks` is wired to fleet.handle_hook by the test: it stands in for the
+    localhost HTTP hop, which runs on the same event loop in production too.
+    """
+
+    def __init__(self, options):
+        super().__init__(options)
+        self.hooks = None                    # fleet.handle_hook, wired later
+        self.cli_session_id = "sess-42"
+        self.exited = False
+
+    def exit_session(self):
+        """The CLI process ends: SessionEnd hook POST, then the stream ends."""
+        if self.exited:
+            return
+        self.exited = True
+        if self.hooks is not None:
+            self.hooks({"hook_event_name": "SessionEnd",
+                        "session_id": self.cli_session_id,
+                        "cwd": self.options.cwd})
+        self.stream.put_nowait(None)
+
+    def exit_on_deny(self, decision_task):
+        """Arm behaviour 1 on a pending can_use_tool decision."""
+        def on_done(task):
+            if task.cancelled() or task.exception() is not None:
+                return
+            if getattr(task.result(), "behavior", "") == "deny":
+                self.exit_session()
+        decision_task.add_done_callback(on_done)
+
+    async def disconnect(self):
+        self.exit_session()                  # behaviour 2
+        await super().disconnect()
+
+
+async def spawned_real_cli(tmp_path, monkeypatch):
+    fleet, bus, router, clients = make_fleet(tmp_path, monkeypatch,
+                                             client_cls=RealCLIClient)
+    opened = []
+
+    async def fake_terminal(cmd):
+        opened.append(cmd)
+
+    fleet._open_terminal = fake_terminal
+    path = repo(tmp_path)
+    await fleet.spawn("globe", path, "task")
+    clients[0].hooks = fleet.handle_hook
+    clients[0].stream.put_nowait(ResultMessage(session_id="sess-42"))
+    await asyncio.sleep(0.05)                     # session id captured
+    return fleet, bus, router, clients, path, opened
+
+
+async def test_handoff_survives_the_cli_exiting_on_the_teardowns_own_denial(tmp_path, monkeypatch):
+    """THE live defect, replayed: worker parked on a pending approval (where a
+    real worker sits most of the time), handoff rejects it, the real CLI treats
+    the denial as terminal and exits, its SessionEnd hook lands `session_end`
+    mid-shutdown — and the handoff must still detach and hand over exactly one
+    driver, because ending the session on our side is a STEP of the handoff,
+    not its failure. Before the fix this failed 3 attempts out of 3."""
+    fleet, bus, router, clients, path, opened = await spawned_real_cli(
+        tmp_path, monkeypatch)
+    w = fleet.workers[0]
+    decision = asyncio.create_task(w._on_tool_request(
+        "Bash", {"command": "npm test"}, SimpleNamespace(title=None)))
+    await asyncio.sleep(0.05)
+    assert w.machine.base == WAITING_PERMISSION
+    clients[0].exit_on_deny(decision)
+
+    result = await fleet.handoff(path)
+    got = await asyncio.wait_for(decision, 1)
+
+    assert got.behavior == "deny"                 # unblocked, not abandoned
+    assert clients[0].exited                      # the CLI really did exit
+    assert result["ok"] is True
+    assert w.machine.base == DETACHED
+    assert "claude --resume sess-42" in result["command"]
+    assert opened == [result["command"]]          # ONE terminal, one driver
+    assert router.pending_approvals() == []
+
+
+async def test_handoff_survives_the_session_end_hook_of_its_own_disconnect(tmp_path, monkeypatch):
+    """The probe attempt (seq 19-22): NO pending approval — the CLI exits
+    under the teardown's interrupt/disconnect and its SessionEnd hook still
+    beats `_apply("detached")`. Same defect, no denial involved."""
+    fleet, bus, router, clients, path, opened = await spawned_real_cli(
+        tmp_path, monkeypatch)
+    w = fleet.workers[0]
+    result = await fleet.handoff(path)
+    assert clients[0].exited
+    assert result["ok"] is True
+    assert w.machine.base == DETACHED
+    assert opened == [result["command"]]
+    # The teardown's session_end was consumed BEFORE the detach, so the next
+    # SessionEnd for this worker is the TERMINAL session's own end — the one
+    # event that may close a DETACHED tile.
+    fleet.handle_hook({"hook_event_name": "SessionEnd",
+                       "session_id": "sess-42", "cwd": w.worktree.path})
+    assert w.machine.base == CLOSED
+
+
+async def test_the_teardowns_late_session_end_echo_does_not_close_the_detached_tile(tmp_path, monkeypatch):
+    """The race's OTHER order: the CLI died without its hook completing (a
+    hard kill mid-hook leaves the curl to finish on its own), so the
+    teardown's own `session_end` lands only AFTER `detached` was applied.
+    Un-swallowed it would collapse DETACHED -> CLOSED under an open terminal:
+    the tile lies, the worktree drops out of live_worktree_paths' never-delete
+    set, and the next boot folds the worker to CLOSED — no DETACHED ghost, no
+    resume command. The echo is swallowed ONCE, keyed to the session id we
+    handed over; the terminal session's own end still closes the tile."""
+    fleet, bus, router, clients, path, opened = await spawned(
+        tmp_path, monkeypatch)               # plain fake: no hook mid-shutdown
+    w = fleet.workers[0]
+    result = await fleet.handoff(path)
+    assert result["ok"] is True and w.machine.base == DETACHED
+
+    fleet.handle_hook({"hook_event_name": "SessionEnd",
+                       "session_id": "sess-42", "cwd": w.worktree.path})
+    assert w.machine.base == DETACHED             # our echo, not the terminal
+
+    fleet.handle_hook({"hook_event_name": "SessionEnd",
+                       "session_id": "sess-42", "cwd": w.worktree.path})
+    assert w.machine.base == CLOSED               # the terminal really ended
+
+
+async def test_a_failed_teardown_never_detaches_even_when_the_session_closed(tmp_path, monkeypatch):
+    """CLOSED-mid-handoff is handoff-able ONLY on the back of a verified
+    teardown. Here the hook proves the CLI exited but disconnect() itself
+    raised — the lockout is unverified end-to-end, so the handoff must refuse,
+    return no resume command, and speak the closed-session sentence."""
+    fleet, bus, router, clients, path, opened = await spawned_real_cli(
+        tmp_path, monkeypatch)
+    w = fleet.workers[0]
+    real_exit = clients[0].exit_session
+
+    async def hook_then_boom():
+        real_exit()                               # the CLI died and said so…
+        raise RuntimeError("subprocess refused to die")   # …but we can't verify
+
+    clients[0].disconnect = hook_then_boom
+    result = await fleet.handoff(path)
+    assert result["ok"] is False and "command" not in result
+    assert w.machine.base == CLOSED               # honest: it really did end
+    assert "closed" in result["spoken"].lower()
+    assert opened == []                           # never a terminal unverified
+
+
+async def test_the_teardowns_denial_speaks_for_marlowe_not_for_keke(tmp_path, monkeypatch):
+    """The rejected approval's deny message lands in the session transcript
+    the human is about to resume. "Keke denied this by voice" is false there —
+    nobody denied anything; Marlowe was detaching — and the resumed model
+    would act on it."""
+    fleet, bus, router, clients, path, opened = await spawned(
+        tmp_path, monkeypatch)
+    w = fleet.workers[0]
+    decision = asyncio.create_task(w._on_tool_request(
+        "Bash", {"command": "npm test"}, SimpleNamespace(title=None)))
+    await asyncio.sleep(0.05)
+    result = await fleet.handoff(path)
+    got = await asyncio.wait_for(decision, 1)
+    assert result["ok"] is True
+    assert got.behavior == "deny"
+    assert "keke" not in got.message.lower()      # not a decision on the tool
+    assert "denied" not in got.message.lower()
 
 
 # ---------- the default launcher (never launches a real Terminal) ----------

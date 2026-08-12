@@ -479,6 +479,14 @@ class Worker:
         self.transcript: deque[dict] = deque(maxlen=TRANSCRIPT_KEEP)
         self.locked = False               # handoff lockout: no more input
         self.handoff_in_flight = False    # a lockout sequence is mid-flight
+        # True between a handoff's verified teardown and the arrival of the
+        # CLI's OWN SessionEnd hook for that teardown. The exiting CLI's hook
+        # curl usually completes before disconnect() returns (all three live
+        # attempts), but a CLI killed mid-hook leaves the POST to land AFTER
+        # `detached` — and session_end is the one event allowed off DETACHED,
+        # so un-swallowed it would close the tile under an open terminal.
+        # handle_hook consumes exactly one such echo.
+        self.session_end_echo_owed = False
         # The symmetric partner of handoff_in_flight, set by _stop_worker (so
         # it covers stop() AND _spawn's deferred stop). Both flags are pure
         # REFUSALS — neither side ever waits on the other, so they cannot
@@ -624,7 +632,13 @@ class Worker:
             # "lost" instead; if the SessionEnd hook already landed the
             # machine is CLOSED and this is a clean, expected end — apply
             # would bounce off CLOSED anyway, so skip the error noise too.
-            if self.machine.base not in (CLOSED, DETACHED):
+            # `locked` gets the same silence, for tick()'s reason: a locked
+            # worker's stream ends BY OUR OWN HAND (the real CLI exits on the
+            # teardown's denial inside the interrupt wait, before shutdown
+            # cancels this task), so "stream ended" is not news — and the
+            # teardown that set the lock ends in an honest state of its own
+            # (session_end, detached, or a spoken failure marked lost).
+            if self.machine.base not in (CLOSED, DETACHED) and not self.locked:
                 self._bus.publish("fleet.error", {
                     "worker": self.id, "project": self.project,
                     "reason": "worker stream ended — the CLI process exited"})
@@ -774,6 +788,16 @@ class Worker:
                     {"nonce": approval.nonce, "approved": approved})
         if approved:
             return PermissionResultAllow()
+        if self.locked:
+            # The rejection came from shutdown(), not from Keke — and this
+            # message lands in the session transcript. After a handoff the
+            # human RESUMES that transcript, and a model told "Keke denied
+            # this by voice" apologises for a denial that never happened.
+            # (The real CLI exits on any denial — that exit is the teardown's
+            # intent here, so the wording changes nothing mechanical.)
+            return PermissionResultDeny(
+                message="Marlowe is closing this session — not a decision "
+                        "on the tool", interrupt=False)
         return PermissionResultDeny(
             message="Keke denied this by voice", interrupt=False)
 
@@ -1171,8 +1195,20 @@ class Fleet:
         """Spec §5 lockout: stop input → reject pending approvals → interrupt
         → close the SDK subprocess → verify exit → lock → `claude --resume`.
         DETACHED only after the session is provably closed on our side; any
-        failure leaves the worker UNKNOWN and returns NO resume command —
-        two drivers on one session interleave messages."""
+        failure of the lockout leaves the worker UNKNOWN and returns NO
+        resume command — two drivers on one session interleave messages.
+
+        The session ENDING under the lockout is not such a failure — it is
+        the lockout WORKING. Closing the SDK subprocess makes the real CLI
+        exit (it also exits the moment the teardown denies its pending
+        approval), and the exiting CLI's own SessionEnd hook lands
+        `session_end` here before shutdown() returns. The first shipped
+        version read that CLOSED as "the session died mid-handoff" and
+        refused — 3 attempts out of 3, live, because a real worker is nearly
+        always holding a pending approval. `claude --resume` drives the
+        transcript on disk, which an ended session has exactly like a
+        stopped one; what the no-two-drivers invariant needs is our side
+        provably dead FIRST, and that is what the verified shutdown gives."""
         w = self._find(path)
         if w is None:
             # A restart ghost is not a Worker, so _find cannot see it — but
@@ -1264,19 +1300,37 @@ class Fleet:
                 for t in (w.consumer, w.pump):
                     if t is not None and not t.done():
                         raise RuntimeError("worker tasks still running")
-                # The transition is a STEP, verified like every other one. The
-                # CLOSED gate above protects only this sequence's ENTRY, and
-                # WorkerStateMachine.apply BOUNCES every event but session_end
-                # off CLOSED *without raising*: a concurrent stop, or the CLI's
-                # own SessionEnd hook fired by the disconnect() we just did,
-                # can land inside these awaits. Unverified, the lines below
-                # would publish the resume command, open a terminal and say
-                # "yours in the terminal" over a worker recorded CLOSED.
+                # Our side is now provably dead: input locked, approvals
+                # rejected, client disconnected, consumer and pump verified
+                # exited. ZERO drivers. If the CLI's own SessionEnd hook has
+                # already landed (it did in all three live attempts — the
+                # exiting CLI's curl completes before disconnect returns),
+                # the machine reads CLOSED, and `detached` is the ONE event
+                # apply() accepts from there: an ended session's transcript
+                # is exactly what `claude --resume` resumes, so detaching it
+                # hands over the FIRST driver, not a second. If the hook has
+                # NOT landed yet, it is still in flight (or the CLI died too
+                # hard to send it) and will arrive AFTER the detach — owe
+                # handle_hook that one echo, or session_end (the one event
+                # allowed off DETACHED, reserved for the TERMINAL session's
+                # end) would close the tile under an open terminal.
+                w.session_end_echo_owed = w.machine.base != CLOSED
+                # The transition is a STEP, verified like every other one —
+                # the belt an earlier audit demanded after an unverified
+                # `detached` silently bounced and the handoff claimed success
+                # anyway. With detached-from-CLOSED now a legal transition
+                # this check cannot fire from hook timing any more, but it
+                # still guards the claim below against any future state the
+                # machine refuses: no DETACHED, no resume command, ever.
                 w._apply("detached", {"session_id": w.session_id})
                 if w.machine.base != DETACHED:
                     raise RuntimeError(
                         f"the session went {w.machine.base} mid-handoff")
             except Exception as e:  # noqa: BLE001 — a half-dead session must never detach
+                # No echo credit for a handoff that failed: the worker is not
+                # DETACHED, so the swallow in handle_hook could never match —
+                # but a stale flag must not survive into some later sequence.
+                w.session_end_echo_owed = False
                 w._apply("lost", {"reason": f"handoff failed: {e}"})
                 # Through the writer, like every other append: it never raises
                 # and never blocks the loop, and handoff_failed is an fsync
@@ -1285,9 +1339,12 @@ class Fleet:
                                         {"worker": w.id, "path": w.path,
                                          "reason": str(e)})
                 if w.machine.base == CLOSED:
-                    # `lost` bounced too: the session really did end under the
-                    # lockout. "Marked unknown" would be the same lie pointing
-                    # the other way, over a tile that reads CLOSED.
+                    # `lost` bounced too: the session ended AND the lockout
+                    # itself failed (a disconnect that raised, tasks that
+                    # would not die). The CLI said it exited, but our side is
+                    # unverified — refusing here is what "DETACHED only on a
+                    # verified teardown" means. "Marked unknown" would be a
+                    # lie pointing the other way, over a tile reading CLOSED.
                     return {"ok": False,
                             "spoken": (f"{w.project}'s session closed while I "
                                        f"was handing it over, sir — I did not "
@@ -1428,6 +1485,24 @@ class Fleet:
             # by tick()'s probe, never by trusting this POST. (Post-handoff
             # the machine bounces everything but session_end off DETACHED,
             # so keeping the hook there bought nothing anyway.)
+            return
+        if (kind == "session_end" and w.session_end_echo_owed
+                and w.machine.base == DETACHED
+                and sid and sid == w.session_id):
+            # The handoff teardown's OWN SessionEnd, arriving late: the CLI
+            # died before its hook curl finished, so the POST outlived the
+            # detach. session_end off DETACHED is reserved for the TERMINAL
+            # session's end — applying this echo would close the tile under
+            # an open terminal, drop the worktree from live_worktree_paths'
+            # never-delete set, and fold the next boot's ghost to CLOSED (no
+            # resume command). Swallowed exactly ONCE, and only for the very
+            # session id the handoff resumed; a terminal session that comes
+            # back under a fresh id is never touched by this. The known cost
+            # points the safe way: if the echo was genuinely lost AND the
+            # terminal reuses the id, its first end is eaten and the tile
+            # stays DETACHED — a protected worktree and a still-valid resume
+            # command, never a terminal driving a tile that says CLOSED.
+            w.session_end_echo_owed = False
             return
         if kind:
             w._apply(kind)

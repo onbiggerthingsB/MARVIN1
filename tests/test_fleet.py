@@ -60,13 +60,14 @@ class FakeClient:
             yield msg
 
 
-def make_fleet(tmp_path, monkeypatch, max_workers=1, forbidden=None):
+def make_fleet(tmp_path, monkeypatch, max_workers=1, forbidden=None,
+               client_cls=FakeClient):
     monkeypatch.setenv("MARLOWE_SKIP_PROXY_CHECK", "1")
     bus, router = EventBus(), Router()
     clients: list[FakeClient] = []
 
     def factory(options):
-        c = FakeClient(options)
+        c = client_cls(options)
         clients.append(c)
         return c
 
