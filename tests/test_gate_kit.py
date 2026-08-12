@@ -23,7 +23,17 @@ import gate_preflight as pre       # noqa: E402
 
 from server.fleet_log import FleetLog       # noqa: E402
 from server.fleet_state import DETACHED     # noqa: E402
+# _EVENT_STATE is private, and reaching for it is deliberate — the same reason
+# gate_observer reaches for _checksum. It is the ONE list of record kinds the
+# state machine knows, and the class guard at the bottom of the beat-mapping
+# section must enumerate the REAL set, not a copy that silently stops covering
+# a kind the day someone adds one.
+from server.fleet_state import _EVENT_STATE  # noqa: E402
 from server.registry import Project         # noqa: E402
+
+# Every kind a fleet record can carry: everything the machine applies, plus
+# the report-only record fleet.handoff writes when a handoff does not take.
+RECORD_KINDS = sorted(set(_EVENT_STATE) | {"handoff_failed"})
 
 
 # ------------------------------------------------------------ log reading ---
@@ -545,6 +555,55 @@ def test_rotation_with_no_live_worker_never_becomes_beat_9():
     corr.on_fleet_rotation()
     corr.on_server_line("INFO:     Started server process [2]", time.time())
     assert not board.evidence[9]
+
+
+# ------------------------------------------- the class guard, not a sixth ---
+# Five separate false-credits have now been fixed (45dd7b5 beat 3, 70cf9dd
+# beat 7, 5d4263a beat 9, f00781d beat 6, and beat 2 above). Every one was the
+# same mistake: a beat credited from a record's mere EXISTENCE, in its own
+# hand-written branch, while the record's resulting `state` — the machine's
+# verdict, computed and logged atomically by fleet._apply — sat right there
+# unread. Four of them were found after the class was declared closed.
+#
+# The tests above pin the five instances. This one pins the CLASS: it walks
+# every record kind the state machine knows and asserts that a record the
+# machine ABSORBED credits nothing. fleet_state.apply returns early at a final
+# CLOSED ("closed is final; late hooks bounce off"), so `state: CLOSED` on a
+# record is the machine saying "I did not apply this event". A beat wired to a
+# new kind is covered the day it is written, with nobody having to remember.
+ABSORBED_BUT_STILL_CONSENT = "permission_done"
+
+
+@pytest.mark.parametrize("kind", RECORD_KINDS)
+def test_no_beat_is_credited_from_a_record_the_state_machine_absorbed(kind):
+    board, corr = board_and_correlator()
+    # Deliberately adversarial: every field any branch looks at is present and
+    # well-formed, so the ONLY thing that can refuse the credit is the state.
+    corr.on_fleet_record(rec(kind, {
+        "worker": "w1", "project": "probe", "path": "/p", "state": "CLOSED",
+        "worktree": "/wt/1", "branch": "marlowe/probe-1",
+        "base_commit": "abc1234def", "session_id": "sess-abcdef123456",
+        "nonce": "n1", "approved": True,
+        "reason": "the session went CLOSED mid-handoff"}))
+    credited = {n: rows for n, rows in board.evidence.items() if rows}
+
+    if kind == ABSORBED_BUT_STILL_CONSENT:
+        # The ONE exemption, written down so it stays a reviewed decision
+        # rather than a silent hole. permission_done carries its own outcome
+        # field: `approved` is set by deliver_approval from Keke's spoken
+        # grant, and a session that closes in the instant AFTER she said yes
+        # does not un-say it. Here `state` records what the machine did next,
+        # not whether consent was given — so beat 3 rightly rests on
+        # `approved`, which the tests above prove is checked in every
+        # direction (denied, cancelled, expired).
+        assert credited == {3: ["approval GRANTED for probe (seq 1)"]}
+        return
+
+    assert credited == {}, (
+        f"`{kind}` credited beat(s) {sorted(credited)} from a record the "
+        f"state machine absorbed. That is the sixth instance of the class "
+        f"fixed in 45dd7b5, 70cf9dd, 5d4263a, f00781d and the beat-2 commit: "
+        f"gate the credit on the record's own resulting `state`.")
 
 
 def test_registry_confirm_is_beat_1_and_a_pin_is_beat_8():
