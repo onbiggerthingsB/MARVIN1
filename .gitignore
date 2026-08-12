@@ -7,3 +7,5 @@ static/chimes/
 config/marvin.json
 live_test.py
 config/projects.json
+.env.bak-*
+.env.*.bak
