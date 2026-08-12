@@ -1,0 +1,124 @@
+{
+  "ok": true,
+  "schema_version": "1",
+  "data": [
+    {
+      "id": "2087295904558817506",
+      "text": "The August 2026 edition of the GitHub Monthly Enterprise Roundup (MER) is now available.\n\nThis month’s roundup explores how AI is moving beyond code completion into governed, measurable, end-to-end engineering workflows. 🧵⬇️ https://t.co/hTGKe4Y2rY",
+      "author": {
+        "id": "1361809122425933825",
+        "name": "GitHub Enterprise",
+        "screenName": "GitHubEnt",
+        "profileImageUrl": "https://pbs.twimg.com/profile_images/2079976051669876736/CcanVcyo_normal.jpg",
+        "verified": true
+      },
+      "metrics": {
+        "likes": 16,
+        "retweets": 1,
+        "replies": 2,
+        "quotes": 0,
+        "views": 10118,
+        "bookmarks": 5
+      },
+      "createdAt": "Tue Aug 11 21:51:38 +0000 2026",
+      "createdAtLocal": "2026-08-12 05:51",
+      "createdAtISO": "2026-08-11T21:51:38+00:00",
+      "media": [
+        {
+          "type": "photo",
+          "url": "https://pbs.twimg.com/media/HPeQR1aaIAAUIzM.jpg",
+          "width": 2400,
+          "height": 1260
+        }
+      ],
+      "urls": [],
+      "isRetweet": true,
+      "retweetedBy": "github",
+      "lang": "en",
+      "score": null
+    },
+    {
+      "id": "2087288043547836679",
+      "text": "We want you to decide which session will take the main stage at #GitHubUniverse. Vote for your favorite at https://t.co/nv9Zgwuf4K https://t.co/kORZZWHXKd",
+      "author": {
+        "id": "13334762",
+        "name": "GitHub",
+        "screenName": "github",
+        "profileImageUrl": "https://pbs.twimg.com/profile_images/2051404708766507008/ATxxTJXO_normal.jpg",
+        "verified": true
+      },
+      "metrics": {
+        "likes": 36,
+        "retweets": 2,
+        "replies": 8,
+        "quotes": 0,
+        "views": 37733,
+        "bookmarks": 11
+      },
+      "createdAt": "Tue Aug 11 21:20:24 +0000 2026",
+      "createdAtLocal": "2026-08-12 05:20",
+      "createdAtISO": "2026-08-11T21:20:24+00:00",
+      "media": [
+        {
+          "type": "photo",
+          "url": "https://pbs.twimg.com/media/HPeJVwEXYAAsjMD.jpg",
+          "width": 2400,
+          "height": 2400
+        },
+        {
+          "type": "photo",
+          "url": "https://pbs.twimg.com/media/HPeJW98XUAAfJSb.jpg",
+          "width": 2400,
+          "height": 2400
+        },
+        {
+          "type": "photo",
+          "url": "https://pbs.twimg.com/media/HPeJYMzWUAARYDd.jpg",
+          "width": 2400,
+          "height": 2400
+        },
+        {
+          "type": "photo",
+          "url": "https://pbs.twimg.com/media/HPeJZavWMAEiJgr.jpg",
+          "width": 2400,
+          "height": 2400
+        }
+      ],
+      "urls": [
+        "http://gh.io/shapethelineup"
+      ],
+      "isRetweet": false,
+      "retweetedBy": null,
+      "lang": "en",
+      "score": null
+    },
+    {
+      "id": "2087244722456731759",
+      "text": "📣 @MicrosoftAI's MAI-Code-1.1-Flash is now rolling out in GitHub Copilot.\n\n➡️ It has native vision support for image understanding\n➡️ Delivers improvements across coding quality, instruction following, tool use, and performance\n➡️ 73% lower list price than MAI-Code-1-Flash, making it a cost-effective option \n\nTry it out in the GitHub Copilot app, CLI, and @code.\nhttps://t.co/kUOJdI9l9A",
+      "author": {
+        "id": "13334762",
+        "name": "GitHub",
+        "screenName": "github",
+        "profileImageUrl": "https://pbs.twimg.com/profile_images/2051404708766507008/ATxxTJXO_normal.jpg",
+        "verified": true
+      },
+      "metrics": {
+        "likes": 364,
+        "retweets": 39,
+        "replies": 13,
+        "quotes": 12,
+        "views": 70600,
+        "bookmarks": 65
+      },
+      "createdAt": "Tue Aug 11 18:28:15 +0000 2026",
+      "createdAtLocal": "2026-08-12 02:28",
+      "createdAtISO": "2026-08-11T18:28:15+00:00",
+      "media": [],
+      "urls": [],
+      "isRetweet": false,
+      "retweetedBy": null,
+      "lang": "en",
+      "score": null
+    }
+  ]
+}

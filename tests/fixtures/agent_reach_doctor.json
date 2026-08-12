@@ -1,0 +1,141 @@
+{
+  "github": {
+    "status": "ok",
+    "name": "GitHub 仓库和代码",
+    "message": "完整可用（读取、搜索、Fork、Issue、PR 等）",
+    "tier": 0,
+    "backends": [
+      "gh CLI"
+    ],
+    "active_backend": "gh CLI"
+  },
+  "twitter": {
+    "status": "ok",
+    "name": "Twitter/X 推文",
+    "message": "twitter-cli 完整可用（搜索、读推文、时间线、长文/Article、用户查询、Thread）",
+    "tier": 1,
+    "backends": [
+      "twitter-cli",
+      "OpenCLI",
+      "bird CLI (legacy)"
+    ],
+    "active_backend": "twitter-cli"
+  },
+  "youtube": {
+    "status": "off",
+    "name": "YouTube 视频和字幕",
+    "message": "yt-dlp 未安装。安装：pip install yt-dlp",
+    "tier": 0,
+    "backends": [
+      "yt-dlp"
+    ],
+    "active_backend": null
+  },
+  "reddit": {
+    "status": "off",
+    "name": "Reddit 帖子和评论",
+    "message": "未安装任何 Reddit 后端。注意：Reddit 没有零配置路径（匿名 .json 已被封，官方 API 需人工审批），必须用登录态。推荐：\n  桌面：agent-reach install --channels opencli\n       （复用 Chrome 登录态，登录过 reddit.com 即可用）\n  服务器/存量：pipx install 'git+https://github.com/public-clis/rdt-cli.git@5e4fb3720d5c174e976cd425ccc3b879d52cac66'\n       然后 `rdt login` 或手动写入 Cookie（见 doctor 提示）\n中国大陆访问 Reddit 需要代理",
+    "tier": 1,
+    "backends": [
+      "OpenCLI",
+      "rdt-cli"
+    ],
+    "active_backend": null
+  },
+  "bilibili": {
+    "status": "ok",
+    "name": "B站视频、字幕和搜索",
+    "message": "B站搜索 API 可达（仅搜索，curl 直连）。完整功能建议安装 bili-cli：pipx install bilibili-cli",
+    "tier": 1,
+    "backends": [
+      "bili-cli",
+      "OpenCLI",
+      "B站搜索 API"
+    ],
+    "active_backend": "B站搜索 API"
+  },
+  "xiaohongshu": {
+    "status": "off",
+    "name": "小红书笔记",
+    "message": "未安装任何小红书后端。推荐：\n  桌面：agent-reach install --channels opencli\n       （复用 Chrome 登录态，刷过小红书即零配置可用）\n  服务器：xiaohongshu-mcp（自带无头浏览器+扫码登录）：https://github.com/xpzouying/xiaohongshu-mcp",
+    "tier": 1,
+    "backends": [
+      "OpenCLI",
+      "xiaohongshu-mcp",
+      "xhs-cli (xiaohongshu-cli)"
+    ],
+    "active_backend": null
+  },
+  "linkedin": {
+    "status": "off",
+    "name": "LinkedIn 职业社交",
+    "message": "mcporter 已装但 LinkedIn MCP 未配置。运行：\n  pip install linkedin-scraper-mcp\n  mcporter config add linkedin http://localhost:3000/mcp",
+    "tier": 2,
+    "backends": [
+      "linkedin-scraper-mcp",
+      "Jina Reader"
+    ],
+    "active_backend": null
+  },
+  "xiaoyuzhou": {
+    "status": "off",
+    "name": "小宇宙播客转文字",
+    "message": "转录脚本未安装。运行：\n  agent-reach install --env=auto\n  或手动复制 transcribe.sh 到 ~/.agent-reach/tools/xiaoyuzhou/",
+    "tier": 1,
+    "backends": [
+      "groq-whisper",
+      "ffmpeg"
+    ],
+    "active_backend": null
+  },
+  "v2ex": {
+    "status": "ok",
+    "name": "V2EX 节点、主题与回复",
+    "message": "公开 API 可用（热门主题、节点浏览、主题详情、用户信息）",
+    "tier": 0,
+    "backends": [
+      "V2EX API (public)"
+    ],
+    "active_backend": "V2EX API (public)"
+  },
+  "xueqiu": {
+    "status": "warn",
+    "name": "雪球股票行情与社区动态",
+    "message": "Xueqiu API 连接失败：HTTP Error 400: 。请先登录雪球后运行：agent-reach configure --from-browser chrome",
+    "tier": 1,
+    "backends": [
+      "Xueqiu API (需要登录 Cookie)"
+    ],
+    "active_backend": null
+  },
+  "rss": {
+    "status": "ok",
+    "name": "RSS/Atom 订阅源",
+    "message": "可读取 RSS/Atom 源",
+    "tier": 0,
+    "backends": [
+      "feedparser"
+    ],
+    "active_backend": "feedparser"
+  },
+  "exa_search": {
+    "status": "ok",
+    "name": "全网语义搜索",
+    "message": "全网语义搜索可用（免费，无需 API Key）",
+    "tier": 0,
+    "backends": [
+      "Exa via mcporter"
+    ],
+    "active_backend": "Exa via mcporter"
+  },
+  "web": {
+    "status": "ok",
+    "name": "任意网页",
+    "message": "通过 Jina Reader 读取任意网页（curl https://r.jina.ai/URL）",
+    "tier": 0,
+    "backends": [
+      "Jina Reader"
+    ],
+    "active_backend": "Jina Reader"
+  }
+}
