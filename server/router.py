@@ -130,6 +130,18 @@ _WORKTREE_REMOVE_EMPTY = re.compile(
 _WORKTREE_REMOVE_NAMED = re.compile(
     r"^\s*(?:remove|delete|drop)(?:\s+(?:the|that))*"
     r"\s+" + _WT + r"\s+for\s+(?P<name>.+?)\s*[.!?]*\s*$", re.I)
+# M5: the X search verb. Anchored on the whole utterance with a closed
+# opener, same discipline as _DISCOVER: the platform token ("x"/"twitter")
+# must sit between the verb and "for", so "search for my projects" stays a
+# discovery and "search the vault for HRV" stays the butler's. The query is
+# DATA — it is passed to the quarantined pipeline as one argv element and
+# never interpreted — so it may be anything except empty. Trailing STT
+# punctuation is trimmed the way _DISCOVER trims it. "ex" (a plausible
+# mishearing of "X") is deliberately absent: mishearings are whitelisted one
+# observed token at a time, never predicted (see "star" above).
+_SOCIAL_SEARCH = re.compile(
+    r"^\s*(?:search|look\s+up)\s+(?:on\s+)?(?:x|twitter)\s+for\s+"
+    r"(?P<query>.+?)\s*[.!?]*\s*$", re.I)
 _STATUS = re.compile(r"^\s*(?:what'?s|what is)\s+(?:running|the fleet|going on)\b.*$", re.I)
 _PULL_IT = re.compile(r"^\s*pull\s+(?:it|that)\s+up\s*[.!?]*\s*$", re.I)
 _PORTFOLIO = re.compile(
@@ -556,6 +568,15 @@ class Router:
         # them would be swallowed silently rather than mis-routed loudly.
         if _DISCOVER.match(text):
             return Command(verb="discover")
+
+        # The X search verb (M5), placed with the other anchored closed-
+        # vocabulary verbs and AFTER _TRADE, which outranks everything: a
+        # search that mentions buying is refused as a trade before the query
+        # can carry it anywhere. The query rides in `argument` as data.
+        m = _SOCIAL_SEARCH.match(text)
+        if m:
+            return Command(verb="social_search",
+                           argument=m.group("query").strip())
 
         # The chain's exit, placed with the same argument as _DISCOVER: it must
         # run BEFORE the project-resolving verbs because _STOP returns None the

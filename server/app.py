@@ -144,9 +144,22 @@ def create_app(base_dir: Path) -> FastAPI:
         print(f"[marvin] WARNING: vault not fully downloaded at {vault_root} "
               f"— enable 'Keep Downloaded' in Finder for reliable answers.")
     vault_server = build_vault_server(vault_root)
+
+    # M5 (spec §7): the quarantined X search. `speak` is the DIRECT-to-TTS
+    # lane the butler-tool path uses for the digest — bounded and guarded
+    # here because a tool handler runs inside the butler's own turn, where a
+    # hung TTS socket would otherwise wedge the ask() await from the inside.
+    async def _speak_digest(text: str) -> None:
+        await asyncio.wait_for(app.state.speaker.speak(text), 60)
+
+    from server.social import SocialSearch, build_social_server
+    app.state.social = SocialSearch(bus=app.state.bus, speak=_speak_digest)
+    social_server = build_social_server(app.state.social)
+
     app.state.butler = Butler(
         options_builder=lambda resume, use_api_key=False: build_options(
-            vault_root, vault_server, resume, use_api_key=use_api_key),
+            vault_root, vault_server, resume, use_api_key=use_api_key,
+            social_server=social_server),
         state_path=base_dir / "state" / "butler.json")
 
     registry_path = base_dir / "config" / "projects.json"
@@ -472,7 +485,8 @@ def create_app(base_dir: Path) -> FastAPI:
                              onboarding=app.state.onboarding,
                              finance=app.state.source_gate,
                              fleet=app.state.fleet,
-                             cleanup=app.state.cleanup))
+                             cleanup=app.state.cleanup,
+                             social=app.state.social))
 
         def _brain_died(t):
             # Last resort. run_butler_brain guards every await, so reaching here

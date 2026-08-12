@@ -102,8 +102,21 @@ SYSTEM_PROMPT = (
 )
 
 
+# Appended to SYSTEM_PROMPT only when the social server is wired. The tool's
+# result is a fixed sentence by construction (spec §7) — this line manages the
+# model's behaviour AROUND that boundary, it is not the boundary itself.
+SOCIAL_PROMPT = (
+    "\nSOCIAL: social_search runs a quarantined X/Twitter search. You never "
+    "see post content — validated results appear on Keke's screen and a "
+    "digest is spoken automatically. The tool returns only a completion "
+    "note; after calling it, acknowledge in one short sentence and never "
+    "invent or guess what the posts said."
+)
+
+
 def build_options(vault_root, mcp_server, resume_session_id=None, *,
-                  use_api_key: bool = False) -> ClaudeAgentOptions:
+                  use_api_key: bool = False,
+                  social_server=None) -> ClaudeAgentOptions:
     # Opt-in paid path: `--bare` forces the CLI to authenticate with
     # ANTHROPIC_API_KEY only (OAuth/keychain never read), which sidesteps the
     # subscription 403 on headless requests. The SDK renders a None-valued
@@ -118,15 +131,27 @@ def build_options(vault_root, mcp_server, resume_session_id=None, *,
             extra_args={"bare": None},
             env={"ANTHROPIC_API_KEY": os.environ["ANTHROPIC_API_KEY"]},
         )
+    # M5 (spec §4/§7): the social server adds exactly ONE tool whose result
+    # is a fixed sentence — the butler still never sees post content. Wired
+    # as opt-in so every existing caller and test keeps the four-tool
+    # surface byte-identical.
+    mcp_servers = {"vault": mcp_server}
+    allowed = list(VAULT_TOOL_NAMES)
+    prompt = SYSTEM_PROMPT
+    if social_server is not None:
+        from server.social import SOCIAL_TOOL_NAMES
+        mcp_servers["social"] = social_server
+        allowed += list(SOCIAL_TOOL_NAMES)
+        prompt = SYSTEM_PROMPT + SOCIAL_PROMPT
     return ClaudeAgentOptions(
         cwd=str(vault_root),
-        system_prompt=SYSTEM_PROMPT,
-        mcp_servers={"vault": mcp_server},
+        system_prompt=prompt,
+        mcp_servers=mcp_servers,
         # [] is the SDK's documented "disable ALL built-in tools" -- the closed
         # surface. MCP tools are server-provided, not built-ins, so the four vault
         # tools survive it and are gated by allowed_tools below.
         tools=[],
-        allowed_tools=list(VAULT_TOOL_NAMES),
+        allowed_tools=allowed,
         # allowed_tools only auto-APPROVES; it does not remove anything. Name the
         # natives explicitly too, so they are stripped from the model's context
         # even if a future SDK default puts them back in the base set.

@@ -46,6 +46,10 @@ PRECONNECT_TIMEOUT_S = 15
 # thread) but the loop still AWAITS it, and an iCloud-evicted or network mount
 # can stall that walk indefinitely. Bounded like every other await here.
 DISCOVERY_TIMEOUT_S = 60
+# The social pipeline bounds its own subprocesses (doctor + search each carry
+# a hard timeout and a byte cap), so this outer bound is the belt over those
+# braces: a wedged pipeline must cost this turn, never the loop.
+SOCIAL_TIMEOUT_S = 90
 # Citation validation touches the filesystem (an iCloud-evicted directory can
 # stall), so it is bounded too. A slow validator must cost the chips, not the turn.
 VALIDATE_TIMEOUT_S = 10
@@ -113,7 +117,7 @@ async def _brief_and_publish(bus, project) -> str:
 
 async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=None,
                            router=None, registry=None, onboarding=None, finance=None,
-                           fleet=None, cleanup=None):
+                           fleet=None, cleanup=None, social=None):
     """Subscribe to the bus and drive the butler. Never raises out of the loop.
 
     `validate_citations` is an optional async callable taking the model's list of
@@ -133,6 +137,13 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
     confirmation or approval owns the next reply. All keyword-optional so every
     M2 caller and test keeps working. `finance` takes the §16 SourceGate: the
     first portfolio ask names the output file and waits for a spoken yes.
+
+    `social` takes the M5 quarantine pipeline (spec §7). On this verb path
+    the butler is BYPASSED entirely: the pipeline validates the untrusted
+    results server-side, the console gets the cards, and the deterministic
+    digest is spoken here — so no session ever holds untrusted content +
+    private data + an action channel. Any follow-up action arrives as a
+    fresh user command through the router, like everything else.
     """
     cid, q = bus.subscribe()
     # Worker ids whose failure has already been spoken. One sentence per
@@ -963,6 +974,21 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                                               or "I have nothing to show "
                                                  "there, sir.")
                             await _speak(spoken)
+                        elif command.verb == "social_search" and social is not None:
+                            # M5 (spec §7): the quarantine owns everything —
+                            # subprocess, validation, cards, digest. What
+                            # comes back here is a SERVER-composed sentence
+                            # (the deterministic digest on success, a closed-
+                            # set refusal line on failure); not one byte of
+                            # post content can be in it, and the butler is
+                            # never consulted. Inside the dispatch try like
+                            # every verb: a pipeline fault costs this turn
+                            # ("that command failed"), never the loop.
+                            res = await asyncio.wait_for(
+                                social.run(command.argument or ""),
+                                SOCIAL_TIMEOUT_S)
+                            await _speak((res or {}).get("spoken")
+                                         or "The X search failed, sir.")
                         elif command.verb in ("worktree_survey",
                                               "worktree_remove_empty",
                                               "worktree_remove_named") \

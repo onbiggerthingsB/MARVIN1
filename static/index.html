@@ -22,6 +22,12 @@
     <div id="finance"></div>
     <div id="fleet"></div>
     <div id="interrupts"></div>
+    <!-- M5: validated X search cards. Everything in here is ATTACKER-
+         AUTHORED text that survived the server's schema whitelist; the
+         renderer uses textContent only, and the single hyperlink per card
+         is a server-CONSTRUCTED https://x.com/... status URL, re-checked
+         client-side before it ever becomes an href. -->
+    <div id="social"></div>
     <!-- What the fleet has left behind. Deliberately BUTTONLESS: removal is a
          spoken instruction ("remove the empty worktrees", "remove the worktree
          for <name>"), never a click, so this pane is purely the surfacing

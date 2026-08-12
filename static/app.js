@@ -15,7 +15,7 @@ function connectSSE() {
    "fleet.update", "fleet.message", "fleet.error", "fleet.transcript",
    "fleet.unknown_session", "fleet.spoken", "fleet.recovered",
    "fleet.handoff", "approval.request", "worktrees.survey",
-   "approval.resolved"].forEach((t) =>
+   "approval.resolved", "social.results", "social.error"].forEach((t) =>
     es.addEventListener(t, dispatch(t)));
   // Deliberate: reconnect fresh (no Last-Event-ID). Replaying stale tts.start/
   // stt.utterance on a live-voice UI would double-trigger playback. Server-side
@@ -574,6 +574,55 @@ window.marvin.onEvent("approval.resolved", (d) => {
   document.querySelectorAll(`#interrupts .interrupt[data-nonce="${d.nonce}"]`)
     .forEach((el) => el.remove());
   window.marvin.setStatus(`approval ${d.outcome}: ${d.project}`);
+});
+
+// ---- M5: the social cards column -----------------------------------------
+// EVERYTHING in a card is attacker-authored text that merely survived the
+// server's schema whitelist. textContent for every field, never innerHTML.
+// The one hyperlink is a server-CONSTRUCTED https://x.com/... status URL —
+// and it is re-checked here anyway before it becomes an href, so even a
+// server regression cannot put a javascript: or off-allowlist link on the
+// page. The digest is NOT rendered from here; it went directly to TTS.
+window.marvin.onEvent("social.results", (d) => {
+  const box = $("#social");
+  if (!box) return;
+  box.textContent = "";               // full repaint: one search, one column
+  (d.cards || []).forEach((c) => {
+    const card = document.createElement("div");
+    card.className = "social-card";
+    const head = document.createElement("div");
+    head.className = "social-head";
+    head.textContent = `@${c.handle} — ${c.author} · ${c.timestamp}`;
+    const body = document.createElement("div");
+    body.className = "social-text";
+    body.textContent = c.text;
+    card.append(head, body);
+    if (/^https:\/\/x\.com\//.test(c.link || "")) {
+      const link = document.createElement("a");
+      link.href = c.link;
+      link.textContent = "open on X";
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      card.appendChild(link);
+    }
+    box.appendChild(card);
+  });
+  // Spec §13: the meter shows what we actually know — counts, never an
+  // invented dollar figure.
+  const meter = document.createElement("div");
+  meter.className = "social-meter";
+  meter.textContent =
+    `${d.count || 0} shown · ${d.refused || 0} refused · ` +
+    `${(d.meter && d.meter.searches) || 0} search` +
+    `${((d.meter && d.meter.searches) || 0) === 1 ? "" : "es"} this session` +
+    ` · ${d.backend || "?"}`;
+  box.appendChild(meter);
+});
+window.marvin.onEvent("social.error", (d) => {
+  const box = $("#social");
+  if (!box) return;
+  // A failed search must never look like an empty result set.
+  box.textContent = `search failed: ${d.reason || "unknown"}`;
 });
 
 // ---- what the fleet leaves behind ---------------------------------------
