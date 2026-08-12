@@ -227,13 +227,26 @@ def test_a_fifo_is_refused_without_blocking(tmp_path):
 def test_the_tail_cap_bounds_what_is_read(tmp_path):
     cwd = "/w/t"
     head = rec_user(cwd, "HEAD-SENTINEL " + "x" * 512)
-    tail = [rec_assistant_text(cwd, f"tail line {i}") for i in range(300)]
+    tail = [rec_assistant_text(cwd, f"tail line {i}") for i in range(20)]
     write_transcript(tmp_path, cwd, SID, [head] + tail)
-    lines = read_session_tail(cwd, SID, tmp_path, tail_bytes=64 * 1024)
+    # 20 records ≈ 13KB: the 8KB byte cap must cut the head record off even
+    # though all 21 lines fit inside the `keep` LINE cap — the caps are
+    # separate defenses, and a whole-file read must fail here (the first
+    # version of this test let `keep` evict the sentinel and mask exactly
+    # that mutation).
+    lines = read_session_tail(cwd, SID, tmp_path, tail_bytes=8 * 1024)
     assert lines, "the capped read must still render the tail"
     assert all("HEAD-SENTINEL" not in l["text"] for l in lines)
-    assert len(lines) <= 200                      # TRANSCRIPT_KEEP parity
-    assert lines[-1]["text"] == "tail line 299"   # newest survives, always
+    assert lines[-1]["text"] == "tail line 19"    # newest survives, always
+
+
+def test_the_keep_cap_bounds_how_many_lines_render(tmp_path):
+    cwd = "/w/t"
+    write_transcript(tmp_path, cwd, SID,
+                     [rec_assistant_text(cwd, f"line {i}") for i in range(250)])
+    lines = read_session_tail(cwd, SID, tmp_path)
+    assert len(lines) == 200                      # TRANSCRIPT_KEEP parity
+    assert lines[-1]["text"] == "line 249"        # newest survives, always
 
 
 def test_each_rendered_line_is_capped(tmp_path):
