@@ -237,6 +237,64 @@ async def test_a_relay_that_dies_is_surfaced_not_raised(tmp_path, monkeypatch):
     assert [t for t, _ in seen] == ["stt.error"], seen
 
 
+async def test_audio_sent_before_deepgram_connects_is_not_lost(tmp_path, monkeypatch):
+    """The server half of the demo's clipped-front defect.
+
+    The client's fix flushes everything spoken during its handshake the moment
+    /mic opens — which is exactly when SttRelay has NOT yet dialed Deepgram:
+    `relay.run` reads the start frame and then awaits `websockets.connect`
+    before anything consumes `inbound()`. Frames sent in that window sit in
+    uvicorn's receive queue; this pins that every one of them reaches Deepgram,
+    in order, byte for byte. The fake Deepgram stalls its handshake for 300ms
+    so the entire burst provably lands mid-dial, and the burst is 40 frames —
+    past the websockets library's default inbound buffering — so backpressure
+    queuing (not dropping) is pinned too. No stand-in: this is SttRelay itself.
+    """
+    received: list[bytes] = []
+
+    async def dg_handler(ws):
+        async for msg in ws:
+            if isinstance(msg, bytes):
+                received.append(msg)
+            elif json.loads(msg).get("type") == "CloseStream":
+                await ws.close()
+                return
+
+    async def stall_handshake(connection, request):
+        await asyncio.sleep(0.3)  # the whole burst arrives while we sleep
+        return None
+
+    dg = await websockets.serve(dg_handler, "127.0.0.1", 0,
+                                process_request=stall_handshake)
+    dg_port = dg.sockets[0].getsockname()[1]
+    monkeypatch.setenv("DEEPGRAM_URL", f"ws://127.0.0.1:{dg_port}")
+
+    app, port = _serve(tmp_path, monkeypatch, app_mod.SttRelay)
+    seen = _record(app)
+    frames = [bytes([i]) * 1920 for i in range(40)]  # 40 distinct 60ms frames
+    try:
+        with _live_server(app, port), _asgi_errors() as errors:
+            cookie = _session_cookie(app, port)
+            ws = await _mic(port, cookie)
+            await ws.send(START)
+            for f in frames:  # the flush: everything buffered pre-open, at once
+                await ws.send(f)
+            await ws.send(STOP)
+            for _ in range(100):  # outlast the stalled dial and the drain
+                if len(received) >= len(frames):
+                    break
+                await asyncio.sleep(0.05)
+            await ws.close()
+            assert errors == [], _formatted(errors)
+    finally:
+        dg.close()
+        await dg.wait_closed()
+    assert received == frames, (
+        f"lost {len(frames) - len(received)} of {len(frames)} frames "
+        "(or reordered/corrupted them)")
+    assert not [e for e in seen if e[0] == "stt.error"], seen
+
+
 async def test_a_press_with_no_audio_is_surfaced_not_raised(tmp_path, monkeypatch):
     """A tap released before the browser's `start` frame ever went out.
 
