@@ -31,6 +31,8 @@ from claude_agent_sdk import (CanUseToolShadowedWarning, ClaudeAgentOptions,
 
 from server.fleet_state import (CLOSED, DETACHED, QUIET, UNKNOWN,
                                 WAITING_PERMISSION, WorkerStateMachine)
+from server.transcripts import (SESSION_ID_RE, TranscriptUnavailable,
+                                default_root, read_session_tail)
 from server.worktrees import (WorktreeError, create_worktree, proxy_problem,
                               write_hook_settings)
 
@@ -476,6 +478,12 @@ class Worker:
         # would silently ignore the new session.
         self.machine = WorkerStateMachine()
         self.session_id: str | None = None
+        # The session the TERMINAL is driving after a handoff. `claude
+        # --resume` may mint a fresh id whose hooks keep POSTing from this
+        # worker's worktree; pull_up follows it to the freshest transcript
+        # file. NEVER used for resume commands — those speak only the id the
+        # SDK stream itself reported (see handle_hook for why).
+        self.terminal_session_id: str | None = None
         self.transcript: deque[dict] = deque(maxlen=TRANSCRIPT_KEEP)
         self.locked = False               # handoff lockout: no more input
         self.handoff_in_flight = False    # a lockout sequence is mid-flight
@@ -862,7 +870,7 @@ class Fleet:
                  worktree_factory=create_worktree,
                  settings_writer=write_hook_settings,
                  hook_port: int = 7777, hook_bearer: str = "",
-                 open_terminal=None, protected=()):
+                 open_terminal=None, protected=(), transcripts_root=None):
         self.workers: list[Worker] = []
         self.queue: deque[tuple[str, str, str]] = deque()
         self.ghosts: list[dict] = []      # restart reports (Task 10)
@@ -886,6 +894,11 @@ class Fleet:
                                for p, name in (protected or ()))
         self.hook_port = hook_port
         self.hook_bearer = hook_bearer
+        # Where the Claude Code CLI writes session transcripts. Pinned here,
+        # once, and never taken from any payload: pull_up derives every path
+        # it reads under this root (spec §12, M4).
+        self.transcripts_root = (Path(transcripts_root) if transcripts_root
+                                 else default_root())
         self._bus = bus
         self._router = router
         self._log = log                       # raw FleetLog: replay/snapshot
@@ -1423,6 +1436,105 @@ class Fleet:
         w = self._find(path)
         return list(w.transcript) if w is not None else []
 
+    async def _disk_lines(self, worktree: str, sids) -> tuple[list | None, str]:
+        """(lines, reason): the first session id whose on-disk transcript
+        reads, newest-preferred, or (None, the last spoken refusal).
+
+        Off-loop via to_thread — the file may be megabytes on a cold disk —
+        and every failure ends as a clause, never a raise: read_session_tail
+        already speaks its refusals, and anything unexpected is reported on
+        the bus and folded into one honest sentence."""
+        reason = "its session id was never recorded"
+        for sid in [s for s in sids if s]:
+            try:
+                return await asyncio.to_thread(
+                    read_session_tail, worktree, sid,
+                    self.transcripts_root), ""
+            except TranscriptUnavailable as e:
+                reason = str(e)
+            except Exception as e:  # noqa: BLE001 — a disk fault is spoken, never raised
+                self._bus.publish("fleet.error",
+                                  {"reason": f"transcript read failed: {e}"})
+                reason = "reading its transcript file failed"
+        return None, reason
+
+    @staticmethod
+    def _disk_view(opening: str, lines: list | None, reason: str) -> dict:
+        """The pull-up dict for a disk-sourced pane. Three honest shapes:
+        lines that read, a file that is genuinely empty, and a refusal whose
+        reason rides in `note` so the pane can never be empty-and-silent."""
+        if lines is None:
+            return {"lines": [], "source": "disk", "note": reason,
+                    "spoken": f"{opening} — and I can't show its transcript: "
+                              f"{reason}."}
+        if not lines:
+            return {"lines": [], "source": "disk",
+                    "note": "its transcript file on disk is empty",
+                    "spoken": f"{opening} — its transcript on disk is empty."}
+        return {"lines": lines, "source": "disk", "note": "",
+                "spoken": f"{opening} — its transcript is on screen, "
+                          f"read from disk."}
+
+    async def pull_up(self, path: str) -> dict:
+        """Lines + sentence + provenance for the pull-up verb (spec §12, M4):
+        {"lines", "spoken", "source" ("memory"|"disk"|"none"), "note"}.
+
+        An OWNED live worker keeps its deque — that stream is fresher than
+        any file flush. A DETACHED worker is served from disk: the deque
+        froze at the handoff, and the transcript file is what the terminal's
+        CLI is actually writing (terminal_session_id preferred — a resume may
+        mint a fresh id — with the handoff-time id as fallback). A restart
+        ghost is served from disk by the worktree + session id its fleet log
+        record carries. Everything else is refused by sentence: nothing binds
+        an unknown session to a directory except a bearer any worker holds,
+        so Marvin does not guess (unknown-session tiles stay deferred).
+
+        Every path a disk read opens is DERIVED under transcripts_root —
+        the hook payload's transcript_path field is never consulted — and a
+        pane with no lines always says why in `note`: an empty pane must
+        never be indistinguishable from all-clear. Failures are sentences;
+        this never raises for a bad path, a bad file, or a bad record."""
+        w = self._find(path)
+        if w is not None:
+            base = w.machine.base
+            # Disk is the truth once a terminal owns (or owned) the session;
+            # memory is the truth while the SDK stream is ours. A CLOSED
+            # worker keeps its deque unless a terminal drove it afterwards.
+            from_disk = (base == DETACHED
+                         or (base == CLOSED and w.terminal_session_id)
+                         or (base == CLOSED and not w.transcript))
+            if not from_disk:
+                lines = list(w.transcript)
+                return {"lines": lines, "source": "memory",
+                        "note": ("" if lines else
+                                 "nothing yet from this worker"),
+                        "spoken": self.one_breath(path)}
+            # Deliberately NO fallback to the frozen deque when disk fails:
+            # pre-handoff memory could contradict what the terminal has done
+            # since, and a stale pane that looks current is a quiet lie. The
+            # note names the failure instead.
+            lines, reason = await self._disk_lines(
+                w.worktree.path, (w.terminal_session_id, w.session_id))
+            opening = (f"{w.project} is detached, sir" if base == DETACHED
+                       else f"{w.project}'s session is closed, sir")
+            return self._disk_view(opening, lines, reason)
+        ghost = next((g for g in self.ghosts
+                      if path and (g.get("path") == path
+                                   or g.get("worktree") == path)), None)
+        if ghost is None:
+            return {"lines": [], "source": "none",
+                    "note": "no session of mine has ever run there",
+                    "spoken": ("Nothing is running there, sir — and I have "
+                               "no record of a session there.")}
+        project = ghost.get("project") or "that worker"
+        opening = (f"{project} is detached, sir"
+                   if ghost.get("state") == DETACHED else
+                   f"{project} was interrupted by a restart, sir")
+        lines, reason = await self._disk_lines(
+            str(ghost.get("worktree") or ""),
+            (str(ghost.get("session_id") or ""),))
+        return self._disk_view(opening, lines, reason)
+
     def one_breath(self, path: str) -> str:
         w = self._find(path)
         if w is None:
@@ -1504,6 +1616,19 @@ class Fleet:
             # command, never a terminal driving a tile that says CLOSED.
             w.session_end_echo_owed = False
             return
+        if (w.machine.base == DETACHED and sid and sid != w.session_id
+                and SESSION_ID_RE.match(str(sid))):
+            # The terminal's own session: `claude --resume` may mint a fresh
+            # id, and its hooks keep POSTing from this worker's worktree (the
+            # settings live in the checkout). Remember it so pull_up can read
+            # the file the terminal is actually writing. Bearer-authed and
+            # bound to a worktree Marvin itself created — the same trust that
+            # already drives state transitions here — and UUID-shaped, so it
+            # can only ever select a `<uuid>.jsonl` inside this worker's own
+            # transcript directory. It is deliberately NEVER written into
+            # session_id and never fed to _resume_command: a forged hook must
+            # not be able to change the `claude --resume` line Keke runs.
+            w.terminal_session_id = str(sid)
         if kind:
             w._apply(kind)
 
