@@ -41,6 +41,15 @@ _NEGATION = re.compile(r"\b(?:no|nope|not|don'?t|wrong|isn'?t)\b", re.I)
 # Punctuation/space between stacked affirmation phrases ("yes, that's right").
 _SEPARATORS = " \t,.;:!?"
 
+# How many repos one run may propose before closing with an honest "N more
+# waiting — say find my projects to continue". Five yes/no questions is about
+# thirty seconds of spoken dialogue — enough to cover the handful of repos a
+# person is actually working in, and small enough that the observed first run
+# (69 discovered repos) is a bounded conversation instead of an ordeal. A run
+# starts at refresh(): boot discovery and the "find my projects" verb are the
+# only two entrances, so each explicit ask buys a fresh budget.
+PROPOSALS_PER_RUN = 5
+
 
 def _bare_affirmation(text: str) -> bool:
     """True when the utterance is an affirmation and NOTHING else — the only
@@ -79,6 +88,22 @@ class Onboarding:
         # question — the barrier the confirm.next indirection was meant to be.
         self._asking_spoken: bool = False
         self._rejected: set[str] = set()  # paths, not names — names can collide
+        # Floor control (2026-08-12). Three facts, stored separately because
+        # they answer different questions and fail differently:
+        #   _paused — the owner said "stop asking". Sticky: only refresh()
+        #     (boot discovery / "find my projects") lifts it, so nothing this
+        #     module does on its own can resume a chain the owner put down.
+        #   _yielded — the chain was displaced by a tool approval (or held
+        #     while one was pending) and should resume once approvals clear.
+        #     Set ONLY when the chain was actually in motion, so a dormant
+        #     chain can never start asking unprompted after an approval.
+        #   _asked_this_run — proposals made since the last refresh(), the
+        #     counter behind PROPOSALS_PER_RUN.
+        # None of this touches _rejected or the registry: pausing/yielding
+        # discards no candidate, ever — they stay pending() and re-askable.
+        self._paused: bool = False
+        self._yielded: bool = False
+        self._asked_this_run: int = 0
 
     @property
     def awaiting(self) -> bool:
@@ -97,6 +122,92 @@ class Onboarding:
         self._asking_spoken = True
         return True
 
+    def is_asking(self, path: str) -> bool:
+        """True when the question for exactly `path` is the one on the floor.
+        The brain's staleness check before voicing a confirm.request: a
+        question displaced (pause/yield) while its readback was still queued
+        must never be spoken — a voiced question that nothing owns invites a
+        yes that lands somewhere else. The mirror of the nonce verification
+        the approval readback already does."""
+        return self._asking is not None and self._asking.path == path
+
+    @property
+    def suspended(self) -> bool:
+        """True when the chain was displaced by an approval and should resume
+        once approvals clear. An explicit pause always wins — the owner said
+        stop, and no approval outcome may overrule that — and an empty
+        candidate list means there is nothing to resume to."""
+        return self._yielded and not self._paused and bool(self._candidates())
+
+    def pause(self) -> str:
+        """The owner's way out: put the chain down. PAUSES, never rejects —
+        every candidate (including the one mid-question) stays pending and
+        untouched in the registry, so nothing is discarded and refresh()
+        ("find my projects") re-proposes them. Returns the spoken close: how
+        many remain and how to continue, composed here so the count and the
+        wording can never drift apart. Clearing _asking makes any queued
+        confirm.request for it stale (see is_asking) and hands bare yes/no
+        back to whoever else is waiting on one."""
+        self._paused = True
+        self._yielded = False
+        self._asking = None
+        self._asking_spoken = False
+        n = len(self._candidates())
+        self._publish_counts()
+        if not n:
+            return "Understood, sir."
+        return (f"Understood, sir — {n} repo{'' if n == 1 else 's'} still "
+                f"waiting. Say find my projects when you want to continue.")
+
+    def yield_floor(self) -> bool:
+        """A tool approval is about to be read aloud: the repo question gives
+        up the floor. The approval blocks a real worker and expires in 600
+        seconds; the repo confirm blocks nothing and can wait — and two open
+        questions competing for one bare yes is exactly how the owner's answer
+        to one resolves the other.
+
+        Returns True only when a question the owner actually HEARD was
+        displaced — the brain uses that to announce the switch and to treat
+        the next bare yes as ambiguous (one clarifying beat, fail closed). A
+        question asked but never voiced displaces silently: the owner heard
+        nothing, so nothing is ambiguous. Either way the candidate stays
+        pending and its budget slot is returned (it was counted at proposal
+        but never answered), and _yielded arms the resume. With no question
+        open this is a no-op that arms nothing: a dormant chain must never
+        start asking unprompted after an approval clears."""
+        if self._asking is None:
+            return False
+        self._asked_this_run = max(0, self._asked_this_run - 1)
+        displaced_spoken = self._asking_spoken
+        self._yielded = True
+        self._asking = None
+        self._asking_spoken = False
+        return displaced_spoken
+
+    def hold(self) -> None:
+        """A confirm.next arrived while an approval was pending: do not put a
+        repo question on the floor, but remember the chain was in motion so it
+        resumes when approvals clear. Candidates-only guard for the same
+        reason yield_floor checks _asking: an empty chain has nothing to
+        resume to, and arming _yielded anyway would make the eventual
+        confirm.next speak a pointless closing line."""
+        if self._candidates():
+            self._yielded = True
+
+    def closing_line(self) -> str | None:
+        """What to say when ask_next() declined to propose. None means say
+        nothing (an explicit pause already spoke its own close). Composed
+        here, next to the counts it reports, for the same reason pause()
+        composes its line: the sentence must never claim a number the state
+        doesn't hold."""
+        if self._paused:
+            return None
+        n = len(self._candidates())
+        if not n:
+            return "Nothing left for me to confirm, sir."
+        return (f"That's {self._asked_this_run} for now, sir — {n} more "
+                f"waiting. Say find my projects when you want to continue.")
+
     def _publish_counts(self) -> None:
         self.bus.publish("registry.updated", {
             "confirmed": sum(1 for p in self.registry.projects if p.confirmed),
@@ -109,6 +220,15 @@ class Onboarding:
         added = self.registry.merge_candidates(await discover(Path(home)))
         if added:
             self.registry.save(self.path)
+        # A refresh IS the start of a run — boot discovery and the "find my
+        # projects" verb are its only callers, and both are explicit asks. So
+        # it lifts a pause (this is the documented way back in) and grants a
+        # fresh PROPOSALS_PER_RUN budget. It still discards nothing:
+        # merge_candidates never touches existing entries, and _rejected is
+        # deliberately left alone — a repo the owner said no to stays refused
+        # for the session.
+        self._paused = False
+        self._asked_this_run = 0
         self._publish_counts()
         return len(added)
 
@@ -122,11 +242,23 @@ class Onboarding:
                             f"That's the correct repo, right?"}
 
     async def ask_next(self) -> bool:
+        # Declines, in the order of who they answer to: the owner's pause
+        # first (nothing may override it), then the per-run cap. A resumed
+        # question — one yield_floor() displaced — spends no new budget: its
+        # slot was returned at displacement, so an interruption never shrinks
+        # the run. False from any decline leaves the caller to speak
+        # closing_line(); the candidates themselves are untouched.
+        if self._paused or self._asked_this_run >= PROPOSALS_PER_RUN:
+            self._asking = None
+            self._asking_spoken = False
+            return False
+        self._yielded = False          # the resume happened (or a fresh ask did)
         prompt = self.next_prompt()
         if prompt is None:
             self._asking = None
             self._asking_spoken = False
             return False
+        self._asked_this_run += 1
         self._asking = next(p for p in self.registry.projects if p.path == prompt["path"])
         # A fresh question, not yet read aloud: the brain marks it spoken only
         # after the confirm.request below has actually been voiced.

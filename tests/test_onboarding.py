@@ -244,3 +244,150 @@ async def test_the_confirm_next_barrier_race_confirms_nothing_before_speaking():
     noted_idx = next((i for i, s in enumerate(spk.spoke) if "Noted" in s), None)
     assert q_idx is not None and (noted_idx is None or noted_idx > q_idx)
     task.cancel()
+
+
+# ---------- the way out: pause, cap, and the yielded floor (2026-08-12) -----
+# The live first run discovered 69 repos and proposed them one at a time with
+# no spoken exit; and while the chain was open it owned every bare yes, eating
+# the owner's answer to a blocked worker's permission request. These pin the
+# unit half of the fix: candidates are never lost, a paused/displaced question
+# is only answerable after a FRESH readback, and one run is bounded.
+
+def many(tmp_path, n):
+    from server.discovery import Candidate as C
+    r = Registry()
+    r.merge_candidates([C(path=f"/p/r{i}", name=f"r{i}", sources=["a"])
+                        for i in range(n)])
+    return Onboarding(EventBus(), r, tmp_path / "projects.json"), r
+
+
+async def test_pause_keeps_every_candidate_pending(tmp_path):
+    ob, r = seeded(tmp_path)                       # two candidates
+    await asked(ob)
+    line = ob.pause()
+    assert not ob.awaiting
+    assert "2" in line and "find my projects" in line.lower()
+    assert len(ob._candidates()) == 2              # nothing rejected...
+    assert not any(p.confirmed for p in r.projects)  # ...nothing confirmed
+
+
+async def test_paused_ask_next_declines_and_closing_is_silent(tmp_path):
+    ob, _ = seeded(tmp_path)
+    ob.pause()
+    assert await ob.ask_next() is False
+    assert ob.closing_line() is None               # pause() already spoke
+
+
+async def test_a_paused_yes_falls_through_untouched(tmp_path):
+    ob, r = seeded(tmp_path)
+    await asked(ob)
+    ob.pause()
+    assert await ob.handle_reply("yes") == "ignored"
+    assert not any(p.confirmed for p in r.projects)
+
+
+async def test_refresh_lifts_the_pause(tmp_path, monkeypatch):
+    ob, _ = seeded(tmp_path)
+    ob.pause()
+
+    async def fake_discover(home, extra_roots=None):
+        return []
+
+    monkeypatch.setattr("server.onboarding.discover", fake_discover)
+    await ob.refresh(Path("/fake/home"))
+    assert await ob.ask_next() is True             # "find my projects" resumes
+
+
+async def test_one_run_is_capped_with_an_honest_closing(tmp_path):
+    from server.onboarding import PROPOSALS_PER_RUN
+    ob, r = many(tmp_path, PROPOSALS_PER_RUN + 3)
+    for _ in range(PROPOSALS_PER_RUN):
+        assert await asked(ob) is True
+        assert await ob.handle_reply("yes") == "confirmed"
+    assert await ob.ask_next() is False            # the cap, not the end
+    line = ob.closing_line()
+    assert "3 more" in line and "find my projects" in line.lower()
+    assert len(ob._candidates()) == 3              # the rest still pending
+    assert sum(1 for p in r.projects if p.confirmed) == PROPOSALS_PER_RUN
+
+
+async def test_refresh_grants_a_fresh_run(tmp_path, monkeypatch):
+    from server.onboarding import PROPOSALS_PER_RUN
+    ob, _ = many(tmp_path, PROPOSALS_PER_RUN + 1)
+    for _ in range(PROPOSALS_PER_RUN):
+        await asked(ob)
+        await ob.handle_reply("yes")
+    assert await ob.ask_next() is False
+
+    async def fake_discover(home, extra_roots=None):
+        return []
+
+    monkeypatch.setattr("server.onboarding.discover", fake_discover)
+    await ob.refresh(Path("/fake/home"))
+    assert await ob.ask_next() is True             # a new budget
+
+
+async def test_the_empty_chain_still_closes_truthfully(tmp_path):
+    ob, _ = seeded(tmp_path)
+    for _ in range(2):
+        await asked(ob)
+        await ob.handle_reply("yes")
+    assert await ob.ask_next() is False
+    assert "nothing left" in ob.closing_line().lower()
+
+
+async def test_yield_floor_keeps_the_candidate_and_requires_a_fresh_readback(tmp_path):
+    ob, r = seeded(tmp_path)
+    await asked(ob)                                # spoken question on the floor
+    path = ob._asking.path
+    assert ob.yield_floor() is True                # a SPOKEN question displaced
+    assert not ob.awaiting and ob.suspended
+    assert path in [p.path for p in ob._candidates()]   # never lost
+    # resumed: the SAME candidate is re-proposed, but a yes may not resolve it
+    # until the question is read aloud again — never silently re-armed.
+    assert await ob.ask_next() is True
+    assert ob._asking.path == path
+    assert await ob.handle_reply("yes") == "ignored"
+    assert not any(p.confirmed for p in r.projects)
+    ob.mark_spoken()
+    assert await ob.handle_reply("yes") == "confirmed"
+
+
+async def test_yield_floor_with_no_open_question_is_a_no_op(tmp_path):
+    ob, _ = seeded(tmp_path)
+    assert ob.yield_floor() is False
+    assert not ob.suspended                        # a dormant chain never auto-resumes
+
+
+async def test_yield_floor_before_the_readback_is_not_an_interruption(tmp_path):
+    ob, _ = seeded(tmp_path)
+    await ob.ask_next()                            # asked, never spoken
+    assert ob.yield_floor() is False               # the owner heard nothing displaced
+    assert ob.suspended                            # but the chain does resume later
+
+
+async def test_hold_marks_resume_only_when_candidates_remain(tmp_path):
+    ob, _ = seeded(tmp_path)
+    ob.hold()
+    assert ob.suspended
+    empty = Onboarding(EventBus(), Registry(), tmp_path / "empty.json")
+    empty.hold()
+    assert not empty.suspended
+
+
+async def test_pause_wins_over_a_yield(tmp_path):
+    ob, _ = seeded(tmp_path)
+    await asked(ob)
+    ob.yield_floor()
+    ob.pause()
+    assert not ob.suspended                        # no auto-resume against a stop
+
+
+async def test_is_asking_tracks_the_open_question(tmp_path):
+    ob, _ = seeded(tmp_path)
+    assert ob.is_asking("/p/soccer") is False      # nothing open yet
+    await ob.ask_next()
+    assert ob.is_asking(ob._asking.path) is True
+    assert ob.is_asking("/somewhere/else") is False
+    ob.pause()
+    assert ob.is_asking("/p/soccer") is False      # displaced questions are stale
