@@ -494,8 +494,13 @@ window.marvin.onEvent("fleet.unknown_session", (d) => {
 window.marvin.onEvent("fleet.transcript", (d) => {
   // #worker-transcript, NOT #transcript: that id is the live STT pane, and a
   // duplicate id would route these lines there (querySelector's first match).
-  $("#worker-transcript").textContent = (d.lines || [])
-    .map((l) => `${l.who}: ${l.text}`).join("\n\n");
+  // Everything here is WORKER-SUPPLIED text (and, for M4 disk reads, the
+  // on-disk transcript a worker wrote): textContent always, never innerHTML.
+  // An empty pane must never read as all-clear — when there are no lines the
+  // server sends `note` saying why, and that is what gets shown.
+  const lines = (d.lines || []).map((l) => `${l.who}: ${l.text}`).join("\n\n");
+  $("#worker-transcript").textContent =
+    lines || `— ${d.note || "no transcript, and no reason given"} —`;
 });
 window.marvin.onEvent("fleet.handoff", (d) => {
   window.marvin.setStatus(`handed off: ${d.command}`);

@@ -942,11 +942,26 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                                 if target is None:
                                     spoken = "Which one, sir?"
                                 else:
+                                    # M4: pull_up resolves the pane for the
+                                    # sessions the deque cannot serve — a
+                                    # DETACHED worker, a restart ghost — by
+                                    # reading the transcript file DERIVED
+                                    # from Marvin's own records (never the
+                                    # hook's transcript_path). `source` and
+                                    # `note` ride the same event so an empty
+                                    # pane always says why it is empty.
+                                    view = await asyncio.wait_for(
+                                        fleet.pull_up(target),
+                                        FLEET_TIMEOUT_S)
                                     bus.publish("fleet.transcript", {
                                         "path": target,
                                         "project": command.project,
-                                        "lines": fleet.transcript(target)})
-                                    spoken = fleet.one_breath(target)
+                                        "lines": view.get("lines") or [],
+                                        "source": view.get("source", ""),
+                                        "note": view.get("note", "")})
+                                    spoken = (view.get("spoken")
+                                              or "I have nothing to show "
+                                                 "there, sir.")
                             await _speak(spoken)
                         elif command.verb in ("worktree_survey",
                                               "worktree_remove_empty",

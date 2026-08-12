@@ -48,6 +48,13 @@ class FakeFleet:
         return [{"who": "worker", "text": "hello from the worktree"}]
     def one_breath(self, path):
         return "soccer is mid-task, sir."
+    async def pull_up(self, path):
+        # M4: the brain asks pull_up for lines AND the sentence — the fleet
+        # decides between the owned deque and the on-disk transcript.
+        self.calls.append(("pull_up", path))
+        return {"lines": [{"who": "worker", "text": "hello from the worktree"}],
+                "spoken": "soccer is mid-task, sir.",
+                "source": "memory", "note": ""}
     def deliver_approval(self, nonce, approved):
         self.calls.append(("deliver", nonce, approved))
         return True
@@ -145,14 +152,19 @@ async def test_status_falls_through_to_the_butler_when_fleet_is_empty():
 
 async def test_pull_up_publishes_the_owned_transcript():
     bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    fleet = FakeFleet()
     task = await brain(bus, butler, spk, router=Router(),
-                       registry=confirmed_registry("soccer"), fleet=FakeFleet())
+                       registry=confirmed_registry("soccer"), fleet=fleet)
     fut = asyncio.ensure_future(_drain(bus, "fleet.transcript"))
     bus.publish("command.received", {"text": "pull up soccer"})
     ev = await fut
     assert ev["data"]["path"] == "/p/soccer"
     assert ev["data"]["lines"][0]["text"] == "hello from the worktree"
-    assert any("mid-task" in s for s in spk.spoke)         # the one-breath status
+    # M4: the payload says where the lines came from, and carries the note
+    # that keeps an empty pane from reading as all-clear.
+    assert ev["data"]["source"] == "memory" and ev["data"]["note"] == ""
+    assert ("pull_up", "/p/soccer") in fleet.calls
+    assert any("mid-task" in s for s in spk.spoke)         # the fleet's sentence
     task.cancel()
 
 
