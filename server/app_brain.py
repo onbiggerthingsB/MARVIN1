@@ -140,6 +140,15 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
     # speech queue must not become a megaphone for it. Bounded by the number
     # of workers a session creates, which is what `self.workers` already is.
     spoken_worker_failures: set[str] = set()
+    # True for exactly one utterance after an approval readback displaced a
+    # repo question the owner had already HEARD. In that window a bare yes/no
+    # is genuinely ambiguous — it may have been released against the repo
+    # question before the switch was audible — so the first one is answered
+    # with a clarifying question instead of being resolved (fail closed, one
+    # beat). Consumed by the next utterance whatever its shape: an addressed
+    # answer or a command is positive evidence of intent and needs no
+    # challenge.
+    floor_switched = False
 
     def _reason(e) -> str:
         # asyncio.TimeoutError stringifies to "", which would publish a blank
@@ -218,6 +227,32 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
         turnlog.record_first_audio(t_first_audio)
         bus.publish("metrics.turn", turnlog.summary())
 
+    async def _resume_confirms():
+        # Give the floor back to the repo chain an approval displaced — but
+        # only once it is TRULY clear: no approval pending at all, spoken or
+        # not (an unspoken one is about to be read, and re-asking now would
+        # recreate the two-questions-one-yes state this exists to end). Every
+        # resolution path lands here — the voice loop and the /approval click
+        # both publish approval.resolved, and the fleet publishes it for the
+        # TTL expiry, the SDK cancel and the shutdown rejection — so a
+        # suspended chain cannot be stranded by how the approval happened to
+        # end. Resume rides confirm.next, never a direct ask_next(): the bus
+        # queue is the barrier that keeps "asked" behind "read aloud" (see the
+        # confirm.next handler), and the resumed question is re-spoken and
+        # re-marked before any yes may touch it. Guarded like everything else:
+        # a resume fault costs the resume ("find my projects" still recovers),
+        # never the loop.
+        if onboarding is None:
+            return
+        try:
+            if router is not None and router.pending_approvals():
+                return
+            if onboarding.suspended:
+                bus.publish("confirm.next", {"trigger": "resume"})
+        except Exception as e:  # noqa: BLE001 — a resume fault must never kill the brain
+            bus.publish("butler.error",
+                        {"reason": f"confirm resume failed: {_reason(e)}"})
+
     try:
         while True:
             event = await q.get()
@@ -244,13 +279,32 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                 # whose answer is already pending. Whitelisted on `kind`, so
                 # a future publisher of this event is silent until it opts in
                 # rather than accidentally loud.
-                question = ""
+                question, q_path = "", ""
                 try:
                     d = data if isinstance(data, dict) else {}
                     if d.get("kind") == "repo":
                         question = str(d.get("question") or "")[:400]
+                        q_path = str(d.get("path") or "")
                 except Exception:  # noqa: BLE001 — a malformed event costs the sentence
-                    question = ""
+                    question, q_path = "", ""
+                if question and onboarding is not None:
+                    # Staleness check, the mirror of the approval readback's
+                    # nonce verification below. A pause ("stop asking") or a
+                    # yield (an approval taking the floor) can land while this
+                    # event is still queued; the question then belongs to
+                    # nobody, and voicing it would invite a yes that lands
+                    # somewhere else. Fail closed on a check fault: an unread
+                    # question stays unanswerable by voice (handle_reply
+                    # refuses until mark_spoken) — the safe direction — while
+                    # a stale one read aloud is a misdirection.
+                    try:
+                        if not onboarding.is_asking(q_path):
+                            question = ""
+                    except Exception as e:  # noqa: BLE001 — a check fault must not kill the brain
+                        bus.publish("butler.error",
+                                    {"reason": f"confirm staleness check "
+                                               f"failed: {_reason(e)}"})
+                        question = ""
                 if question:
                     spoke = await _speak(question)
                     # AFTER the await returns, never before it, and ONLY when the
@@ -287,6 +341,42 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                 # Approval.spoken gives the fleet's approvals.
                 if onboarding is None:
                     continue
+                # An approval holds the floor (2026-08-12). The two questions
+                # must never be pending together — that is how one bare yes
+                # got two owners — and this is the second of the two doors
+                # into that state (the first, an approval arriving over an
+                # open repo question, is closed by yield_floor in the
+                # approval.request handler). A confirm.next that finds ANY
+                # approval pending defers: hold() remembers the chain was in
+                # motion and _resume_confirms re-publishes this event once
+                # the approvals are gone. Fail closed on a check fault — a
+                # repo question we cannot prove safe to ask is not asked
+                # (the chain stays recoverable via "find my projects").
+                if router is not None:
+                    held = False
+                    try:
+                        if router.pending_approvals():
+                            onboarding.hold()
+                            held = True
+                    except Exception as e:  # noqa: BLE001 — a hold fault must not kill the brain
+                        bus.publish("butler.error",
+                                    {"reason": f"confirm hold failed: {_reason(e)}"})
+                        held = True
+                    if held:
+                        # Spoken only when the owner explicitly asked for the
+                        # chain ("find my projects"); the internal triggers
+                        # (boot, reply, resume) defer silently — the approval
+                        # readback already owns the audible floor.
+                        trigger = ""
+                        try:
+                            trigger = str((data or {}).get("trigger") or "")
+                        except Exception:  # noqa: BLE001
+                            trigger = ""
+                        if trigger == "voice":
+                            await _speak("A worker's request comes first, sir "
+                                         "— I'll ask about the repos once "
+                                         "it's settled.")
+                        continue
                 try:
                     asked = bool(await onboarding.ask_next())
                 except Exception as e:  # noqa: BLE001 — onboarding must never kill the brain
@@ -295,9 +385,19 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                     await _speak("I couldn't line up the next project, sir.")
                     continue
                 if not asked:
-                    # No candidates left. Say so once and STOP — nothing here
+                    # ask_next declined: chain empty ("Nothing left..."),
+                    # capped ("N more waiting..."), or paused (silence — the
+                    # pause spoke its own close). Onboarding composes the
+                    # sentence next to the counts it reports; nothing here
                     # republishes, so the chain ends rather than looping.
-                    await _speak("Nothing left for me to confirm, sir.")
+                    line = None
+                    try:
+                        line = onboarding.closing_line()
+                    except Exception as e:  # noqa: BLE001 — a closing fault must not kill the brain
+                        bus.publish("butler.error",
+                                    {"reason": f"onboarding closing failed: {_reason(e)}"})
+                    if line:
+                        await _speak(line)
                 continue
             if etype == "approval.request":
                 # A worker is blocked on Keke's word; the card is on screen and
@@ -335,8 +435,31 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                         question, nonce = "", ""
                     if not verified:
                         continue
-                spoke = await _speak(question or "A worker needs permission, "
-                                                 "sir — the card is on screen.")
+                # The floor swap (2026-08-12). A tool approval blocks a real
+                # worker and expires in 600s; a repo confirm blocks nothing —
+                # so an approval arriving over an open repo question takes the
+                # floor, and the repo question is put down (candidate kept,
+                # re-asked and RE-SPOKEN via _resume_confirms once approvals
+                # clear). This is the first of the two doors into the
+                # two-questions-one-yes state; the confirm.next hold above is
+                # the second. yield_floor returns True only when a question
+                # the owner actually HEARD was displaced — then the readback
+                # announces the switch, and `floor_switched` makes the next
+                # bare yes cost one clarifying beat (see the utterance
+                # handler): a yes released against the repo question must
+                # never ride into the approval resolver as consent.
+                interrupted = False
+                if onboarding is not None:
+                    try:
+                        interrupted = bool(onboarding.yield_floor())
+                    except Exception as e:  # noqa: BLE001 — a yield fault must not kill the brain
+                        bus.publish("butler.error",
+                                    {"reason": f"confirm yield failed: {_reason(e)}"})
+                line = question or ("A worker needs permission, "
+                                    "sir — the card is on screen.")
+                if interrupted:
+                    line = "The repo question can wait, sir. " + line
+                spoke = await _speak(line)
                 # AFTER the await returns, never before it, and ONLY when speech
                 # SUCCEEDED: `spoken` means the sentence was actually read, so a
                 # swallowed TTS failure must NOT flip it — the readback is the
@@ -354,6 +477,21 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                         bus.publish("butler.error",
                                     {"reason": f"approval readback failed: "
                                                f"{_reason(e)}"})
+                # Armed only when a HEARD repo question was displaced AND this
+                # readback actually went out: with a failed TTS the approval
+                # stays unspoken (unresolvable by voice anyway), so there is
+                # no ambiguity for the challenge to catch.
+                if interrupted and spoke:
+                    floor_switched = True
+                continue
+            if etype == "approval.resolved":
+                # Published by every path an approval can end on — this loop's
+                # voice resolution, the /approval click, the fleet's TTL
+                # expiry, SDK cancel and shutdown rejection. Whichever way it
+                # ended, the floor may now be clear: give it back to a
+                # suspended repo chain. (_resume_confirms itself re-checks
+                # that no other approval is still pending.)
+                await _resume_confirms()
                 continue
             if etype in ("fleet.spoken", "fleet.recovered"):
                 text_out = ""
@@ -481,6 +619,32 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                         await _speak("About the data file, sir — is that a yes or a no?")
                         continue
 
+                # One clarifying beat after a floor swap (see floor_switched
+                # above). Placed AFTER the onboarding/finance gates — neither
+                # is awaiting right after a yield, so nothing above can have
+                # consumed the utterance — and BEFORE the resolver, which is
+                # exactly what it must keep a mis-released yes away from.
+                # Scoped to the dangerous shape only: a bare yes/no beside a
+                # spoken pending approval. Anything else (a command, an
+                # addressed answer, conversation) passes through and consumes
+                # the flag. On a check fault the challenge is skipped — the
+                # resolver's own guards still stand behind it.
+                if floor_switched:
+                    floor_switched = False
+                    if bare_yes_no(text):
+                        heard_pending = False
+                        try:
+                            heard_pending = bool(
+                                router is not None
+                                and any(a.spoken for a in router.pending_approvals()))
+                        except Exception as e:  # noqa: BLE001 — a check fault must not kill the brain
+                            bus.publish("butler.error",
+                                        {"reason": f"floor check failed: {_reason(e)}"})
+                        if heard_pending:
+                            await _speak("About the worker's request, sir — "
+                                         "is that a yes or a no?")
+                            continue
+
                 # Dangerous verbs are parsed deterministically, never by the model.
                 command = None
                 if router is not None and registry is not None:
@@ -525,7 +689,20 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                         if (router.pending_approvals()
                                 and not (command is not None
                                          and (command.project
-                                              or command.needs_disambiguation))):
+                                              or command.needs_disambiguation
+                                              # The pause verb is whitelisted
+                                              # out of the resolver the same
+                                              # way a resolved project is: its
+                                              # anchored, closed vocabulary is
+                                              # positive evidence of a command
+                                              # no consent phrasing can
+                                              # produce. Without this, "stop
+                                              # asking" (a deny-word opener)
+                                              # beside an unread approval was
+                                              # answered "I haven't read that
+                                              # request to you yet" and the
+                                              # pause never fired.
+                                              or command.verb == "onboard_pause"))):
                             resolving = True
                             state, approval = router.resolve_approval(text, time.time())
                             if state in ("approved", "denied") and approval is not None:
@@ -631,6 +808,10 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                     continue
                 if state == "expired":
                     await _speak("That approval expired, sir.")
+                    # The sweep inside resolve_approval is the one resolution
+                    # with no approval.resolved event — resume the displaced
+                    # chain here or it waits for "find my projects".
+                    await _resume_confirms()
                     continue
                 # "none": not an approval answer — fall through.
 
@@ -699,6 +880,21 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
                                     f"project{'' if added == 1 else 's'}, sir."
                                     if added else "Nothing new, sir.")
                                 bus.publish("confirm.next", {"trigger": "voice"})
+                        elif command.verb == "onboard_pause":
+                            # The chain's exit ("stop asking" / "that's
+                            # enough" / "not now"). pause() PUTS DOWN, never
+                            # rejects: every candidate stays pending and the
+                            # spoken close it returns says how many remain and
+                            # that "find my projects" continues — the counts
+                            # and the wording live together in onboarding so
+                            # they cannot drift. Inside the dispatch try like
+                            # every verb: a pause fault costs this turn
+                            # ("that command failed"), never the loop.
+                            if onboarding is None:
+                                await _speak("There was nothing I was asking "
+                                             "about, sir.")
+                            else:
+                                await _speak(onboarding.pause())
                         elif command.verb == "capture":
                             # Regression fix: before the router existed, "note/
                             # remember that ..." reached the butler, whose

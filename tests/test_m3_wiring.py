@@ -455,10 +455,13 @@ async def test_a_second_yes_cannot_confirm_a_repo_that_was_never_asked(tmp_path)
     task.cancel()
 
 
-async def test_a_bare_yes_answers_the_spoken_repo_question_not_the_tool_approval(tmp_path):
-    # Three questions can be pending at once. A bare yes with a repo confirm
-    # pending belongs TERMINALLY to that confirm — it must never reach the
-    # approval resolver and run someone's `rm -rf`.
+async def test_the_chain_holds_while_an_approval_is_pending_and_resumes_after(tmp_path):
+    # The two questions must never compete for one yes (live demo defect,
+    # 2026-08-12): a repo confirm blocks nothing and can wait; a tool approval
+    # blocks a real worker and expires. So a confirm.next arriving while an
+    # approval is pending HOLDS — no repo question is put on the floor — and
+    # the yes goes to the approval. Once it resolves, the chain resumes and
+    # the repo question is read aloud before it may be answered.
     bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
     reg = pending_registry("soccer")
     ob = onboarding_for(bus, reg, tmp_path)
@@ -470,12 +473,19 @@ async def test_a_bare_yes_answers_the_spoken_repo_question_not_the_tool_approval
     await asyncio.sleep(0)
     bus.publish("confirm.next", {})
     await _settle()
-    assert any("correct repo" in s for s in spk.spoke)   # it WAS read aloud
+    assert not any("correct repo" in s for s in spk.spoke)  # held, not asked
+    assert not ob.awaiting
+    bus.publish("command.received", {"text": "yes"})
+    await _settle()
+    assert router.pending_approvals() == []              # the worker got its answer
+    assert butler.asked == []
+    # ...and the chain resumed: the repo question is now on the floor, spoken
+    assert any("correct repo" in s for s in spk.spoke), spk.spoke
+    assert ob.awaiting
+    assert not any(p.confirmed for p in reg.projects)    # that yes confirmed no repo
     bus.publish("command.received", {"text": "yes"})
     await _settle()
     assert [p.name for p in reg.projects if p.confirmed] == ["soccer"]
-    assert len(router.pending_approvals()) == 1          # the rm -rf is untouched
-    assert butler.asked == []
     task.cancel()
 
 
@@ -690,3 +700,245 @@ async def test_a_spawn_shaped_fallthrough_is_explained_not_answered():
     assert butler.asked == []          # never became a conversational answer
     assert "start work" in spk.spoke[0].lower()   # tells Keke how to retry
     task.cancel()
+
+
+# ---- the confirm chain's exits and the floor arbitration (2026-08-12) -----
+# The live first run: 69 discovered repos, one spoken confirm each, no way to
+# stop the chain — and while it was open, its terminal ownership of bare
+# yes/no ate the owner's answer to a blocked worker's permission request.
+# These pin the wiring half of the fix.
+
+async def test_a_mid_chain_tool_approval_is_not_eaten_by_the_repo_question(tmp_path):
+    """THE LIVE DEFECT (M3P2 gate, beat 3). A repo question is on the floor
+    when a worker blocks on permission. The approval readback displaces the
+    repo question; the first bare yes after the switch is confirmed against
+    the question it now belongs to (fail closed, one beat); the next yes
+    unblocks the worker; and the chain resumes with the repo question read
+    aloud AGAIN before it may be answered."""
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    reg = pending_registry("quant agent", "soccer")
+    ob = onboarding_for(bus, reg, tmp_path)
+    router = Router()
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=router, registry=reg, onboarding=ob))
+    await asyncio.sleep(0)
+    bus.publish("confirm.next", {"trigger": "boot"})
+    await _settle()
+    assert ob.awaiting                                   # repo question spoken
+    # a worker blocks on permission mid-chain; its card publishes the readback
+    a = router.open_approval("alethic", "Bash: npm test", now=time.time(),
+                             path="/x/alethic")
+    bus.publish("approval.request", {
+        "nonce": a.nonce, "worker": "w1", "project": "alethic",
+        "path": "/x/alethic", "tool": "Bash", "args": "npm test",
+        "voice_ok": True,
+        "question": "alethic wants Bash — npm test. Approve or deny, sir?"})
+    await _settle()
+    assert any("npm test" in s for s in spk.spoke)       # readback spoken
+    assert not ob.awaiting                               # repo question yielded
+    # the owner's yes is for the WORKER. Before the fix, onboarding's terminal
+    # ownership confirmed the repo with it and the worker stayed blocked.
+    bus.publish("command.received", {"text": "yes"})
+    await _settle()
+    assert not any(p.confirmed for p in reg.projects)    # repo NOT confirmed by it
+    # the floor just switched, so the first bare yes costs one clarifying beat
+    assert any("worker's request" in s for s in spk.spoke), spk.spoke
+    assert len(router.pending_approvals()) == 1          # nothing resolved by it either
+    bus.publish("command.received", {"text": "yes"})
+    await _settle()
+    assert router.pending_approvals() == []              # the worker got its yes
+    assert not any(p.confirmed for p in reg.projects)
+    # the chain resumed: the displaced question was read aloud a SECOND time
+    assert sum(1 for s in spk.spoke if "correct repo" in s) >= 2, spk.spoke
+    assert ob.awaiting
+    bus.publish("command.received", {"text": "yes"})
+    await _settle()
+    assert sum(1 for p in reg.projects if p.confirmed) == 1
+    assert butler.asked == []                            # none of this reached the model
+    task.cancel()
+
+
+async def test_a_sixty_nine_repo_discovery_does_not_chain_unbounded(tmp_path):
+    """The other half of the live report: proposing 59 remaining repos one at
+    a time is bad design even with an exit. One run is capped, and the close
+    is honest — how many remain and how to continue."""
+    from server.onboarding import PROPOSALS_PER_RUN
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    reg = pending_registry(*[f"repo{i}" for i in range(PROPOSALS_PER_RUN + 4)])
+    ob = onboarding_for(bus, reg, tmp_path)
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=reg, onboarding=ob))
+    await asyncio.sleep(0)
+    bus.publish("confirm.next", {"trigger": "boot"})
+    await _settle()
+    for _ in range(PROPOSALS_PER_RUN):
+        assert ob.awaiting
+        bus.publish("command.received", {"text": "yes"})
+        await _settle()
+    assert not ob.awaiting                               # the chain closed itself
+    closing = [s for s in spk.spoke if "4 more" in s]
+    assert closing and "find my projects" in closing[0].lower(), spk.spoke
+    assert sum(1 for p in reg.projects if p.confirmed) == PROPOSALS_PER_RUN
+    assert len(ob._candidates()) == 4                    # nothing discarded
+    task.cancel()
+
+
+async def test_stop_asking_ends_the_chain_and_find_my_projects_resumes_it(tmp_path, monkeypatch):
+    import server.app_brain as ab
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(ab, "default_home", lambda: home)
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    reg = pending_registry("quant agent", "soccer", "alethic")
+    ob = onboarding_for(bus, reg, tmp_path)
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=reg, onboarding=ob))
+    await asyncio.sleep(0)
+    bus.publish("confirm.next", {"trigger": "boot"})
+    await _settle()
+    bus.publish("command.received", {"text": "yes"})     # confirm the first
+    await _settle()
+    assert ob.awaiting                                   # the second is on the floor
+    bus.publish("command.received", {"text": "stop asking"})
+    await _settle()
+    assert not ob.awaiting                               # the way out works
+    line = next(s for s in spk.spoke if "find my projects" in s.lower())
+    assert "2" in line                                   # how many remain, honestly
+    assert len(ob._candidates()) == 2                    # both still pending
+    assert sum(1 for p in reg.projects if p.confirmed) == 1
+    assert butler.asked == []                            # never model-parsed
+    # the documented way back in
+    bus.publish("command.received", {"text": "find my projects"})
+    await _settle(0.3)                                   # the rescan runs off-loop
+    assert ob.awaiting                                   # the chain re-opened
+    bus.publish("command.received", {"text": "yes"})
+    await _settle()
+    assert sum(1 for p in reg.projects if p.confirmed) == 2
+    task.cancel()
+
+
+async def test_a_displaced_question_is_never_spoken_stale(tmp_path):
+    """The pause lands while its question's confirm.request is still queued:
+    the stale readback must not be voiced. A spoken question nothing owns
+    invites a yes that lands somewhere else — the misdirection this whole
+    module exists to prevent."""
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    reg = pending_registry("quant agent", "soccer")
+    ob = onboarding_for(bus, reg, tmp_path)
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=reg, onboarding=ob))
+    await asyncio.sleep(0)
+    # ask_next publishes confirm.request to the TAIL, so it lands BEHIND this
+    # utterance — the pause is processed first and the readback goes stale
+    bus.publish("confirm.next", {"trigger": "boot"})
+    bus.publish("command.received", {"text": "stop asking"})
+    await _settle()
+    assert not any("correct repo" in s for s in spk.spoke), spk.spoke
+    assert not ob.awaiting
+    assert len(ob._candidates()) == 2                    # nothing lost
+    task.cancel()
+
+
+async def test_stop_asking_is_not_swallowed_by_a_pending_approval(tmp_path):
+    """'stop asking' opens with a deny word, and a project-less utterance is
+    offered to the approval resolver first — with an unread approval pending
+    that used to answer 'I haven't read that request to you yet' and the
+    pause never fired. A parsed pause command is positive evidence of intent,
+    exactly like a resolved project name."""
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    reg = pending_registry("quant agent", "soccer")
+    ob = onboarding_for(bus, reg, tmp_path)
+    router = Router()
+    router.open_approval("alethic", "Bash: npm test", now=time.time(),
+                         path="/x/alethic")              # pending, UNSPOKEN
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=router, registry=reg, onboarding=ob))
+    await asyncio.sleep(0)
+    bus.publish("command.received", {"text": "stop asking"})
+    await _settle()
+    assert not any("haven't read" in s for s in spk.spoke), spk.spoke
+    assert any("find my projects" in s.lower() for s in spk.spoke), spk.spoke
+    assert len(router.pending_approvals()) == 1          # the approval is untouched
+    task.cancel()
+
+
+async def test_find_my_projects_defers_honestly_while_an_approval_is_pending(tmp_path, monkeypatch):
+    import server.app_brain as ab
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(ab, "default_home", lambda: home)
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    reg = pending_registry("quant agent")
+    ob = onboarding_for(bus, reg, tmp_path)
+    router = Router()
+    open_spoken(router, "alethic", "Bash: npm test", now=time.time(),
+                path="/x/alethic")
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=router, registry=reg, onboarding=ob))
+    await asyncio.sleep(0)
+    bus.publish("command.received", {"text": "find my projects"})
+    await _settle(0.3)
+    assert not ob.awaiting                               # deferred, not asked
+    assert any("worker's request comes first" in s for s in spk.spoke), spk.spoke
+    # the deferral is honest AND recoverable: resolving the approval resumes
+    bus.publish("command.received", {"text": "yes"})
+    await _settle()
+    assert router.pending_approvals() == []
+    assert ob.awaiting                                   # the chain came back
+    task.cancel()
+
+
+async def test_the_brain_survives_a_pause_explosion(tmp_path):
+    class BoomPause:
+        awaiting = False
+        suspended = False
+        async def handle_reply(self, text): return "ignored"
+        def pause(self): raise RuntimeError("pause exploded")
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=Router(), registry=Registry(), onboarding=BoomPause()))
+    await asyncio.sleep(0)
+    fut = asyncio.ensure_future(_drain(bus, "butler.error"))
+    bus.publish("command.received", {"text": "stop asking"})
+    ev = await fut
+    assert "command handling failed" in ev["data"]["reason"]
+    assert not task.done()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def test_the_brain_survives_a_yield_explosion(tmp_path):
+    class BoomYield:
+        awaiting = False
+        suspended = False
+        async def handle_reply(self, text): return "ignored"
+        def yield_floor(self): raise RuntimeError("yield exploded")
+    bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
+    router = Router()
+    a = router.open_approval("alethic", "Bash: npm test", now=time.time(),
+                             path="/x/alethic")
+    task = asyncio.create_task(run_butler_brain(
+        bus, butler, spk, FakeTurnLog(),
+        router=router, registry=Registry(), onboarding=BoomYield()))
+    await asyncio.sleep(0)
+    fut = asyncio.ensure_future(_drain(bus, "butler.error"))
+    bus.publish("approval.request", {
+        "nonce": a.nonce, "project": "alethic", "voice_ok": True,
+        "question": "alethic wants Bash — npm test. Approve or deny, sir?"})
+    ev = await fut
+    assert "yield failed" in ev["data"]["reason"]
+    await _settle()
+    # the readback still went out — a yield fault costs the yield, not the turn
+    assert any("npm test" in s for s in spk.spoke)
+    assert not task.done()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
