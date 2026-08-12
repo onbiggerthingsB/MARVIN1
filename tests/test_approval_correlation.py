@@ -1,4 +1,4 @@
-"""A yes may only resolve the request Marlowe actually READ ALOUD.
+"""A yes may only resolve the request Marvin actually READ ALOUD.
 
 The spoken approval line is the whole safety model: the worktree is not a
 sandbox, so what contains a worker is the human hearing what it wants and
@@ -291,7 +291,7 @@ async def test_a_genuine_polarity_conflict_still_says_both_a_yes_and_a_no():
 
 
 async def test_a_readback_that_was_actually_spoken_is_resolvable_by_voice():
-    """The positive control: without it every test above passes on a Marlowe
+    """The positive control: without it every test above passes on a Marvin
     that simply never resolves anything by voice again."""
     bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
     router, fleet = Router(), FakeFleet()

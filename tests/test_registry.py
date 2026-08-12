@@ -128,11 +128,11 @@ def test_reconfirming_does_not_downgrade_a_finance_project():
 
 def test_duplicate_basenames_are_confirmable_by_path():
     r = Registry()
-    r.merge_candidates([cand("/one/marlowe", "marlowe"), cand("/two/marlowe", "marlowe")])
-    r.confirm_path("/two/marlowe")
+    r.merge_candidates([cand("/one/marvin", "marvin"), cand("/two/marvin", "marvin")])
+    r.confirm_path("/two/marvin")
     confirmed = [p for p in r.projects if p.confirmed]
-    assert [p.path for p in confirmed] == ["/two/marlowe"]   # the OTHER one, precisely
-    assert r.match("marlowe")[0].path == "/two/marlowe"
+    assert [p.path for p in confirmed] == ["/two/marvin"]   # the OTHER one, precisely
+    assert r.match("marvin")[0].path == "/two/marvin"
 
 
 def test_load_tolerates_valid_json_of_the_wrong_shape(tmp_path):

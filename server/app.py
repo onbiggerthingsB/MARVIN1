@@ -1,4 +1,4 @@
-"""Marlowe control plane. Single-process FastAPI app; all state on app.state."""
+"""Marvin control plane. Single-process FastAPI app; all state on app.state."""
 from __future__ import annotations
 
 import asyncio
@@ -31,7 +31,7 @@ from server.vault_paths import vault_root_from_env
 from server.vault_read import vault_is_downloaded
 from server.worktree_survey import WorktreeCleanup
 
-COOKIE = "marlowe_session"
+COOKIE = "marvin_session"
 OPEN_PATHS = {"/health", "/bootstrap"}
 BEARER_PATHS = {"/wake", "/hooks"}
 # Fleet ticker cadence. Module-level so tests can shrink it and observe real
@@ -94,7 +94,7 @@ async def close_quietly(ws: WebSocket) -> None:
 
 def create_app(base_dir: Path) -> FastAPI:
     app = FastAPI()
-    cfg = ensure_config(base_dir / "config" / "marlowe.json")
+    cfg = ensure_config(base_dir / "config" / "marvin.json")
     token_plain, bootstrap_state = auth.new_bootstrap()
     state_dir = base_dir / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -127,7 +127,7 @@ def create_app(base_dir: Path) -> FastAPI:
         except Exception:
             audio_clients.discard(ws_)
 
-    voice = os.environ.get("MARLOWE_VOICE",
+    voice = os.environ.get("MARVIN_VOICE",
                             "elevenlabs" if os.environ.get("ELEVENLABS_API_KEY") else "say")
     app.state.speaker = SpeakEngine(
         voice_id=os.environ.get("ELEVENLABS_VOICE_ID", "") if voice == "elevenlabs" else "",
@@ -141,7 +141,7 @@ def create_app(base_dir: Path) -> FastAPI:
     if not vault_is_downloaded(vault_root):
         # Not fatal: the butler still runs, but grounding may stall on iCloud.
         # Surfaced once at startup; the setup screen guidance covers the fix.
-        print(f"[marlowe] WARNING: vault not fully downloaded at {vault_root} "
+        print(f"[marvin] WARNING: vault not fully downloaded at {vault_root} "
               f"— enable 'Keep Downloaded' in Finder for reliable answers.")
     vault_server = build_vault_server(vault_root)
     app.state.butler = Butler(
@@ -158,7 +158,7 @@ def create_app(base_dir: Path) -> FastAPI:
         bus=app.state.bus, router=app.state.router,
         log=FleetLog(base_dir / "state" / "fleet.jsonl"),
         worktrees_dir=base_dir / "state" / "worktrees",
-        # spec §5/§9: never the vault, never the Marlowe repo itself
+        # spec §5/§9: never the vault, never the Marvin repo itself
         forbidden=(str(Path(vault_root).resolve()),
                    str(Path(base_dir).resolve())),
         # The SAME two roots, carrying the words to say about them. `forbidden`
@@ -166,7 +166,7 @@ def create_app(base_dir: Path) -> FastAPI:
         # <vault>/Daily/2026-08-09.md and a Write into /tmp/DONE.txt used to
         # get the identical "Outside its worktree, sir."
         protected=((str(Path(vault_root).resolve()), "your Obsidian vault"),
-                   (str(Path(base_dir).resolve()), "the Marlowe repo itself")),
+                   (str(Path(base_dir).resolve()), "the Marvin repo itself")),
         hook_port=cfg.port, hook_bearer=cfg.hook_bearer)
     # Surfacing + consented cleanup for the worktrees the fleet leaves behind.
     # NOT a fourth yes/no gate: its verbs are destructive instructions no
@@ -243,7 +243,7 @@ def create_app(base_dir: Path) -> FastAPI:
     @app.get("/worktrees")
     async def worktrees_view():
         # The pile nothing has ever surfaced: every task ever run leaves a
-        # disposable worktree and a marlowe/* branch behind, on purpose (the
+        # disposable worktree and a marvin/* branch behind, on purpose (the
         # worktree holds a diff a human may still want to merge back), and
         # until now there was no way to see them short of `ls state/worktrees`.
         #
@@ -273,7 +273,7 @@ def create_app(base_dir: Path) -> FastAPI:
             return JSONResponse({"error": "invalid bootstrap token"}, status_code=403)
         cookie_value, stored_hash = auth.issue_session()
         cfg.session_token_hash = stored_hash
-        save_config(cfg, base_dir / "config" / "marlowe.json")
+        save_config(cfg, base_dir / "config" / "marvin.json")
         resp = RedirectResponse("/", status_code=303)
         resp.set_cookie(COOKIE, cookie_value, httponly=True, samesite="strict")
         return resp
@@ -283,7 +283,7 @@ def create_app(base_dir: Path) -> FastAPI:
         html = (base_dir / "static" / "index.html")
         if html.exists():
             return Response(html.read_text(), media_type="text/html")
-        return Response("Marlowe: static console not built yet", media_type="text/plain")
+        return Response("Marvin: static console not built yet", media_type="text/plain")
 
     @app.post("/wake")
     async def wake():
@@ -477,7 +477,7 @@ def create_app(base_dir: Path) -> FastAPI:
         def _brain_died(t):
             # Last resort. run_butler_brain guards every await, so reaching here
             # means something outside those guards ended it -- and a dead brain
-            # is otherwise perfectly silent: /health stays ok and Marlowe simply
+            # is otherwise perfectly silent: /health stays ok and Marvin simply
             # never answers again. Cancellation is the normal shutdown path.
             if t.cancelled():
                 return
@@ -526,7 +526,7 @@ def create_app(base_dir: Path) -> FastAPI:
             app.state.bus.publish("fleet.error",
                                   {"reason": f"recovery failed: {e}"})
             # ...and SAY so. Silence here is the one outcome restart honesty
-            # cannot afford: Marlowe would come up knowing nothing about the
+            # cannot afford: Marvin would come up knowing nothing about the
             # previous run and mention nothing, which reads exactly like "all
             # clear". The console gets the reason; Keke gets the fact.
             app.state.bus.publish("fleet.spoken", {
@@ -574,7 +574,7 @@ def create_app(base_dir: Path) -> FastAPI:
         def _discovery_died(t):
             # Same last resort as the two above. The body guards Exception, so
             # reaching here means something escaped it — and a dead discovery
-            # task is perfectly silent: Marlowe simply never asks, which is the
+            # task is perfectly silent: Marvin simply never asks, which is the
             # exact failure this task exists to fix.
             if t.cancelled():
                 return

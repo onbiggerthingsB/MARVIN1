@@ -1,8 +1,9 @@
 #!/bin/bash
-# Marlowe launcher: start server if down, open the console, send /wake.
+# Marvin launcher: start server if down, open the console, send /wake.
 set -euo pipefail
-MARLOWE_DIR="$HOME/marlowe"
-cd "$MARLOWE_DIR"
+# TODO: becomes $HOME/marvin when the directory moves
+MARVIN_DIR="$HOME/marlowe"
+cd "$MARVIN_DIR"
 [ -f .env ] && set -a && source .env && set +a
 
 if ! curl -sf http://127.0.0.1:7777/health >/dev/null 2>&1; then
@@ -19,5 +20,5 @@ else
   open -na "Google Chrome" --args --app="http://127.0.0.1:7777/"
 fi
 
-BEARER=$(uv run python -c "from pathlib import Path; from server.config import load_config; print(load_config(Path('config/marlowe.json')).hook_bearer)")
+BEARER=$(uv run python -c "from pathlib import Path; from server.config import load_config; print(load_config(Path('config/marvin.json')).hook_bearer)")
 curl -s -X POST http://127.0.0.1:7777/wake -H "Authorization: Bearer $BEARER" >/dev/null || true

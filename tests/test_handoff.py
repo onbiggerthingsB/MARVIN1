@@ -624,10 +624,10 @@ async def test_a_failed_teardown_never_detaches_even_when_the_session_closed(tmp
     assert opened == []                           # never a terminal unverified
 
 
-async def test_the_teardowns_denial_speaks_for_marlowe_not_for_keke(tmp_path, monkeypatch):
+async def test_the_teardowns_denial_speaks_for_marvin_not_for_keke(tmp_path, monkeypatch):
     """The rejected approval's deny message lands in the session transcript
     the human is about to resume. "Keke denied this by voice" is false there —
-    nobody denied anything; Marlowe was detaching — and the resumed model
+    nobody denied anything; Marvin was detaching — and the resumed model
     would act on it."""
     fleet, bus, router, clients, path, opened = await spawned(
         tmp_path, monkeypatch)
@@ -667,7 +667,7 @@ async def test_the_applescript_literal_keeps_a_non_ascii_path_verbatim(monkeypat
     """AppleScript does not decode \\uXXXX. With json.dumps' default
     ensure_ascii, one non-ASCII character anywhere in the worktree path turns
     the whole `cd` into a literal backslash-u string — and osascript STILL
-    exits 0, so Marlowe says "yours in the terminal" over a shell that never
+    exits 0, so Marvin says "yours in the terminal" over a shell that never
     left home."""
     seen = {}
 

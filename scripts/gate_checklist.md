@@ -1,4 +1,4 @@
-# Marlowe M3P2 milestone gate — the demo script
+# Marvin M3P2 milestone gate — the demo script
 
 This is the last unverified piece of M3 Part 2. Everything else in the
 milestone has automated tests; these nine beats are the acceptance criterion
@@ -7,7 +7,7 @@ that only a human at a real microphone can satisfy.
 Read this page while you perform it. **Deviations are findings, not failures to
 hide.** A beat that behaves differently from what is written here is worth more
 than a beat that goes perfectly — write it down verbatim, including the exact
-sentence Marlowe said. The gate's output is a transcript plus your notes, not a
+sentence Marvin said. The gate's output is a transcript plus your notes, not a
 feeling that it went well.
 
 ---
@@ -37,21 +37,21 @@ transcript to `state/gate-transcript-<stamp>.md`. It makes no HTTP calls and
 never touches the bootstrap token — that token is single-redeem, and spending
 it would lock your own console out of the demo.
 
-**Start it before `marlowe`, not after.** Whatever is already on disk belongs to
+**Start it before `marvin`, not after.** Whatever is already on disk belongs to
 an earlier run, so it is printed as `(pre-existing, not credited)` and counted
 towards no beat — `state/server.log` always ends in the last run's shutdown
 block, and crediting that would hand beat 9 its restart for free. Anything you
 perform after that line counts. (`--once` re-reads finished logs and *does*
 credit them; use it only to rebuild a transcript after the fact.)
 
-**3. Start Marlowe.**
+**3. Start Marvin.**
 
 ```
-marlowe
+marvin
 ```
 
 If the preflight told you to start the server yourself first (for the access
-log), do that first and *then* run `marlowe` — it sees `/health` answering and
+log), do that first and *then* run `marvin` — it sees `/health` answering and
 will not start a second one.
 
 **4. Say the beat number out loud before each beat.** It lands in the STT
@@ -61,7 +61,7 @@ transcript and lines the audio up with the observer's timestamps.
 
 ## Beat 1 — Discovery + a spoken repo confirm
 
-**Say:** nothing yet — this beat is Marlowe asking *you*.
+**Say:** nothing yet — this beat is Marvin asking *you*.
 
 **Expect:** "I found what looks like `<name>` at `<path>`. Is that one of
 yours, sir?", then your spoken "yes", then "Noted, sir."
@@ -84,7 +84,7 @@ onboarding upgrades a repo to `kind="finance"` on confirmation when its name
 or path contains quant/stock/trad/invest/portfolio/finance, and beat 8 needs
 that project.
 
-After each answer Marlowe proposes the **next** candidate, so expect a short
+After each answer Marvin proposes the **next** candidate, so expect a short
 chain rather than one question. When the candidates run out it says so and
 stops.
 
@@ -111,7 +111,7 @@ somewhere the preflight's scan missed.
 **Say, exactly:**
 
 > Start work in `<confirmed repo name>`, add a one-line comment at the top of
-> the README saying hello from Marlowe.
+> the README saying hello from Marvin.
 
 **The punctuation is load-bearing.** The spawn pattern requires a comma or a
 colon between the repo and the task:
@@ -130,7 +130,7 @@ a missing comma is the usual cause, and it is worth a note either way.
 ```
 #N spawned  w1 <project> -> IDLE_AT_PROMPT
     worktree /Users/.../state/worktrees/<repo>-<slug>-<stamp>
-    branch   marlowe/<slug>-<stamp> @ <commit>
+    branch   marvin/<slug>-<stamp> @ <commit>
     *** beat 2 FIRST EVIDENCE
 ```
 
@@ -152,7 +152,7 @@ say:
 **Three sharp edges, all correct behaviour:**
 
 1. **Answer only after the readback finishes.** A "yes" now resolves only an
-   approval Marlowe has actually read aloud. Answer early and you get
+   approval Marvin has actually read aloud. Answer early and you get
    *"One moment, sir — I haven't read that request to you yet; it's on the
    console"*, and **nothing is resolved**. That is the design working. Wait
    for the sentence to end and say yes again.
@@ -214,7 +214,7 @@ fills only after a manual reload.
 
 **Expect:** Terminal.app opens running
 `cd <worktree> && claude --resume <session-id>`, the tile goes **DETACHED**,
-and Marlowe says "`<project>` is yours in the terminal, sir."
+and Marvin says "`<project>` is yours in the terminal, sir."
 
 **Observer:**
 
@@ -241,7 +241,7 @@ carrying no session id.
 watch two places at once.
 
 **Expect on the console:** the DETACHED tile's state **keeps moving** while you
-type in the terminal. Marlowe holds no SDK stream for that session any more —
+type in the terminal. Marvin holds no SDK stream for that session any more —
 `handoff` closed the client and verified its tasks were dead before recording
 `detached` — so anything that moves that tile arrived over HTTP from the
 worktree's own hook settings.
@@ -262,7 +262,7 @@ POST /hooks #3 (AFTER the detach) — most recent detached session <id>
 ```
 
 Lane A (the access log) is silent if the server was started with
-`--no-access-log` — which is what `bin/marlowe` does. The preflight prints the
+`--no-access-log` — which is what `bin/marvin` does. The preflight prints the
 exact fix. **Lane B still proves the beat either way**, and lane B is the
 stronger of the two because it carries the session id and is causally tied to
 the tile you are watching.
@@ -287,7 +287,7 @@ the tile not moving.
 3. **then** the brief.
 
 **Sharp edge:** the question is asked **once** and then **pinned** to the
-project. If it was already confirmed during earlier testing, Marlowe goes
+project. If it was already confirmed during earlier testing, Marvin goes
 straight to the brief and beat 8 *looks skipped*. The preflight warns when a
 `data_source` is already pinned and tells you which field to clear.
 
@@ -327,9 +327,9 @@ pkill -f 'uvicorn server.app'
    repair instead — either is a valid demo, note which one you did.
 
 3. Restart the server the same way you started it (with the access log if the
-   preflight told you to), then `marlowe`.
+   preflight told you to), then `marvin`.
 
-**Expect:** Marlowe reports the interrupted worker out loud, and a ghost tile
+**Expect:** Marvin reports the interrupted worker out loud, and a ghost tile
 appears with its worktree preserved.
 
 **Sharp edge:** the ghost is re-announced on **every** boot while its worktree
@@ -362,7 +362,7 @@ sentence is honest, but it means the log was damaged — capture the
    a diff you may still want. Clean them up deliberately when the report is
    written:
    `git -C <origin repo> worktree remove --force <path>` then
-   `git -C <origin repo> branch -D marlowe/<...>`. Leaving them means the ghosts
+   `git -C <origin repo> branch -D marvin/<...>`. Leaving them means the ghosts
    keep being re-announced on every boot.
 4. **`git tag m3p2` is the last step — and only if the gate genuinely passed.**
    A tag is a claim that the milestone's acceptance criterion was met by a

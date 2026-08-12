@@ -64,7 +64,7 @@ _DISCOVER = re.compile(
     r"(?:\s+again)?\s*[.!?]*\s*$", re.I)
 # Worktree housekeeping. THREE verbs, and not one of them is a yes.
 #
-# Every task ever run leaves a disposable worktree and a `marlowe/*` branch
+# Every task ever run leaves a disposable worktree and a `marvin/*` branch
 # behind — nothing in server/ has ever removed one, because "the worktree holds
 # the diff a human may still want to merge back". These verbs surface the pile
 # and offer a narrow, consented way to clear the part of it that is provably
@@ -78,7 +78,7 @@ _DISCOVER = re.compile(
 # consent fail-opens came from. None of the phrasings below can be produced by
 # any affirmation or denial vocabulary in the system (pinned by a test), so
 # this gate can neither steal a yes nor have its instruction stolen, and a yes
-# said anywhere in Marlowe removes no worktree, ever.
+# said anywhere in Marvin removes no worktree, ever.
 #
 # WHY THESE PHRASINGS. "clean up / tidy up the worktrees" is what a person
 # actually says about accumulated clutter, and it is the phrasing the task's
@@ -740,7 +740,7 @@ class Router:
                 return ("none", None)
             if len(matched) > 1:
                 # Fail closed: still cannot tell which one was meant. Two
-                # pending "marlowe npm test" approvals in different checkouts
+                # pending "marvin npm test" approvals in different checkouts
                 # must never resolve by voice guesswork — the console resolves
                 # precisely by nonce (take_nonce); voice refuses.
                 return ("ambiguous", None)

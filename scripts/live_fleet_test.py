@@ -4,7 +4,7 @@ Run:      cd ~/marlowe && uv run python scripts/live_fleet_test.py
 Needs:    working claude auth (subscription or ANTHROPIC_API_KEY), and this
           machine's proxy env (HTTPS_PROXY/HTTP_PROXY + NO_PROXY=localhost,127.0.0.1).
 Note:     the worktree's hook curls target 127.0.0.1:7777 with an EMPTY bearer,
-          so they cannot be accepted even if the real Marlowe is running there —
+          so they cannot be accepted even if the real Marvin is running there —
           this script never touches a live fleet. Hook delivery is verified in
           the milestone gate, not here.
 
@@ -13,7 +13,7 @@ deliberately. `testpaths = ["tests"]` keeps `uv run pytest` away from it.
 
 The repo under test is created fresh in a temp directory and thrown away by
 the operating system; the Fleet is additionally built with the vault and the
-Marlowe checkout in `forbidden`, so even an edited copy of this script cannot
+Marvin checkout in `forbidden`, so even an edited copy of this script cannot
 aim a worker at either.
 
 PASS criteria, printed at the end:
@@ -53,9 +53,9 @@ def make_repo(base: Path) -> Path:
     repo = base / "scratch-repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
-    (repo / "README.md").write_text("A scratch repo for the Marlowe fleet smoke.\n")
+    (repo / "README.md").write_text("A scratch repo for the Marvin fleet smoke.\n")
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
-    subprocess.run(["git", "-c", "user.email=j@j", "-c", "user.name=marlowe",
+    subprocess.run(["git", "-c", "user.email=j@j", "-c", "user.name=marvin",
                     "commit", "-qm", "init"], cwd=repo, check=True)
     return repo
 
@@ -71,7 +71,7 @@ async def wait_for(predicate, timeout, what):
 
 
 async def main() -> int:
-    # Fail here, loudly, with the sentence Marlowe itself would speak — rather
+    # Fail here, loudly, with the sentence Marvin itself would speak — rather
     # than inside a worker that dies on a bare "403 Request not allowed".
     problem = proxy_problem()
     if problem:
@@ -80,7 +80,7 @@ async def main() -> int:
               "NO_PROXY=localhost,127.0.0.1, then run this again.")
         return 2
 
-    base = Path(tempfile.mkdtemp(prefix="marlowe-fleet-smoke-"))
+    base = Path(tempfile.mkdtemp(prefix="marvin-fleet-smoke-"))
     repo = make_repo(base)
     bus, router = EventBus(), Router()
     fleet = Fleet(bus=bus, router=router,

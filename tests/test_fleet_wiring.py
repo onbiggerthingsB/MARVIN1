@@ -63,7 +63,7 @@ def confirmed_registry(*names, kind="code"):
 
 
 def open_spoken(router, *args, **kwargs):
-    """An approval Marlowe has already read aloud — the precondition every
+    """An approval Marvin has already read aloud — the precondition every
     voice-resolution test below assumes. A bare open_approval() models one
     nobody has heard, and a yes may not resolve that (see
     tests/test_approval_correlation.py)."""
@@ -330,7 +330,7 @@ async def test_a_worker_dying_is_spoken_once_and_only_once():
     """`fleet.error` was never spoken at all, so a worker's stream dying, a
     failed health probe and an unknown session were all SILENT — and because
     UNKNOWN counts as live, the dead worker permanently blocked admission: a
-    project Keke was told is "queued at position 1" never started, and Marlowe
+    project Keke was told is "queued at position 1" never started, and Marvin
     never mentioned it again.
 
     THE RULE: an error that NAMES a worker is a fact about a project Keke

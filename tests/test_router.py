@@ -11,7 +11,7 @@ NOW = 1000.0
 
 def open_spoken(router, *args, **kwargs):
     """Open an approval AND mark it read aloud — the state every test below
-    means. A voice yes may only resolve a request Marlowe actually SPOKE, so a
+    means. A voice yes may only resolve a request Marvin actually SPOKE, so a
     raw open_approval() now models an approval nobody has heard; that
     correlation is pinned on its own in tests/test_approval_correlation.py."""
     a = router.open_approval(*args, **kwargs)
@@ -871,7 +871,7 @@ def test_no_affirmation_vocabulary_can_ever_OPEN_a_worktree_verb():
     alternation by one friendly token ("|yes|sure") to make a natural sentence
     work. That single token would make a pending "yes" removable-shaped, which
     is the seventh instance of this codebase's oldest bug. An affirmative
-    OPENER carrying a real request is not consent anywhere else in Marlowe
+    OPENER carrying a real request is not consent anywhere else in Marvin
     either (onboarding._bare_affirmation, finance_gate._bare_rejection); it
     costs one re-ask here and it is the whole safety argument for this gate.
     """
@@ -900,7 +900,12 @@ def test_no_affirmation_vocabulary_can_ever_OPEN_a_worktree_verb():
 
 def demo_registry():
     """The real fleet's shape: confirmed multi-word names, a shared word
-    ("agent"), a hyphenated name, and two directories both named jarvis."""
+    ("agent"), a hyphenated name, and two directories both named jarvis.
+    The `marlowe` entry below is a DIRECTORY basename at its real path, not
+    the assistant's name (now Marvin): the repo still lives at
+    /Users/likerun/marlowe, and the spoken utterances in the tests below are
+    live Deepgram transcripts of that project being named. All of it moves to
+    `marvin` together when the directory itself does."""
     r = Registry()
     r.merge_candidates([
         Candidate(path="/Users/likerun/marlowe", name="marlowe", sources=["t"]),

@@ -42,7 +42,7 @@ async def test_worktree_excludes_untracked_files_by_construction(tmp_path):
 async def test_worktree_branch_is_namespaced(tmp_path):
     repo = make_repo(tmp_path)
     wt = await create_worktree(repo, "Fix The Login!", tmp_path / "wts")
-    assert wt.branch.startswith("marlowe/fix-the-login")
+    assert wt.branch.startswith("marvin/fix-the-login")
 
 
 async def test_non_git_dir_raises_a_worktree_error(tmp_path):
@@ -59,19 +59,19 @@ async def test_remove_worktree_deletes_the_checkout(tmp_path):
     assert not Path(wt.path).exists()
 
 
-async def test_remove_worktree_refuses_a_branch_outside_the_marlowe_namespace(tmp_path):
+async def test_remove_worktree_refuses_a_branch_outside_the_marvin_namespace(tmp_path):
     # A record with a foreign branch must be refused BEFORE any git call —
     # `worktree remove --force` would happily delete a real linked checkout.
     repo = make_repo(tmp_path)
     forged = Worktree(repo=str(repo), path=str(repo), branch="main",
                       base_commit="deadbeef")
-    with pytest.raises(WorktreeError, match="marlowe/"):
+    with pytest.raises(WorktreeError, match="marvin/"):
         await remove_worktree(forged)
     assert repo.exists() and (repo / "README.md").exists()
 
 
 async def test_remove_worktree_refuses_a_stale_record_on_the_wrong_checkout(tmp_path):
-    # Stale/forged record: a legitimate marlowe/ branch name, but the path
+    # Stale/forged record: a legitimate marvin/ branch name, but the path
     # points at a checkout that is NOT on that branch. Refuse; leave it alone.
     repo = make_repo(tmp_path)
     wt_a = await create_worktree(repo, "task alpha", tmp_path / "wts")
@@ -91,8 +91,8 @@ async def test_remove_worktree_refuses_a_stale_record_on_the_wrong_checkout(tmp_
         await remove_worktree(wt_b)
 
 
-async def test_remove_worktree_refuses_a_marlowe_record_aimed_at_the_main_checkout(tmp_path):
-    # The nightmare case: a corrupted record wearing a marlowe/ branch but
+async def test_remove_worktree_refuses_a_marvin_record_aimed_at_the_main_checkout(tmp_path):
+    # The nightmare case: a corrupted record wearing a marvin/ branch but
     # pointing at the user's real checkout (which is on main, not the branch).
     repo = make_repo(tmp_path)
     wt = await create_worktree(repo, "task", tmp_path / "wts")
@@ -102,7 +102,7 @@ async def test_remove_worktree_refuses_a_marlowe_record_aimed_at_the_main_checko
         # match= is load-bearing: git refuses to delete a MAIN working tree all
         # by itself ("fatal: ... is a main working tree"), so a bare raises()
         # here passes with the guard fully reverted — it would be testing git,
-        # not Marlowe. Pin the guard's own branch-mismatch sentence instead.
+        # not Marvin. Pin the guard's own branch-mismatch sentence instead.
         with pytest.raises(WorktreeError,
                            match="has 'main' checked out, not the recorded"):
             await remove_worktree(forged)
@@ -129,14 +129,14 @@ async def test_remove_worktree_refuses_a_relative_path(tmp_path, monkeypatch):
     subprocess.run(["git", "worktree", "add", "-q", "-b", "feature/human",
                     str(victim_w)], cwd=victim_repo, check=True)
     (victim_w / "notes.txt").write_text("hours of work\n", encoding="utf-8")
-    # A same-NAME decoy in an unrelated repo, wearing a marlowe/ branch so the
+    # A same-NAME decoy in an unrelated repo, wearing a marvin/ branch so the
     # guard's rev-parse happily says yes.
-    subprocess.run(["git", "worktree", "add", "-q", "-b", "marlowe/decoy",
+    subprocess.run(["git", "worktree", "add", "-q", "-b", "marvin/decoy",
                     str(decoy_w)], cwd=decoy_repo, check=True)
     try:
         monkeypatch.chdir(decoy_w.parent)        # "W" verifies HERE ...
         forged = Worktree(repo=str(victim_repo), path="W",
-                          branch="marlowe/decoy", base_commit="deadbeef")
+                          branch="marvin/decoy", base_commit="deadbeef")
         with pytest.raises(WorktreeError, match="not an absolute path"):
             await remove_worktree(forged)        # ... but git would delete THERE
         assert victim_w.exists()                 # the human's checkout survived
@@ -216,7 +216,7 @@ def test_proxy_problem_flags_missing_proxy_and_bad_no_proxy():
 def test_proxy_problem_accepts_a_good_environment_or_the_skip_switch():
     good = {"HTTPS_PROXY": "http://proxy:8080", "NO_PROXY": "localhost,127.0.0.1"}
     assert proxy_problem(good) is None
-    assert proxy_problem({"MARLOWE_SKIP_PROXY_CHECK": "1"}) is None
+    assert proxy_problem({"MARVIN_SKIP_PROXY_CHECK": "1"}) is None
 
 
 def test_proxy_problem_requires_both_no_proxy_hosts():

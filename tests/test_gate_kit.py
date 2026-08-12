@@ -186,7 +186,7 @@ def test_spawn_record_is_beat_2():
     board, corr = board_and_correlator()
     corr.on_fleet_record(rec("spawned", {
         "worker": "w1", "project": "alethic", "state": "IDLE_AT_PROMPT",
-        "worktree": "/wt/1", "branch": "marlowe/x-1", "base_commit": "abc1234"}))
+        "worktree": "/wt/1", "branch": "marvin/x-1", "base_commit": "abc1234"}))
     assert board.evidence[2] and not board.evidence[7]
 
 
@@ -209,7 +209,7 @@ def test_a_spawned_record_bounced_off_closed_is_not_beat_2():
         "worktree": "/wt/1"}, 11))
     corr.on_fleet_record(rec("spawned", {
         "worker": "w1", "project": "probe", "path": "/p", "state": "CLOSED",
-        "worktree": "/wt/1", "branch": "marlowe/probe-1",
+        "worktree": "/wt/1", "branch": "marvin/probe-1",
         "base_commit": "abc1234def"}, 12))
     corr.on_fleet_record(rec("prompt", {
         "worker": "w1", "project": "probe", "path": "/p", "state": "CLOSED",
@@ -227,10 +227,10 @@ def test_a_genuine_spawn_after_a_bounced_one_still_credits_beat_2():
     board, corr = board_and_correlator()
     corr.on_fleet_record(rec("spawned", {
         "worker": "w1", "project": "probe", "state": "CLOSED",
-        "worktree": "/wt/1", "branch": "marlowe/probe-1"}, 12))
+        "worktree": "/wt/1", "branch": "marvin/probe-1"}, 12))
     corr.on_fleet_record(rec("spawned", {
         "worker": "w2", "project": "alethic", "state": "IDLE_AT_PROMPT",
-        "worktree": "/wt/2", "branch": "marlowe/x-1",
+        "worktree": "/wt/2", "branch": "marvin/x-1",
         "base_commit": "def5678"}, 20))
     assert board.evidence[2]
     assert any("alethic" in row for row in board.evidence[2])
@@ -396,7 +396,7 @@ def test_a_genuine_detach_after_a_bounced_one_still_credits_beat_6():
 
 
 def test_records_reaching_a_detached_worker_are_beat_7():
-    """The whole point of beat 7: after the handoff Marlowe holds no stream for
+    """The whole point of beat 7: after the handoff Marvin holds no stream for
     that session, so only a /hooks POST can still move the tile."""
     board, corr = board_and_correlator()
     corr.on_fleet_record(rec("detached", {"worker": "w1", "state": DETACHED,
@@ -581,7 +581,7 @@ def test_no_beat_is_credited_from_a_record_the_state_machine_absorbed(kind):
     # well-formed, so the ONLY thing that can refuse the credit is the state.
     corr.on_fleet_record(rec(kind, {
         "worker": "w1", "project": "probe", "path": "/p", "state": "CLOSED",
-        "worktree": "/wt/1", "branch": "marlowe/probe-1",
+        "worktree": "/wt/1", "branch": "marvin/probe-1",
         "base_commit": "abc1234def", "session_id": "sess-abcdef123456",
         "nonce": "n1", "approved": True,
         "reason": "the session went CLOSED mid-handoff"}))
@@ -670,7 +670,7 @@ def test_a_fully_successful_demo_still_credits_every_creditable_beat():
     # beat 2: spawn w1
     corr.on_fleet_record(rec("spawned", {
         "worker": "w1", "project": "alethic", "state": "IDLE_AT_PROMPT",
-        "worktree": "/wt/1", "branch": "marlowe/x-1",
+        "worktree": "/wt/1", "branch": "marvin/x-1",
         "base_commit": "abc1234"}, 1))
     # beat 3: card raised → approved by voice → worker finishes the turn
     corr.on_fleet_record(rec("permission_wait", {
@@ -698,7 +698,7 @@ def test_a_fully_successful_demo_still_credits_every_creditable_beat():
     # beat 9: fresh worker w2 live mid-flight, clean kill, restart
     corr.on_fleet_record(rec("spawned", {
         "worker": "w2", "project": "alethic", "state": "ACTIVE_TURN",
-        "worktree": "/wt/2", "branch": "marlowe/x-2",
+        "worktree": "/wt/2", "branch": "marvin/x-2",
         "base_commit": "def5678"}, 7))
     corr.on_server_line("INFO:     Shutting down", t)
     corr.on_fleet_rotation()                   # FleetLog.snapshot's rename
@@ -801,7 +801,7 @@ def test_check_proxy_env_passes_a_correct_environment():
 
 
 def test_skipping_the_proxy_check_is_a_warning_not_a_pass():
-    c = pre.check_proxy_env({"MARLOWE_SKIP_PROXY_CHECK": "1"})
+    c = pre.check_proxy_env({"MARVIN_SKIP_PROXY_CHECK": "1"})
     assert c.level == pre.WARN and "403" in c.detail
 
 
@@ -812,7 +812,7 @@ def test_deepgram_is_a_blocker_and_elevenlabs_is_only_a_warning():
     assert "say" in checks["TTS (ElevenLabs)"].detail
 
 
-def test_both_elevenlabs_keys_are_required_for_the_marlowe_voice():
+def test_both_elevenlabs_keys_are_required_for_the_marvin_voice():
     """SpeakEngine._eleven_enabled needs BOTH; one alone still falls back."""
     checks = {c.name: c for c in pre.check_voice(
         {"DEEPGRAM_API_KEY": "k", "ELEVENLABS_API_KEY": "k"})}
@@ -828,14 +828,14 @@ def test_both_elevenlabs_keys_are_required_for_the_marlowe_voice():
 def test_forcing_the_say_voice_is_reported_as_a_warning():
     checks = {c.name: c for c in pre.check_voice(
         {"DEEPGRAM_API_KEY": "k", "ELEVENLABS_API_KEY": "k",
-         "ELEVENLABS_VOICE_ID": "v", "MARLOWE_VOICE": "say"})}
+         "ELEVENLABS_VOICE_ID": "v", "MARVIN_VOICE": "say"})}
     assert checks["TTS (ElevenLabs)"].level == pre.WARN
 
 
 def test_access_log_check_flags_the_launcher_as_shipped():
     c = pre.access_log_check("uvicorn ... --port 7777 --no-access-log\n")
     assert c.level == pre.ERROR
-    assert "--access-log" in c.fix and "Do NOT edit bin/marlowe" in c.fix
+    assert "--access-log" in c.fix and "Do NOT edit bin/marvin" in c.fix
     assert pre.access_log_check("uvicorn ... --port 7777\n").level == pre.OK
     assert pre.access_log_check("").level == pre.WARN
 
@@ -967,7 +967,7 @@ def test_observer_once_writes_a_transcript_and_a_beat_summary(tmp_path):
     state.mkdir()
     write_log(state / "fleet.jsonl", [
         ("spawned", {"worker": "w1", "project": "alethic", "state": "IDLE",
-                     "worktree": str(tmp_path / "wt"), "branch": "marlowe/x"}),
+                     "worktree": str(tmp_path / "wt"), "branch": "marvin/x"}),
         ("permission_wait", {"worker": "w1", "state": "WAITING_PERMISSION",
                              "nonce": "n1"}),
         ("permission_done", {"worker": "w1", "state": "ACTIVE_TURN",
@@ -992,7 +992,7 @@ def test_observer_once_writes_a_transcript_and_a_beat_summary(tmp_path):
          "data_source": "/q/picks.sqlite"}]}))
     out = tmp_path / "transcript.md"
     code = obs.main(["--state-dir", str(state), "--registry", str(reg),
-                     "--launcher", str(REPO_ROOT / "bin" / "marlowe"),
+                     "--launcher", str(REPO_ROOT / "bin" / "marvin"),
                      "--out", str(out), "--once"])
     assert code == 0
     text = out.read_text()

@@ -16,12 +16,12 @@ def test_targets_are_fixed_destinations(tmp_path):
 
 
 def test_env_override(monkeypatch):
-    monkeypatch.setenv("MARLOWE_VAULT", "/tmp/some vault")
+    monkeypatch.setenv("MARVIN_VAULT", "/tmp/some vault")
     assert vault_root_from_env() == Path("/tmp/some vault")
 
 
 def test_env_default_when_unset(monkeypatch):
-    monkeypatch.delenv("MARLOWE_VAULT", raising=False)
+    monkeypatch.delenv("MARVIN_VAULT", raising=False)
     root = vault_root_from_env()
     assert root.name == "KEKE LI"
     assert "iCloud~md~obsidian" in str(root)

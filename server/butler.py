@@ -60,7 +60,7 @@ async def _dispose(client) -> None:
         pass
 
 SYSTEM_PROMPT = (
-    "You are Marlowe, a concise voice-first butler for Keke's Obsidian 'second brain' vault.\n"
+    "You are Marvin, a concise voice-first butler for Keke's Obsidian 'second brain' vault.\n"
     "GROUND every answer in the vault: call vault_search to find relevant notes, then "
     "vault_read to read them. Never state a fact you did not find in the vault; if you "
     "cannot find something, say so plainly.\n"
@@ -164,7 +164,7 @@ def _best_parse(messages: list[str]) -> dict:
     the end. Concatenating them all and parsing the blob is fine while the model
     emits clean JSON -- _load_object finds the object wherever it sits -- but the
     moment it does not, parse_butler_output's plain-text fallback speaks the
-    WHOLE blob, so Marlowe reads its own narration aloud as the answer.
+    WHOLE blob, so Marvin reads its own narration aloud as the answer.
 
     Order, therefore:
       1. the last non-empty message, if it carried a butler object -- the normal case;

@@ -57,7 +57,7 @@ from server.vault_paths import vault_root_from_env       # noqa: E402
 from server.worktrees import proxy_problem  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-HOOK_PORT = 7788        # NEVER 7777: a live Marlowe may be listening there
+HOOK_PORT = 7788        # NEVER 7777: a live Marvin may be listening there
 
 
 def make_repo(base: Path) -> Path:
@@ -66,7 +66,7 @@ def make_repo(base: Path) -> Path:
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
     (repo / "README.md").write_text("Scratch repo for the live handoff smoke.\n")
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
-    subprocess.run(["git", "-c", "user.email=j@j", "-c", "user.name=marlowe",
+    subprocess.run(["git", "-c", "user.email=j@j", "-c", "user.name=marvin",
                     "commit", "-qm", "init"], cwd=repo, check=True)
     return repo
 
@@ -111,7 +111,7 @@ async def main() -> int:
         return 2
     real_terminal = "--real-terminal" in sys.argv[1:]
 
-    base = Path(tempfile.mkdtemp(prefix="marlowe-handoff-smoke-"))
+    base = Path(tempfile.mkdtemp(prefix="marvin-handoff-smoke-"))
     repo = make_repo(base)
     bus, router = EventBus(), Router()
     bearer = secrets.token_hex(16)

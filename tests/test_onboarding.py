@@ -110,10 +110,10 @@ async def test_a_plain_yes_still_confirms(tmp_path, said):
 
 async def test_mutation_lands_on_the_exact_path_asked_about(tmp_path):
     r = Registry()
-    r.merge_candidates([Candidate(path="/one/marlowe", name="marlowe", sources=["a"]),
-                        Candidate(path="/two/marlowe", name="marlowe", sources=["a"])])
+    r.merge_candidates([Candidate(path="/one/marvin", name="marvin", sources=["a"]),
+                        Candidate(path="/two/marvin", name="marvin", sources=["a"])])
     ob = Onboarding(EventBus(), r, tmp_path / "projects.json")
-    # Reject the first marlowe, then confirm the second: a name-keyed mutation
+    # Reject the first marvin, then confirm the second: a name-keyed mutation
     # would land on the first (rejected!) one, since both share a basename.
     await asked(ob)
     assert await ob.handle_reply("no") == "rejected"
@@ -224,7 +224,7 @@ async def test_the_confirm_next_barrier_race_confirms_nothing_before_speaking():
     r = Registry()
     r.merge_candidates([Candidate(path="/p/quant agent", name="quant agent",
                                   sources=["a", "b"])])
-    ob = Onboarding(bus, r, "/tmp/marlowe-test-projects.json")
+    ob = Onboarding(bus, r, "/tmp/marvin-test-projects.json")
     spk = SeqSpeaker()
     task = asyncio.create_task(run_butler_brain(
         bus, FakeButler(), spk, FakeTurnLog(),

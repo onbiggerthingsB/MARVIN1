@@ -4,6 +4,6 @@ __pycache__/
 state/
 static/clips/
 static/chimes/
-config/marlowe.json
+config/marvin.json
 live_test.py
 config/projects.json

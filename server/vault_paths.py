@@ -9,7 +9,7 @@ _DEFAULT = "Library/Mobile Documents/iCloud~md~obsidian/Documents/KEKE LI"
 
 
 def vault_root_from_env() -> Path:
-    override = os.environ.get("MARLOWE_VAULT")
+    override = os.environ.get("MARVIN_VAULT")
     return Path(override) if override else Path.home() / _DEFAULT
 
 

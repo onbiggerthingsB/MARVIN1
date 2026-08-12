@@ -130,13 +130,13 @@ def _session_cookie(app, port: int) -> str:
         token = app.state.bootstrap_token_plain
         r = client.get(f"/bootstrap?token={token}", follow_redirects=False)
         assert r.status_code == 303
-        return r.cookies["marlowe_session"]
+        return r.cookies["marvin_session"]
 
 
 async def _mic(port: int, cookie: str):
     return await websockets.connect(
         f"ws://127.0.0.1:{port}/mic",
-        additional_headers={"Cookie": f"marlowe_session={cookie}"},
+        additional_headers={"Cookie": f"marvin_session={cookie}"},
     )
 
 

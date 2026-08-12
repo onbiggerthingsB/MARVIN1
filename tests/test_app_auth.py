@@ -22,7 +22,7 @@ def bootstrap(client: TestClient) -> None:
     token = client.app.state.bootstrap_token_plain  # test hook, set in create_app
     r = client.get(f"/bootstrap?token={token}", follow_redirects=False)
     assert r.status_code == 303
-    assert "marlowe_session" in r.cookies
+    assert "marvin_session" in r.cookies
 
 
 def test_health_is_open(tmp_path):
@@ -79,7 +79,7 @@ def test_events_requires_cookie(tmp_path):
             token = app.state.bootstrap_token_plain
             r = client.get(f"/bootstrap?token={token}", follow_redirects=False)
             assert r.status_code == 303
-            assert "marlowe_session" in r.cookies
+            assert "marvin_session" in r.cookies
             with client.stream("GET", "/events") as r:
                 assert r.status_code == 200
 
@@ -89,7 +89,7 @@ def test_bootstrap_is_single_use_and_persists_hash(tmp_path):
     token = c.app.state.bootstrap_token_plain
     assert c.get(f"/bootstrap?token={token}", follow_redirects=False).status_code == 303
     assert c.get(f"/bootstrap?token={token}", follow_redirects=False).status_code == 403
-    cfg = load_config(tmp_path / "config" / "marlowe.json")
+    cfg = load_config(tmp_path / "config" / "marvin.json")
     assert cfg.session_token_hash != ""
 
 
@@ -188,6 +188,6 @@ def test_malformed_last_event_id_does_not_500(tmp_path):
             token = app.state.bootstrap_token_plain
             r = client.get(f"/bootstrap?token={token}", follow_redirects=False)
             assert r.status_code == 303
-            assert "marlowe_session" in r.cookies
+            assert "marvin_session" in r.cookies
             with client.stream("GET", "/events", headers={"Last-Event-ID": "not-a-number"}) as r:
                 assert r.status_code == 200

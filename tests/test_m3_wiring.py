@@ -7,7 +7,7 @@ from server.discovery import Candidate
 from server.registry import Registry
 from server.router import Router
 from server.app_brain import run_butler_brain
-# An approval Marlowe has already read aloud. A raw open_approval() models one
+# An approval Marvin has already read aloud. A raw open_approval() models one
 # nobody has heard, which a voice yes may no longer resolve.
 from tests.test_fleet_wiring import open_spoken
 
@@ -97,7 +97,7 @@ async def test_a_trade_request_is_refused_aloud_and_not_routed():
 
 async def test_capture_verb_actually_appends_to_the_daily_inbox(tmp_path, monkeypatch):
     # The day-one regression: "remember/note that ..." must WRITE, not stub.
-    monkeypatch.setenv("MARLOWE_VAULT", str(tmp_path))
+    monkeypatch.setenv("MARVIN_VAULT", str(tmp_path))
     bus, butler, spk = EventBus(), FakeButler(), FakeSpeaker()
     task = asyncio.create_task(run_butler_brain(
         bus, butler, spk, FakeTurnLog(),

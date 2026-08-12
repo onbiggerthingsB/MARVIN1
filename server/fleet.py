@@ -85,7 +85,7 @@ def _elide(text: str, limit: int) -> str:
     aloud as the same truncated prefix), and a shell command's destructive
     clause is almost always at the end: `… && rm -rf …`, `… && git push
     --force`. Cutting there reads Keke a sentence with exactly the dangerous
-    part removed — and _risk_note scans the FULL blob, so Marlowe would say
+    part removed — and _risk_note scans the FULL blob, so Marvin would say
     "Careful, sir" about a danger the very same sentence then declines to
     name."""
     limit = max(int(limit), 8)
@@ -117,7 +117,7 @@ def _full_args(args) -> str:
     _risk_note (which scans the whole blob) still says "this one can destroy
     things". Executed against a 347-character command, the elided middle was an
     `rm -rf` on the owner's vault. The card publishes this instead, rendered
-    with textContent, so there is at least ONE surface in Marlowe showing the
+    with textContent, so there is at least ONE surface in Marvin showing the
     exact thing being approved.
 
     Same field preference as _short_args, so the card and the sentence are the
@@ -272,7 +272,7 @@ def _resume_command(info: dict) -> str:
     session id exists nowhere but the fleet log. An INTERRUPTED ghost gets
     nothing: its state is UNKNOWN precisely because nobody knows what became of
     it, and offering a resume command would invite Keke to drive a session
-    Marlowe has just said it cannot vouch for."""
+    Marvin has just said it cannot vouch for."""
     if info.get("state") != DETACHED:
         return ""
     sid, wt = info.get("session_id") or "", info.get("worktree") or ""
@@ -289,7 +289,7 @@ async def _default_open_terminal(cmd: str) -> None:
     ensure_ascii=False is load-bearing: with the default, a non-ASCII worktree
     path (a project named in Chinese, an accent in a folder) is emitted as
     \\uXXXX, which AppleScript does NOT decode — it would `cd` into a literal
-    backslash-u path, fail, and still exit 0, so Marlowe would confidently say
+    backslash-u path, fail, and still exit 0, so Marvin would confidently say
     "yours in the terminal" over a shell sitting in the wrong directory.
 
     The child is reaped on every exit: a hung osascript (a modal dialog, a
@@ -703,7 +703,7 @@ class Worker:
         readback, and wait for the voice loop, a click, or the TTL."""
         if self.locked:
             return PermissionResultDeny(
-                message="Marlowe handoff in progress", interrupt=True)
+                message="Marvin handoff in progress", interrupt=True)
         # The SPOKEN rendering, decided FIRST: a command too long to read in
         # full is click-only (voice_ok False), never elided into the middle.
         spoken, voice_ok = _spoken_arg(tool_input)
@@ -796,7 +796,7 @@ class Worker:
             # (The real CLI exits on any denial — that exit is the teardown's
             # intent here, so the wording changes nothing mechanical.)
             return PermissionResultDeny(
-                message="Marlowe is closing this session — not a decision "
+                message="Marvin is closing this session — not a decision "
                         "on the tool", interrupt=False)
         return PermissionResultDeny(
             message="Keke denied this by voice", interrupt=False)
@@ -979,7 +979,7 @@ class Fleet:
             resolved = str(Path(path).resolve())
             for bad in self.forbidden:
                 if resolved == bad or resolved.startswith(bad + "/"):
-                    # spec §5/§9: never the vault, never the Marlowe repo
+                    # spec §5/§9: never the vault, never the Marvin repo
                     return "I don't run workers in that directory, sir."
             problem = proxy_problem()
             if problem:
@@ -1228,7 +1228,7 @@ class Fleet:
                           f"sir — it has its own terminal.")
                 cmd = ghost.get("command") or ""
                 if cmd:
-                    # Still ok=False — Marlowe opens no window and takes no
+                    # Still ok=False — Marvin opens no window and takes no
                     # session back. But refusing with NOTHING actionable, over
                     # a session that provably still exists, wastes the one fact
                     # only the log has.
@@ -1622,7 +1622,7 @@ class Fleet:
                             "task": g.get("task", ""), "worktree": wt,
                             "session_id": g.get("session_id", "")}
         # An empty or absent log has nothing to compact, and rotating it is not
-        # a compaction — it is a deletion of the previous generation. A Marlowe
+        # a compaction — it is a deletion of the previous generation. A Marvin
         # session that never spawned a worker must not erase the last one that
         # did.
         #
@@ -1634,7 +1634,7 @@ class Fleet:
         # and a ghost survives precisely the boots that spawn nothing. Simulated
         # boots 2 through 8 each re-reported the same ghost, including the boots
         # after its worktree had been deleted, so `fleet.recovered` fired every
-        # time and Marlowe claimed workers were "interrupted by a restart" many
+        # time and Marvin claimed workers were "interrupted by a restart" many
         # restarts later. So compute the state FIRST and skip the rotation only
         # when there is genuinely nothing new to write down.
         try:

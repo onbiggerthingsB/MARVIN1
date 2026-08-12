@@ -1,4 +1,4 @@
-"""The confirmation beat: Marlowe proposes a repo, Keke confirms it out loud.
+"""The confirmation beat: Marvin proposes a repo, Keke confirms it out loud.
 
 Discovery is a guess. Nothing becomes usable — least of all the finance repo —
 until a human says yes, so this module is the only path to `confirmed`.

@@ -17,7 +17,7 @@ target truthfully, tail included, and say when the target is outside here.
 
 The hook settings go into the WORKTREE's .claude/settings.local.json:
   - local settings are never tracked, so the human's merge-back diff stays
-    clean of Marlowe plumbing;
+    clean of Marvin plumbing;
   - hooks fire from the CLI process, so they keep POSTing after a terminal
     handoff, when the owned SDK stream is gone — that is the second detection
     layer surviving the first.
@@ -68,7 +68,7 @@ async def _git(repo: Path, *args: str) -> str:
         # Cancelling the AWAIT does not cancel the PROCESS. Every worktree
         # verb the brain dispatches is wrapped in its own asyncio.wait_for, so
         # a timeout there abandons this coroutine while git keeps running —
-        # the removal lands seconds after Marlowe has already said "that
+        # the removal lands seconds after Marvin has already said "that
         # command failed", which is the same class of lie as claiming a
         # removal that never happened. Kill it, then reap it: an unreaped
         # child holds its pipes open for the life of the server.
@@ -91,7 +91,7 @@ async def create_worktree(repo: Path, task: str, worktrees_dir: Path) -> Worktre
     stamp = time.strftime("%Y%m%d-%H%M%S")
     slug = _slug(task)
     dest = Path(worktrees_dir) / f"{repo.name}-{slug}-{stamp}"
-    branch = f"marlowe/{slug}-{stamp}"
+    branch = f"marvin/{slug}-{stamp}"
     dest.parent.mkdir(parents=True, exist_ok=True)
     await _git(repo, "worktree", "add", "-b", branch, str(dest), base_commit)
     return Worktree(repo=str(repo), path=str(dest), branch=branch,
@@ -105,8 +105,8 @@ async def remove_worktree(wt: Worktree) -> None:
     Guard before the destructive call: `worktree remove --force` deletes ANY
     registered linked worktree (untracked files included) — git only protects
     the MAIN working tree. A Worktree is a plain dataclass anyone can forge or
-    rehydrate stale from disk, so refuse anything Marlowe did not create:
-      1. the recorded branch must live in Marlowe's own marlowe/ namespace;
+    rehydrate stale from disk, so refuse anything Marvin did not create:
+      1. the recorded branch must live in Marvin's own marvin/ namespace;
       2. wt.path must be ABSOLUTE, so the checkout this verifies and the
          worktree git deletes are provably the same directory;
       3. the checkout actually at wt.path must have that exact branch checked
@@ -121,10 +121,10 @@ async def remove_worktree(wt: Worktree) -> None:
     unrelated worker-3 checkout inside wt.repo. An absolute path gets no name
     matching, so the two can never diverge. create_worktree only ever records
     absolute paths; anything else is forged or corrupt."""
-    if not wt.branch.startswith("marlowe/"):
+    if not wt.branch.startswith("marvin/"):
         raise WorktreeError(
             f"refusing to remove {wt.path}: branch {wt.branch!r} is outside "
-            f"the marlowe/ namespace, so Marlowe did not create it")
+            f"the marvin/ namespace, so Marvin did not create it")
     if not Path(wt.path).is_absolute():
         raise WorktreeError(
             f"refusing to remove {wt.path!r}: that is not an absolute path, so "
@@ -173,8 +173,8 @@ def proxy_problem(env=os.environ) -> str | None:
     """This machine reaches Anthropic only through a proxy; a worker CLI
     without the proxy vars dies with '403 Request not allowed'. Checked at
     spawn so the failure is a spoken sentence, not a mystery inside a worker.
-    MARLOWE_SKIP_PROXY_CHECK=1 disables it on networks that need no proxy."""
-    if env.get("MARLOWE_SKIP_PROXY_CHECK") == "1":
+    MARVIN_SKIP_PROXY_CHECK=1 disables it on networks that need no proxy."""
+    if env.get("MARVIN_SKIP_PROXY_CHECK") == "1":
         return None
     if not (env.get("HTTPS_PROXY") or env.get("https_proxy")
             or env.get("HTTP_PROXY") or env.get("http_proxy")):

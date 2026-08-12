@@ -163,7 +163,7 @@ def test_a_ghost_is_retired_once_its_worktree_is_gone(tmp_path):
 
 def test_a_retired_ghost_is_not_re_announced_on_the_next_boot(tmp_path):
     """The consequence the count made visible: `fleet.recovered` fired on every
-    boot, so Marlowe announced "workers were interrupted by a restart" about a
+    boot, so Marvin announced "workers were interrupted by a restart" about a
     worktree that had been deleted several restarts ago — and a DETACHED ghost
     kept offering a `claude --resume` for a session that ended long before."""
     wt = tmp_path / "wt-a"
@@ -214,7 +214,7 @@ def test_a_detached_ghost_keeps_the_command_that_rejoins_it(tmp_path):
 
 def test_an_interrupted_ghost_is_offered_no_resume_command(tmp_path):
     """UNKNOWN means nobody knows what became of it — a resume command would
-    invite Keke to drive something Marlowe just said it cannot vouch for."""
+    invite Keke to drive something Marvin just said it cannot vouch for."""
     seed_log(tmp_path,
              ("spawned", {**W1, "state": "IDLE_AT_PROMPT",
                           "session_id": "s-9"}))

@@ -46,7 +46,7 @@ async function loadChime(name) {
   chimes[name] = await audioCtx.decodeAudioData(buf);
 }
 
-window.marlowe = {
+window.marvin = {
   onEvent(type, h) { handlers.set(type, [...(handlers.get(type) || []), h]); },
   setStatus(text) { $("#status").textContent = text; },
   playChime(name) {
@@ -67,7 +67,7 @@ $("#setup-btn").addEventListener("click", async () => {
     // Mic permission is requested here once; the stream is stopped immediately.
     const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
     mic.getTracks().forEach((t) => t.stop());
-    window.marlowe.playChime("done");
+    window.marvin.playChime("done");
     $("#setup-overlay").hidden = true;
     $("#console").hidden = false;
     connectSSE();
@@ -78,15 +78,15 @@ $("#setup-btn").addEventListener("click", async () => {
     // route. Idempotent, so running it here and on every connect is safe.
     refreshFleet();
     refreshWorktrees();
-    window.marlowe.setStatus("online — hold to talk");
+    window.marvin.setStatus("online — hold to talk");
   } catch (err) {
     $("#setup-status").textContent = `setup failed: ${err.message} — fix and click again`;
   }
 });
 
-window.marlowe.onEvent("wake", () => {
-  window.marlowe.playChime("listen");
-  window.marlowe.setStatus("yes?");
+window.marvin.onEvent("wake", () => {
+  window.marvin.playChime("listen");
+  window.marvin.setStatus("yes?");
 });
 
 // ---- press-and-hold mic → /mic WebSocket -------------------------------
@@ -129,11 +129,11 @@ async function startTalking() {
   closeDraining();   // one live relay at a time
   micAborting = false;
   try {
-    window.marlowe.playChime("listen");
+    window.marvin.playChime("listen");
     $("#ptt").classList.add("live");
     micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     if (micAborting) { teardownMic(); return; } // released during setup
-    const ctx = window.marlowe.audioCtx();
+    const ctx = window.marvin.audioCtx();
     await ctx.audioWorklet.addModule("/static/worklet.js");
     if (micAborting) { teardownMic(); return; } // released during setup
     const src = ctx.createMediaStreamSource(micStream);
@@ -165,7 +165,7 @@ async function startTalking() {
     drawWave();
   } catch (err) {
     teardownMic();
-    window.marlowe.setStatus("mic error — " + err.message);
+    window.marvin.setStatus("mic error — " + err.message);
     return;
   }
 }
@@ -195,7 +195,7 @@ function stopTalking() {
     // grace period would just leave the server holding a mic that never spoke.
     ws.close();
   }
-  window.marlowe.setStatus("thinking…");
+  window.marvin.setStatus("thinking…");
 }
 
 function drawWave() {
@@ -261,22 +261,22 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) endHoldOnLostFocus();
 });
 
-window.marlowe.onEvent("stt.interim", (d) => {
+window.marvin.onEvent("stt.interim", (d) => {
   const t = $("#transcript");
   t.classList.add("interim");
   t.textContent = d.text;
 });
-window.marlowe.onEvent("stt.utterance", (d) => {
+window.marvin.onEvent("stt.utterance", (d) => {
   $("#transcript").classList.remove("interim");
   $("#transcript").textContent = d.text;
-  window.marlowe.playChime("ack");
+  window.marvin.playChime("ack");
 });
-window.marlowe.onEvent("stt.error", (d) => {
-  window.marlowe.setStatus("couldn't hear you — " + (d.reason || "audio error"));
+window.marvin.onEvent("stt.error", (d) => {
+  window.marvin.setStatus("couldn't hear you — " + (d.reason || "audio error"));
   if (typeof playClip === "function") playClip("cannot_hear");
 });
 
-window.marlowe.onEvent("butler.answer", (d) => {
+window.marvin.onEvent("butler.answer", (d) => {
   $("#answer").textContent = d.display || "";
   const box = $("#citations");
   box.textContent = "";
@@ -286,21 +286,21 @@ window.marlowe.onEvent("butler.answer", (d) => {
     chip.textContent = name;
     box.appendChild(chip);
   });
-  window.marlowe.setStatus("online — hold to talk");
+  window.marvin.setStatus("online — hold to talk");
 });
-window.marlowe.onEvent("butler.error", (d) => {
+window.marvin.onEvent("butler.error", (d) => {
   // Clear the previous turn's answer AND its citation chips. Leaving them up
   // under an error line reads as if the stale answer belongs to the question
   // that just failed.
   $("#answer").textContent = "";
   $("#citations").textContent = "";
-  window.marlowe.setStatus("brain error — " + (d.reason || "unavailable"));
+  window.marvin.setStatus("brain error — " + (d.reason || "unavailable"));
 });
 // Metrics failures are NOT brain failures: a TurnLog hiccup on tts.done must
-// never blank a correct answer that Marlowe is still speaking. Status line only —
+// never blank a correct answer that Marvin is still speaking. Status line only —
 // no clearing of #answer / #citations.
-window.marlowe.onEvent("metrics.error", (d) => {
-  window.marlowe.setStatus("metrics: " + (d.reason || "unavailable"));
+window.marvin.onEvent("metrics.error", (d) => {
+  window.marvin.setStatus("metrics: " + (d.reason || "unavailable"));
 });
 
 // ---- /audio WebSocket → MediaSource playback ---------------------------
@@ -330,7 +330,7 @@ function connectAudio() {
     // FIRST — pause, revoke its object URL, and null the buffer immediately so no
     // in-flight chunk appends to the stale SourceBuffer — THEN build the new
     // MediaSource + Audio.
-    window.marlowe.onEvent("tts.start", () => {
+    window.marvin.onEvent("tts.start", () => {
       if (S.el) { S.el.pause(); URL.revokeObjectURL(S.el.src); }
       S.sb = null;
       S.queue = [];
@@ -359,7 +359,7 @@ function connectAudio() {
   connectAudio.ping = setInterval(() => ws.readyState === 1 && ws.send("ping"), 10000);
 }
 connectAudio();
-window.marlowe.onEvent("tts.done", () => window.marlowe.setStatus("online — hold to talk"));
+window.marvin.onEvent("tts.done", () => window.marvin.setStatus("online — hold to talk"));
 
 // ---- canned clips + metrics footer -------------------------------------
 let clipManifest = {};
@@ -376,25 +376,25 @@ function playClip(slug) {
 }
 
 // ---- M3: router / confirmation / registry / finance surfaces ------------
-window.marlowe.onEvent("confirm.request", (d) => {
+window.marvin.onEvent("confirm.request", (d) => {
   const box = $("#confirm");
   box.textContent = d.question || "";
   box.className = "asking";
 });
-window.marlowe.onEvent("confirm.result", (d) => {
+window.marvin.onEvent("confirm.result", (d) => {
   const box = $("#confirm");
   box.textContent = `${d.name}: ${d.outcome}`;
   box.className = "";
 });
-window.marlowe.onEvent("registry.updated", (d) => {
+window.marvin.onEvent("registry.updated", (d) => {
   $("#projects").textContent =
     `projects: ${d.confirmed} confirmed, ${d.pending} awaiting your yes`;
 });
-window.marlowe.onEvent("router.command", (d) => {
-  window.marlowe.setStatus(
+window.marvin.onEvent("router.command", (d) => {
+  window.marvin.setStatus(
     `command: ${d.verb}${d.project ? " → " + d.project : ""}`);
 });
-window.marlowe.onEvent("finance.brief", (d) => {
+window.marvin.onEvent("finance.brief", (d) => {
   const box = $("#finance");
   box.textContent = "";
   (d.rows || []).forEach((row) => {
@@ -412,8 +412,8 @@ window.marlowe.onEvent("finance.brief", (d) => {
   }
 });
 
-window.marlowe.onEvent("stt.utterance", () => playClip("got_it"));
-window.marlowe.onEvent("metrics.turn", (m) => {
+window.marvin.onEvent("stt.utterance", () => playClip("got_it"));
+window.marvin.onEvent("metrics.turn", (m) => {
   $("#metrics").textContent =
     `turns ${m.turns} · release→final p50 ${m.release_to_final_p50}ms ` +
     `p95 ${m.release_to_final_p95}ms · final→audio p50 ${m.final_to_audio_p50}ms ` +
@@ -445,9 +445,9 @@ function renderFleetTile(d) {
       // A refused request RESOLVES — the .catch below only ever sees a network
       // failure — so without this a 401 from an expired session (or a 400)
       // produces no feedback at all and the click looks ignored.
-      if (!r.ok) window.marlowe.setStatus(
+      if (!r.ok) window.marvin.setStatus(
         `handoff refused — HTTP ${r.status}; reload the console and retry`);
-    }).catch(() => window.marlowe.setStatus(
+    }).catch(() => window.marvin.setStatus(
       "handoff failed to send — try again")));
     tile.appendChild(handoff);
     $("#fleet").appendChild(tile);
@@ -477,30 +477,30 @@ function renderFleetTile(d) {
   if (d.command) tile.querySelector(".tile-resume").textContent = d.command;
   return tile;
 }
-window.marlowe.onEvent("fleet.update", renderFleetTile);
-window.marlowe.onEvent("fleet.message", (d) => {
-  window.marlowe.setStatus(`${d.project}: working…`);
+window.marvin.onEvent("fleet.update", renderFleetTile);
+window.marvin.onEvent("fleet.message", (d) => {
+  window.marvin.setStatus(`${d.project}: working…`);
 });
-window.marlowe.onEvent("fleet.error", (d) => {
-  window.marlowe.setStatus("fleet: " + (d.reason || "error"));
+window.marvin.onEvent("fleet.error", (d) => {
+  window.marvin.setStatus("fleet: " + (d.reason || "error"));
 });
-// A session Marlowe does not own POSTed a hook. Console only — never spoken:
+// A session Marvin does not own POSTed a hook. Console only — never spoken:
 // it is not a worker of ours dying, and a misconfigured worktree could emit
 // these in a stream.
-window.marlowe.onEvent("fleet.unknown_session", (d) => {
-  window.marlowe.setStatus(
+window.marvin.onEvent("fleet.unknown_session", (d) => {
+  window.marvin.setStatus(
     `unowned session: ${d.event || "hook"} from ${d.cwd || "?"}`);
 });
-window.marlowe.onEvent("fleet.transcript", (d) => {
+window.marvin.onEvent("fleet.transcript", (d) => {
   // #worker-transcript, NOT #transcript: that id is the live STT pane, and a
   // duplicate id would route these lines there (querySelector's first match).
   $("#worker-transcript").textContent = (d.lines || [])
     .map((l) => `${l.who}: ${l.text}`).join("\n\n");
 });
-window.marlowe.onEvent("fleet.handoff", (d) => {
-  window.marlowe.setStatus(`handed off: ${d.command}`);
+window.marvin.onEvent("fleet.handoff", (d) => {
+  window.marvin.setStatus(`handed off: ${d.command}`);
   // #status is wiped back to "online — hold to talk" by the tts.done handler,
-  // which fires the moment Marlowe finishes saying "run the command on screen"
+  // which fires the moment Marvin finishes saying "run the command on screen"
   // — and when osascript failed, that line is the ONLY copy of the command
   // Keke has. Park it on the worker's own tile, which nothing clears. The
   // tile already exists (fleet.update for DETACHED is published first, on the
@@ -534,7 +534,7 @@ function renderApproval(d) {
   note.textContent = [d.risk, d.outside].filter(Boolean).join(" ");
   // The full, UNELIDED argument. Speech cuts the middle out of a long shell
   // line — the elided middle of a real 347-character command was an `rm -rf`
-  // on the vault — so this is the only surface in Marlowe that shows the exact
+  // on the vault — so this is the only surface in Marvin that shows the exact
   // thing being approved. Falls back to the spoken form for older payloads.
   const full = document.createElement("pre");
   full.className = "interrupt-args";
@@ -549,7 +549,7 @@ function renderApproval(d) {
     // A network failure correctly KEEPS the card (the nonce is still live and
     // the click can be retried) — but without a catch it is also an unhandled
     // rejection. Say what happened instead.
-    .catch(() => window.marlowe.setStatus(
+    .catch(() => window.marvin.setStatus(
       `approval ${decision} failed to send: ${d.project} — try again`));
   const yes = document.createElement("button");
   yes.textContent = "Approve";
@@ -561,18 +561,18 @@ function renderApproval(d) {
   $("#interrupts").appendChild(card);
   return card;
 }
-window.marlowe.onEvent("approval.request", renderApproval);
-window.marlowe.onEvent("approval.resolved", (d) => {
+window.marvin.onEvent("approval.request", renderApproval);
+window.marvin.onEvent("approval.resolved", (d) => {
   // EVERY outcome removes the card — approved, denied, expired, cancelled,
   // and anything a later task adds. An unknown outcome must never leave a
   // stale card a click could still try to redeem.
   document.querySelectorAll(`#interrupts .interrupt[data-nonce="${d.nonce}"]`)
     .forEach((el) => el.remove());
-  window.marlowe.setStatus(`approval ${d.outcome}: ${d.project}`);
+  window.marvin.setStatus(`approval ${d.outcome}: ${d.project}`);
 });
 
 // ---- what the fleet leaves behind ---------------------------------------
-// Every task ever run leaves a disposable worktree and a marlowe/* branch, on
+// Every task ever run leaves a disposable worktree and a marvin/* branch, on
 // purpose — the worktree holds a diff a human may still want to merge back —
 // and until this pane there was no way to see the pile. Read-only: removal is
 // a SPOKEN instruction, never a click, so there is no button here to
@@ -655,7 +655,7 @@ function renderWorktrees(d) {
 // The voice verb publishes the same payload it spoke, so the screen and the
 // sentence describe one survey. Idempotent — a full repaint, so the SSE event
 // and a concurrent fetch cannot double-paint.
-window.marlowe.onEvent("worktrees.survey", renderWorktrees);
+window.marvin.onEvent("worktrees.survey", renderWorktrees);
 
 function refreshWorktrees() {
   fetch("/worktrees").then((r) => r.json()).then(renderWorktrees).catch(() => {});

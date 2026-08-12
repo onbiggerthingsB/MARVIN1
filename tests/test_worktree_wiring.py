@@ -197,7 +197,7 @@ async def test_no_affirmation_anywhere_can_remove_a_worktree(said):
 
 
 async def test_a_yes_right_after_a_survey_still_removes_nothing():
-    # The realistic shape of the accident: Marlowe reads the survey, Keke says
+    # The realistic shape of the accident: Marvin reads the survey, Keke says
     # "yes". Nothing removable follows from that — the gate is never consulted,
     # and the utterance goes on to be ordinary conversation.
     bus, butler, spk, cleanup = EventBus(), FakeButler(), FakeSpeaker(), FakeCleanup()

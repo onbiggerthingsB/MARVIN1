@@ -1,6 +1,6 @@
 """Read-only briefing over Keke's own stock system.
 
-Spec §16: Marlowe is an ADVISOR SURFACE, never an execution path. There is no
+Spec §16: Marvin is an ADVISOR SURFACE, never an execution path. There is no
 function here that can place, modify or cancel an order, and no brokerage
 credential is read, stored or transmitted. Voice is the worst possible surface
 for an irreversible money action (mishearing plus no undo), and an execution

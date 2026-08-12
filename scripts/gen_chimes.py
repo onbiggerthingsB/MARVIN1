@@ -1,4 +1,4 @@
-"""Generate the three Marlowe chimes as WAV files. Stdlib only, deterministic."""
+"""Generate the three Marvin chimes as WAV files. Stdlib only, deterministic."""
 import math
 import struct
 import wave
