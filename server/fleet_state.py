@@ -7,6 +7,19 @@ Two traps this module exists to encode:
      so silence derives QUIET (a display state, base untouched), and only a
      FAILED health probe may escalate to UNKNOWN.
 
+And one deliberate exception: CLOSED is final for every event EXCEPT
+`detached`. A handoff MUST end the SDK session — close the subprocess, verify
+exit — before it may hand the resume command over, and a real CLI announces
+that very exit through its own SessionEnd hook, which lands `session_end`
+here while the teardown is still in flight (observed 3-for-3 live:
+state/fleet.jsonl seq 55-60). So for a real worker CLOSED is the EXPECTED
+state at the moment of detaching, not a contradiction of it: the transcript
+on disk is exactly what `claude --resume` drives, and detaching a closed
+session hands over the FIRST driver, not a second. The only writer of
+`detached` is Fleet.handoff, after its verified lockout — everything else
+still bounces off CLOSED, so a late activity hook can never resurrect a
+stopped worker.
+
 Both detection layers — the owned SDK stream and the HTTP hook dispatcher —
 feed the same machine through the small event-kind vocabulary below, which is
 also the FleetLog kind vocabulary, so the durable log reads as a state history.
@@ -47,7 +60,7 @@ class WorkerStateMachine:
         target = _EVENT_STATE.get(kind)
         if target is None:
             return self.state(now)    # unknown kinds must never corrupt the machine
-        if self.base == CLOSED:
+        if self.base == CLOSED and target != DETACHED:
             return self.state(now)    # closed is final; late hooks bounce off
         if self.base == DETACHED and target != CLOSED:
             return self.state(now)    # another driver owns it; only its end matters

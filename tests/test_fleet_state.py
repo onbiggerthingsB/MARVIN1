@@ -52,7 +52,29 @@ def test_closed_is_final():
     m = WorkerStateMachine()
     m.apply("session_end", 0.0)
     assert m.apply("activity", 1.0) == CLOSED        # late hook deliveries bounce off
+    assert m.apply("prompt", 1.5) == CLOSED
+    assert m.apply("spawned", 1.6) == CLOSED
     assert m.probe_failed(2.0) == CLOSED
+
+
+def test_detached_is_the_one_event_closed_admits():
+    """The deliberate exception to closed-is-final. A handoff MUST end the SDK
+    session before handing the resume command over, and the real CLI announces
+    that exit through its own SessionEnd hook — so for a real worker CLOSED is
+    the EXPECTED state at the moment of detaching (observed 3-for-3 live,
+    state/fleet.jsonl seq 55-60). An ended session's transcript is exactly what
+    `claude --resume` drives: detaching it hands over the FIRST driver, not a
+    second. The only writer of `detached` is Fleet.handoff, after its verified
+    lockout — and once DETACHED, session_end (the terminal session's own end)
+    still closes it."""
+    m = WorkerStateMachine()
+    m.apply("permission_wait", 0.0)
+    m.apply("permission_done", 1.0)                  # the teardown's rejection
+    m.apply("session_end", 2.0)                      # the exiting CLI's hook
+    assert m.base == CLOSED
+    assert m.apply("detached", 3.0) == DETACHED      # the live defect, un-bounced
+    assert m.apply("activity", 4.0) == DETACHED      # terminal hooks still bounce
+    assert m.apply("session_end", 5.0) == CLOSED     # the terminal session ended
 
 
 def test_detached_ignores_everything_but_session_end():
