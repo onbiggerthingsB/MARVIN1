@@ -17,7 +17,7 @@ feeling that it went well.
 **1. Preflight.** Read-only; it starts nothing and spawns nothing.
 
 ```
-cd ~/marlowe && uv run python scripts/gate_preflight.py
+cd ~/marvin && uv run python scripts/gate_preflight.py
 ```
 
 Fix every numbered blocker it prints before going on. It knows about the proxy
@@ -28,7 +28,7 @@ access log beat 7 needs, and the suite.
 **2. Observer, in a second terminal.** Leave it running for the whole demo.
 
 ```
-cd ~/marlowe && uv run python scripts/gate_observer.py
+cd ~/marvin && uv run python scripts/gate_observer.py
 ```
 
 It tails `state/fleet.jsonl`, `state/server.log` and `config/projects.json`,
@@ -123,7 +123,7 @@ a missing comma is the usual cause, and it is worth a note either way.
 **Expect to hear:** "On it, sir — `<project>`, in a fresh worktree."
 
 **Expect to see:** a new tile, and a fresh directory under
-`~/marlowe/state/worktrees/`.
+`~/marvin/state/worktrees/`.
 
 **Observer:**
 

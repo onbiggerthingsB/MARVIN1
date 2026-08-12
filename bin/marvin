@@ -1,8 +1,7 @@
 #!/bin/bash
 # Marvin launcher: start server if down, open the console, send /wake.
 set -euo pipefail
-# TODO: becomes $HOME/marvin when the directory moves
-MARVIN_DIR="$HOME/marlowe"
+MARVIN_DIR="$HOME/marvin"
 cd "$MARVIN_DIR"
 [ -f .env ] && set -a && source .env && set +a
 

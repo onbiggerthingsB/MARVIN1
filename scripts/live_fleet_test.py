@@ -1,6 +1,6 @@
 """Live fleet smoke: a REAL worker on a throwaway repo, through the real SDK.
 
-Run:      cd ~/marlowe && uv run python scripts/live_fleet_test.py
+Run:      cd ~/marvin && uv run python scripts/live_fleet_test.py
 Needs:    working claude auth (subscription or ANTHROPIC_API_KEY), and this
           machine's proxy env (HTTPS_PROXY/HTTP_PROXY + NO_PROXY=localhost,127.0.0.1).
 Note:     the worktree's hook curls target 127.0.0.1:7777 with an EMPTY bearer,

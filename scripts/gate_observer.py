@@ -1,6 +1,6 @@
 """M3P2 milestone gate — the evidence observer.
 
-Run:   cd ~/marlowe && uv run python scripts/gate_observer.py
+Run:   cd ~/marvin && uv run python scripts/gate_observer.py
        (second terminal, started BEFORE `marvin`)
 Then:  perform scripts/gate_checklist.md at the microphone. Ctrl-C at the end.
 Also:  `--once` reads the logs that already exist, prints the same transcript

@@ -3,7 +3,7 @@ handed to a real second driver — the beat the shipped feature failed 3-for-3
 (state/fleet.jsonl seq 55-60: `session_end` from the exiting CLI's own hook
 landed before `_apply("detached")`, which bounced off CLOSED).
 
-Run:      cd ~/marlowe && uv run python scripts/live_handoff_test.py
+Run:      cd ~/marvin && uv run python scripts/live_handoff_test.py
           add --real-terminal to launch Terminal.app via the default
           osascript launcher instead of the recorder (leaves a window open
           driving the session; the script then does NOT resume headlessly —
