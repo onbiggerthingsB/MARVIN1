@@ -394,12 +394,35 @@ class Correlator:
         out.append(f"#{seq} {kind:<15} {wid} {project} -> {state}")
 
         if kind == "spawned":
+            # A `spawned` record is NOT a spawn that took — the same shape as
+            # the `detached` case below. Fleet._spawn registers the worker
+            # BEFORE it awaits start(), so the CLI's own hooks can already
+            # address it by worktree `cwd` while connect() is still running;
+            # a SessionEnd landing in that window drives the machine to
+            # CLOSED, and WorkerStateMachine.apply bounces every later event
+            # off a final CLOSED without raising. `_apply("spawned")` then
+            # writes a `spawned` record whose resulting `state` is CLOSED,
+            # and _spawn's torn_down branch answers "was stopped while it was
+            # starting, sir — nothing is running there" — so the "On it…
+            # fresh worktree" sentence beat 2 IS never spoken. CLOSED and
+            # DETACHED are the only two states apply() bounces off, so a
+            # record carrying either is the machine's own verdict that the
+            # spawn did not land; anything else means it moved the machine.
             wt = data.get("worktree", "?")
             base = str(data.get("base_commit", ""))[:7]
             branch = data.get("branch", "?")
             out.append(f"    worktree {wt}")
             out.append(f"    branch   {branch} @ {base}")
-            self._note(out, 2, f"spawned {project} into {wt} ({branch})")
+            if state in (CLOSED, DETACHED):
+                self.deviate(out, f"a `spawned` record for {project} landed "
+                                  f"with state {state} — the state machine "
+                                  f"bounced the spawn, the session was gone "
+                                  f"before it started, Keke heard \"stopped "
+                                  f"while it was starting\" and NOT \"On it… "
+                                  f"fresh worktree\", and this record is NOT "
+                                  f"beat 2 evidence")
+            else:
+                self._note(out, 2, f"spawned {project} into {wt} ({branch})")
         elif kind == "permission_wait":
             # Not beat-3 evidence YET: beat 3 is "approved BY VOICE", and a
             # card that ends in a denial, a cancellation or an unanswered TTL

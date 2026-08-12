@@ -180,6 +180,53 @@ def test_spawn_record_is_beat_2():
     assert board.evidence[2] and not board.evidence[7]
 
 
+def test_a_spawned_record_bounced_off_closed_is_not_beat_2():
+    """The fifth false-credit, of the same shape as the fourth. A worker is
+    registered — and therefore hook-addressable by its worktree `cwd` — BEFORE
+    start() runs, so the CLI's own SessionEnd POST can land while connect() is
+    still awaited. That drives the machine to CLOSED, and
+    WorkerStateMachine.apply bounces every later event off a final CLOSED
+    without raising: `_apply("spawned")` then writes a `spawned` record whose
+    resulting state is CLOSED, and `_apply("prompt")` bounces the same way.
+    _spawn's torn_down branch answers "was stopped while it was starting, sir
+    — nothing is running there", so the "On it… fresh worktree" sentence beat
+    2 is about was never spoken. The record's own `state` field is the
+    machine's verdict at the instant of the write, so gating on it here needs
+    no retraction."""
+    board, corr = board_and_correlator()
+    corr.on_fleet_record(rec("session_end", {
+        "worker": "w1", "project": "probe", "path": "/p", "state": "CLOSED",
+        "worktree": "/wt/1"}, 11))
+    corr.on_fleet_record(rec("spawned", {
+        "worker": "w1", "project": "probe", "path": "/p", "state": "CLOSED",
+        "worktree": "/wt/1", "branch": "marlowe/probe-1",
+        "base_commit": "abc1234def"}, 12))
+    corr.on_fleet_record(rec("prompt", {
+        "worker": "w1", "project": "probe", "path": "/p", "state": "CLOSED",
+        "worktree": "/wt/1"}, 13))
+    assert not board.evidence[2]               # the spawn did NOT take
+    assert any("NOT beat 2" in d for d in corr.deviations)
+    text = "\n".join(board.summary_lines())
+    assert "[NONE    ] 2." in text
+
+
+def test_a_genuine_spawn_after_a_bounced_one_still_credits_beat_2():
+    """The mirror guard: refusing the bounced record must not poison a later
+    spawn that verifiably took. A spawn that reaches the machine leaves
+    IDLE_AT_PROMPT — anything but the two states apply() bounces off."""
+    board, corr = board_and_correlator()
+    corr.on_fleet_record(rec("spawned", {
+        "worker": "w1", "project": "probe", "state": "CLOSED",
+        "worktree": "/wt/1", "branch": "marlowe/probe-1"}, 12))
+    corr.on_fleet_record(rec("spawned", {
+        "worker": "w2", "project": "alethic", "state": "IDLE_AT_PROMPT",
+        "worktree": "/wt/2", "branch": "marlowe/x-1",
+        "base_commit": "def5678"}, 20))
+    assert board.evidence[2]
+    assert any("alethic" in row for row in board.evidence[2])
+    assert len(corr.deviations) == 1           # only the bounced one
+
+
 def test_approval_pair_is_beat_3():
     """A GRANTED approval credits beat 3 with both halves: the card that was
     raised and the grant that resolved it. The fixture carries exactly what
