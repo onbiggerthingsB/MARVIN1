@@ -277,6 +277,67 @@ def test_a_detach_with_no_session_id_is_a_deviation():
     assert any("session id" in d for d in corr.deviations)
 
 
+def test_a_detached_record_bounced_off_closed_is_not_beat_6():
+    """The fourth false-credit, found live at 15:22:42: the worker finished at
+    the instant the handoff was in flight, the session went CLOSED, and
+    WorkerStateMachine.apply bounced the `detached` step — so the record
+    EXISTS but its resulting state is CLOSED, and Fleet.handoff refused (no
+    resume command, no Terminal). This is the real four-record sequence from
+    that fleet log. The record's own `state` field is the machine's verdict
+    at the instant of the write, so gating on it needs no retraction when
+    `handoff_failed` lands one record later."""
+    board, corr = board_and_correlator()
+    corr.on_fleet_record(rec("session_end", {
+        "worker": "w1", "project": "probe", "state": "CLOSED"}, 19))
+    corr.on_fleet_record(rec("detached", {
+        "worker": "w1", "project": "probe", "state": "CLOSED",
+        "session_id": "0c0d125d-4c9etc"}, 20))
+    corr.on_fleet_record(rec("lost", {
+        "worker": "w1", "project": "probe", "state": "CLOSED",
+        "reason": "handoff failed: the session went CLOSED mid-handoff"}, 21))
+    corr.on_fleet_record(rec("handoff_failed", {
+        "worker": "w1", "path": "/p",
+        "reason": "the session went CLOSED mid-handoff"}, 22))
+    assert not board.evidence[6]               # the handoff did NOT take
+    assert any("NOT beat 6" in d for d in corr.deviations)
+    text = "\n".join(board.summary_lines())
+    assert "[NONE    ] 6." in text
+
+
+def test_a_bounced_detach_never_arms_beat_7():
+    """The same defective branch armed BOTH of beat 7's lanes: it set
+    first_detach_ts (lane A credits every later POST /hooks as 'after the
+    detach') and registered the worker in corr.detached (lane B's gate).
+    A detach that never took must arm neither."""
+    board, corr = board_and_correlator()
+    corr.on_fleet_record(rec("detached", {
+        "worker": "w1", "project": "probe", "state": "CLOSED",
+        "session_id": "0c0d125d-4c9etc"}, 20))
+    assert corr.first_detach_ts is None
+    assert "w1" not in corr.detached
+    # a hook POST and a fleet record after the bounced detach credit nothing
+    corr.on_server_line('INFO: - "POST /hooks HTTP/1.1" 200 OK', time.time())
+    corr.on_fleet_record(rec("activity", {"worker": "w1", "project": "probe",
+                                          "state": "CLOSED"}, 23))
+    assert corr.hooks_after_detach == 0
+    assert not board.evidence[7]
+
+
+def test_a_genuine_detach_after_a_bounced_one_still_credits_beat_6():
+    """The mirror guard: refusing the bounced record must not poison a later
+    handoff that verifiably took (resulting state DETACHED)."""
+    board, corr = board_and_correlator()
+    corr.on_fleet_record(rec("detached", {
+        "worker": "w1", "project": "probe", "state": "CLOSED",
+        "session_id": "0c0d125d-4c9etc"}, 20))
+    corr.on_fleet_record(rec("detached", {
+        "worker": "w2", "project": "alethic", "state": DETACHED,
+        "session_id": "sess-abcdef123456"}, 30))
+    assert board.evidence[6]
+    assert "w2" in corr.detached and "w1" not in corr.detached
+    assert corr.first_detach_ts is not None
+
+
 def test_records_reaching_a_detached_worker_are_beat_7():
     """The whole point of beat 7: after the handoff Marlowe holds no stream for
     that session, so only a /hooks POST can still move the tile."""

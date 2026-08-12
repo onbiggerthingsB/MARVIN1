@@ -434,15 +434,36 @@ class Correlator:
             self._note(out, 3, f"{project} finished a turn after the "
                                f"approval (seq {seq})")
         elif kind == "detached":
+            # A `detached` record is NOT a detach. Fleet.handoff applies the
+            # step and only THEN verifies it took — WorkerStateMachine.apply
+            # bounces every event but session_end off a final CLOSED without
+            # raising — so a worker that closed mid-handoff still leaves a
+            # `detached` record whose resulting `state` is CLOSED, followed
+            # one record later by `handoff_failed` (no resume command, no
+            # Terminal). The record's own `state` field IS the machine's
+            # verdict at the instant of the write — the same fold the handoff
+            # checks — so gating on it here needs no retraction when the
+            # failure record arrives, and a genuine handoff (state DETACHED)
+            # still credits on its own record.
             sid = str(data.get("session_id", "") or "")
-            self.detached[wid] = {"session_id": sid, "ts": rec.get("ts", 0.0)}
-            if self.first_detach_ts is None:
-                self.first_detach_ts = float(rec.get("ts") or 0.0)
-            out.append(f"    session  {sid or '(none recorded!)'}")
-            self._note(out, 6, f"{project} DETACHED, session {sid[:12] or '?'}")
-            if not sid:
-                self.deviate(out, "a `detached` record carried NO session id — "
-                                  "beat 6's `claude --resume` cannot work")
+            if state != DETACHED:
+                self.deviate(out, f"a `detached` record for {project} landed "
+                                  f"with state {state}, not DETACHED — the "
+                                  f"state machine bounced the detach, the "
+                                  f"handoff did NOT take, and this record is "
+                                  f"NOT beat 6 evidence")
+            else:
+                self.detached[wid] = {"session_id": sid,
+                                      "ts": rec.get("ts", 0.0)}
+                if self.first_detach_ts is None:
+                    self.first_detach_ts = float(rec.get("ts") or 0.0)
+                out.append(f"    session  {sid or '(none recorded!)'}")
+                self._note(out, 6,
+                           f"{project} DETACHED, session {sid[:12] or '?'}")
+                if not sid:
+                    self.deviate(out, "a `detached` record carried NO session "
+                                      "id — beat 6's `claude --resume` cannot "
+                                      "work")
         elif kind in ("handoff_failed", "lost"):
             reason = data.get("reason", "")
             self.deviate(out, f"{kind} for {project}: {reason}")
