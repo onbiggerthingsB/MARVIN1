@@ -62,6 +62,34 @@ _DISCOVER = re.compile(
     r"(?:\s+(?:my|all|the))*"
     r"\s+(?:projects?|repos?|repositor(?:y|ies))"
     r"(?:\s+again)?\s*[.!?]*\s*$", re.I)
+# The way OUT of the confirmation chain (live demo defect, 2026-08-12: 69
+# discovered repos, one spoken confirm each, and the only exits were answering
+# every one). _DISCOVER's counterpart: that verb re-opens the chain, this one
+# puts it down. PAUSES, never rejects — 59 repos must not be disposed of on
+# one utterance; the candidates stay pending and "find my projects" resumes.
+#
+# Same shape discipline as _DISCOVER and the worktree verbs: anchored on the
+# whole utterance over a closed vocabulary, so ordinary conversation that
+# merely contains these words ("we should stop asking users for feedback",
+# "later tonight remind me to stretch") leaves unaccounted words and matches
+# nothing. Deliberately EXCLUDED: any phrasing opening with onboarding's
+# rejection vocabulary ("no more questions", "skip the rest") — the pending
+# repo question owns those openers as a rejection of THAT candidate, and a
+# family member it can swallow would sometimes reject instead of pausing.
+# "that's it" is likewise left to onboarding's _YES, where it already means
+# "yes, that's the repo".
+_ONBOARD_PAUSE = re.compile(
+    r"^\s*(?:"
+    r"(?:stop|quit)\s+asking(?:\s+me)?"
+    r"(?:\s+about\s+(?:the\s+)?(?:repos?|projects?|them|these|those))?"
+    r"(?:\s+for\s+now)?"
+    r"|that'?s\s+(?:enough|all)(?:\s+for\s+now)?(?:\s+questions?)?"
+    r"|enough(?:\s+questions?|\s+for\s+now|\s+of\s+(?:that|this|these|those))?"
+    r"|not\s+now"
+    r"|(?:maybe\s+)?later"
+    r"|ask\s+(?:me\s+)?later"
+    r"|the\s+rest\s+can\s+wait"
+    r")\s*[.!?,]*\s*$", re.I)
 # Worktree housekeeping. THREE verbs, and not one of them is a yes.
 #
 # Every task ever run leaves a disposable worktree and a `marvin/*` branch
@@ -528,6 +556,16 @@ class Router:
         # them would be swallowed silently rather than mis-routed loudly.
         if _DISCOVER.match(text):
             return Command(verb="discover")
+
+        # The chain's exit, placed with the same argument as _DISCOVER: it must
+        # run BEFORE the project-resolving verbs because _STOP returns None the
+        # moment its project fails to resolve — "stop asking" would match _STOP
+        # (project "asking"), resolve nothing, and be swallowed silently. First
+        # position also means a project literally named "asking" cannot make
+        # this sentence ambiguous: the anchored closed vocabulary wins,
+        # deterministically.
+        if _ONBOARD_PAUSE.match(text):
+            return Command(verb="onboard_pause")
 
         # Same placement argument as _DISCOVER, and the same shape: anchored on
         # the whole utterance, closed vocabulary, no project to resolve. Checked

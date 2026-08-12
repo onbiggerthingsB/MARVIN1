@@ -1139,3 +1139,79 @@ def test_a_trade_never_earns_a_hint():
     # if a caller asks out of order.
     assert Router().spawn_hint("begin work on buy 10 shares of NVDA",
                                demo_registry()) is None
+
+
+# ---------- the onboarding pause verb (live demo defect, 2026-08-12) --------
+# 69 discovered repos, one confirm question each, and no spoken way out: the
+# only exits were answering all of them. The pause verb is that way out —
+# deterministic, anchored on a closed vocabulary, never model-parsed.
+
+PAUSE_PHRASES = [
+    "stop asking", "Stop asking.", "stop asking me",
+    "stop asking about the repos", "stop asking about projects",
+    "quit asking", "stop asking for now",
+    "that's enough", "that's enough for now", "that's all", "that's all for now",
+    "enough", "enough questions", "enough for now", "enough of that",
+    "not now", "later", "maybe later", "ask me later", "the rest can wait",
+]
+
+
+@pytest.mark.parametrize("said", PAUSE_PHRASES)
+def test_pause_phrases_parse_deterministically(said):
+    c = Router().parse(said, reg("soccer"))
+    assert c is not None and c.verb == "onboard_pause", said
+
+
+@pytest.mark.parametrize("said", [
+    # ordinary conversation that merely CONTAINS the vocabulary must fall
+    # through — the same "explain every word or do nothing" rule as _DISCOVER
+    "what's stopping the deploy",
+    "we should stop asking users for feedback",
+    "later tonight remind me to stretch",
+    "I've had enough of the bugs in soccer",
+    "the rest can wait until tomorrow",
+    "that's enough soccer for today",
+    "is that enough coverage?",
+])
+def test_pause_never_fires_on_ordinary_conversation(said):
+    c = Router().parse(said, reg("soccer"))
+    assert c is None or c.verb != "onboard_pause", said
+
+
+@pytest.mark.parametrize("said,verb", [
+    # every existing verb keeps its utterance — the pause verb steals nothing
+    ("start work in soccer: fix the tests", "spawn"),
+    ("tell soccer to run the tests", "steer"),
+    ("pull up soccer", "pull_up"),
+    ("stop soccer", "stop"),
+    ("note that later is better than never", "capture"),
+    ("find my projects", "discover"),
+    ("how's the market", "portfolio"),
+    ("sell everything later", "refuse_trade"),
+    ("clean up the worktrees", "worktree_survey"),
+    ("clear out the empty worktrees", "worktree_remove_empty"),
+    ("remove the worktree for soccer", "worktree_remove_named"),
+])
+def test_pause_steals_no_existing_verb(said, verb):
+    assert Router().parse(said, reg("soccer")).verb == verb, said
+
+
+@pytest.mark.parametrize("said,verb", [
+    ("what's running right now?", "status"),
+    ("pull it up", "pull_up"),
+])
+def test_pause_steals_no_fleet_verb(said, verb):
+    assert Router().parse(said, reg("soccer"), has_fleet=True).verb == verb, said
+
+
+def test_a_pause_phrase_is_never_an_approval_answer():
+    # "stop asking" opens with a deny word, so before the pause verb existed it
+    # could reach resolve_approval. It must resolve nothing in either spoken
+    # state: it answers no question, it puts one down.
+    r = Router()
+    a = r.open_approval("soccer", "npm test", now=NOW)     # unspoken
+    assert r.resolve_approval("stop asking", NOW + 1)[0] in ("none", "unspoken")
+    r.mark_spoken(a.nonce)
+    state, appr = r.resolve_approval("stop asking", NOW + 2)
+    assert appr is None and state not in ("approved", "denied")
+    assert len(r.pending_approvals()) == 1
