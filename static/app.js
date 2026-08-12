@@ -1,3 +1,5 @@
+import { makeFrameSink } from "/static/micbuffer.js";
+
 const $ = (sel) => document.querySelector(sel);
 const handlers = new Map();
 let audioCtx = null;
@@ -149,13 +151,30 @@ async function startTalking() {
     const ws = new WebSocket(`ws://${location.host}/mic`);
     micWS = ws;
     ws.binaryType = "arraybuffer";
+    // The worklet starts posting frames NOW, while the socket is still
+    // CONNECTING. The old code attached this handler only inside ws.onopen,
+    // which left the early frames to the browser's implicit MessagePort
+    // queue — unbounded, browser-dependent, and pure luck that they arrived
+    // after readyState hit 1 instead of dying on the old handler's readyState
+    // guard. Attach the handler immediately and route every frame through a
+    // bounded, ordered sink instead: CONNECTING buffers (capped — see
+    // micbuffer.js), OPEN sends with any backlog flushed first, later states
+    // discard. The sink is per-press closure state, so an abandoned press's
+    // buffered audio is dropped with the press — it can never flush into the
+    // next session.
+    const sink = makeFrameSink();
+    micNode.port.onmessage = (e) => {
+      if (micWS !== ws) return;                 // press ended or superseded
+      sink.frame(ws.readyState, e.data, (f) => ws.send(f));
+    };
     ws.onopen = () => {
       if (micWS !== ws) { ws.close(); return; } // released while CONNECTING
       ws.send(JSON.stringify({ type: "start", encoding: "linear16",
         sample_rate: 16000, channels: 1, t_hold: Date.now() }));
-      micNode.port.onmessage = (e) => {
-        if (micWS === ws && ws.readyState === 1) ws.send(e.data);
-      };
+      // Everything spoken during the handshake goes out here, in capture
+      // order, BEFORE any live frame — and after the `start` frame above,
+      // which must stay first on the wire.
+      sink.flush((f) => ws.send(f));
     };
     // An abnormal close used to leave micWS pointing at a dead socket, and
     // every later press returned at the guard above — hold-to-talk simply
