@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import time
 
@@ -32,6 +33,42 @@ class NobodyListening(RuntimeError):
     publishes social.error. The reply is DROPPED with that published record,
     never queued: a queue replayed at reconnect is the talking-to-an-empty-
     room defect again, just deferred to a moment nobody asked for.
+    """
+
+
+class SpeechNotDelivered(RuntimeError):
+    """Speech STARTED but did not verifiably reach a connected console.
+
+    NobodyListening's after-the-fact sibling, raised once the utterance is
+    over — after tts.done goes out carrying an `interrupted` field that names
+    the reason — because "speak() did not raise" used to be the success
+    signal, and both engines returned normally for speech nobody could have
+    heard. That false signal was the ninth consent fail-open: interrupt()
+    killed `say` mid-word on the last console leaving, proc.wait() returned
+    like a clean finish, the brain's _speak() said True, and the approval
+    readback was marked spoken — so a later bare "yes" delivered a
+    destructive tool whose sentence was never voiced.
+
+    What each engine now requires before speak() returns without this raise:
+      * `say`   — the subprocess was not cut (no _say_cut), exited 0 (a kill
+                  is -9, and `say` reports its own failures via the exit
+                  code), and a console was still connected when it finished
+                  (re-read AFTER speech: interrupt() cannot cut a process
+                  that ended in the same instant the last console left).
+      * eleven  — the stream carried at least one audio chunk, ended with
+                  isFinal (a clean socket close mid-utterance is not a
+                  finish), every chunk was handed to a non-empty room
+                  (latched: a console returning mid-stream missed the
+                  start), the per-console sends were drained, and the room
+                  was still occupied after that drain.
+
+    What the ABSENCE of this raise still cannot prove: that a human heard
+    anything. `say` plays through the machine's own speakers next to a
+    connected console; ElevenLabs bytes accepted by an open /audio socket
+    may still sit unplayed in a browser buffer when the tab dies a moment
+    later. No software closes that last gap — the consent design leans on
+    the approval TTL and the console card, which ignore `spoken`, exactly
+    for this reason.
     """
 
 
@@ -165,6 +202,7 @@ class SpeakEngine:
         proc = await asyncio.create_subprocess_exec("say", "-v", "Daniel", text)
         self._say_proc, self._say_cut = proc, ""
         t0 = time.time()
+        rc = None
         try:
             # The presence gate ran before this subprocess existed, so a
             # console that left in that window was told "nothing to cut".
@@ -172,7 +210,7 @@ class SpeakEngine:
             # covers every later moment.
             if self._listening is not None and not self._listening():
                 self.interrupt()
-            await proc.wait()
+            rc = await proc.wait()
         except asyncio.CancelledError:
             # a speak timeout must not leave `say` talking over the next turn
             try:
@@ -182,12 +220,33 @@ class SpeakEngine:
             raise
         finally:
             self._say_proc = None
-        done = {"t_first_audio": t0, "engine": "say"}
+        # The success signal, decided from evidence rather than from "wait()
+        # did not raise": wait() returns normally after a kill, so a readback
+        # cut mid-word used to be indistinguishable from a delivered one —
+        # the ninth fail-open. Precedence: the recorded cut names the event
+        # most honestly; the exit code catches both the kill it implies and
+        # `say`'s own failures (unknown voice, dead audio device — nonzero,
+        # never checked before); the room is then re-read AFTER speech, with
+        # no grace, for the one sliver the disconnect hook cannot see —
+        # interrupt() finding the process already finished in the same
+        # instant the last console left records nothing. Fail closed on an
+        # unknown exit (rc None).
         if self._say_cut:
+            reason = self._say_cut
+        elif rc != 0:
+            reason = f"say exited {rc}"
+        elif self._listening is not None and not self._listening():
+            reason = "no console at completion"
+        else:
+            reason = ""
+        done = {"t_first_audio": t0, "engine": "say"}
+        if reason:
             # A cut reply must not be indistinguishable from a delivered one.
             # Additive field; the event name is unchanged.
-            done["interrupted"] = self._say_cut
+            done["interrupted"] = reason
         self.publish("tts.done", done)
+        if reason:
+            raise SpeechNotDelivered(reason)
 
     async def close(self) -> None:
         if self._ws is not None:

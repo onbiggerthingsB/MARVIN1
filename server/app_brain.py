@@ -171,13 +171,21 @@ async def run_butler_brain(bus, butler, speaker, turnlog, validate_citations=Non
         # session; surface it and keep looping. wait_for because a hang is not a
         # failure this try/except would ever see.
         #
-        # Returns whether speech actually SUCCEEDED. Callers that record "Keke
-        # heard this" — the approval readback (Approval.spoken) and the repo
-        # confirm (Onboarding.mark_spoken) — must consult it: a swallowed TTS
-        # failure that still marked a request spoken let a later "yes" deliver a
-        # command the owner never heard. On failure the request stays unspoken;
-        # the TTL backstops it, and fail-closed is free because the console
-        # click path ignores `spoken`.
+        # Returns whether the ENGINE REPORTED the utterance delivered: it ran
+        # to completion, uncut, with a console connected through the end (per
+        # engine, see SpeechNotDelivered in server/tts.py — a killed or
+        # failed `say`, an ElevenLabs stream that lost its room, its audio or
+        # its isFinal, all raise and land here as False). True does NOT mean
+        # a human heard it — bytes a live socket accepted can still die
+        # unplayed in a browser buffer; no software can close that gap.
+        # Callers that record "Keke heard this" — the approval readback
+        # (Approval.spoken) and the repo confirm (Onboarding.mark_spoken) —
+        # must consult it: a swallowed TTS failure that still marked a
+        # request spoken let a later "yes" deliver a command the owner never
+        # heard (the sixth fail-open), and a cut readback reporting success
+        # did the same one layer down (the ninth). On failure the request
+        # stays unspoken; the TTL backstops it, and fail-closed is free
+        # because the console click path ignores `spoken`.
         try:
             await asyncio.wait_for(speaker.speak(text), SPEAK_TIMEOUT_S)
             return True

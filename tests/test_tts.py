@@ -6,7 +6,7 @@ import pytest
 import websockets
 
 from server import tts as tts_mod
-from server.tts import NobodyListening, SpeakEngine
+from server.tts import NobodyListening, SpeakEngine, SpeechNotDelivered
 
 
 async def start_fake_eleven(chunks=(b"MP3A", b"MP3B"), idle_close_after: float | None = None):
@@ -235,7 +235,12 @@ async def test_last_console_disconnect_kills_in_flight_say(monkeypatch):
 
     present["now"] = False                  # the tab closes...
     assert eng.interrupt("console disconnected") is True  # ...the hook fires
-    await asyncio.wait_for(task, 2)         # speak() must come straight back
+    # speak() must come straight back — and come back HONEST: returning
+    # normally here was the ninth fail-open (the brain marked the readback
+    # spoken and a later bare "yes" delivered the tool). The cut is both
+    # published and raised; see tests/test_spoken_signal.py.
+    with pytest.raises(SpeechNotDelivered):
+        await asyncio.wait_for(task, 2)
     done = dict(events)["tts.done"]
     assert done.get("interrupted") == "console disconnected", done
 
