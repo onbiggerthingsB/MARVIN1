@@ -28,10 +28,14 @@ nobody there. Every speak() caller already treats a raise as "not
 delivered", so `spoken` stays false and the TTL backstops the request.
 """
 import asyncio
+import base64
+import json
 import time
 
 import pytest
+import websockets
 
+from server import tts as tts_mod
 from server.bus import EventBus
 from server.router import Router
 from server.tts import SpeakEngine, SpeechNotDelivered
@@ -128,6 +132,66 @@ async def test_a_readback_cut_by_the_last_console_leaving_is_never_marked_spoken
     assert "haven't read" in spawned[-1][0][-1]
     spawned[-1][1].finish(0)
     task.cancel()
+
+
+async def test_the_elevenlabs_analogue_a_stream_to_an_emptied_room_is_unspoken(
+        monkeypatch):
+    """Same sequence, worse engine: the chunks go to fire-and-forget sends,
+    so the tab dying mid-readback never raised anything — isFinal arrived,
+    speak() returned, the approval was marked spoken."""
+    stream_done = asyncio.Event()
+
+    async def handler(ws):
+        try:
+            while True:
+                data = json.loads(await ws.recv())
+                if not data.get("text"):
+                    continue
+                for c in (b"MP3A", b"MP3B"):
+                    await ws.send(json.dumps(
+                        {"audio": base64.b64encode(c).decode()}))
+                await ws.send(json.dumps({"isFinal": True}))
+                stream_done.set()
+        except websockets.ConnectionClosed:
+            return
+
+    server = await websockets.serve(handler, "127.0.0.1", 0)
+    url = f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+    bus, butler = EventBus(), FakeButler()
+    router, fleet = Router(), FakeFleet()
+    a = router.open_approval("soccer", DESTRUCTIVE, now=time.time(),
+                             path="/p/soccer")
+    present = {"now": True}
+    chunks = []
+
+    def send_audio(b):
+        # the last console dies as the first chunk is handed to the fan-out:
+        # every byte of this readback broadcasts to zero sockets
+        chunks.append(b)
+        present["now"] = False
+
+    eng = SpeakEngine("voice1", "key", url, bus.publish,
+                      send_audio=send_audio,
+                      listening=lambda: present["now"])
+    task = await brain(bus, butler, eng, router=router,
+                       registry=confirmed_registry("soccer"), fleet=fleet)
+    bus.publish("approval.request", card(
+        a, "soccer wants Bash — rm -rf /Users/likerun/Documents. "
+           "Approve or deny, sir?"))
+    await asyncio.wait_for(stream_done.wait(), 5)
+    await asyncio.sleep(0.1)
+    assert chunks, "the fake stream never produced audio"
+    assert router.pending_approvals()[0].spoken is False, \
+        "a stream whose audio went to zero consoles was marked spoken"
+    present["now"] = True                          # the owner reconnects
+    bus.publish("command.received", {"text": "yes"})
+    await asyncio.sleep(0.1)
+    assert all(c[0] != "deliver" for c in fleet.calls)
+    assert len(router.pending_approvals()) == 1
+    task.cancel()
+    await eng.close()
+    server.close()
+    await server.wait_closed()
 
 
 async def test_a_repo_confirm_cut_mid_word_is_never_marked_spoken(
@@ -246,3 +310,140 @@ async def test_a_clean_say_with_a_listener_is_still_delivered(monkeypatch):
     spawned[0][1].finish(0)
     await asyncio.wait_for(task, 2)                # no raise
     assert "interrupted" not in dict(events)["tts.done"]
+
+
+# =====================================================================
+# the ElevenLabs engine: audio + isFinal + an occupied room, or no claim
+# =====================================================================
+async def _eleven(handler):
+    server = await websockets.serve(handler, "127.0.0.1", 0)
+    return server, f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+
+
+def _stream_handler(frames):
+    """A fake stream-input endpoint that answers the first text frame with
+    `frames` (already-encoded JSON payloads) and then idles."""
+    async def handler(ws):
+        try:
+            while True:
+                data = json.loads(await ws.recv())
+                if not data.get("text"):
+                    continue
+                for f in frames:
+                    await ws.send(json.dumps(f))
+                if frames and frames[-1].get("isFinal"):
+                    continue
+                await ws.close(code=1000)      # clean close, no isFinal
+                return
+        except websockets.ConnectionClosed:
+            return
+    return handler
+
+
+def _audio_frame(b=b"MP3A"):
+    return {"audio": base64.b64encode(b).decode()}
+
+
+async def test_a_room_that_empties_mid_stream_is_not_delivery():
+    """The room is re-read at every chunk hand-off — and LATCHED: a console
+    arriving back before isFinal missed the start, so the utterance stays
+    undelivered even though the final read would pass."""
+    server, url = await _eleven(_stream_handler(
+        [_audio_frame(b"MP3A"), _audio_frame(b"MP3B"), {"isFinal": True}]))
+    present, handed = {"now": True}, []
+
+    def send_audio(b):
+        handed.append(b)
+        if len(handed) == 1:
+            present["now"] = False         # dies on the first chunk...
+
+    events = []
+    eng = SpeakEngine("voice1", "key", url,
+                      lambda t, d: events.append((t, d)),
+                      send_audio=send_audio,
+                      listening=lambda: present["now"] or len(handed) >= 2)
+    # ...and a new console appears before the second chunk: the latch holds
+    with pytest.raises(SpeechNotDelivered, match="mid-stream"):
+        await eng.speak("Gone mid-sentence, sir.")
+    assert dict(events)["tts.done"].get("interrupted") == \
+        "console disconnected mid-stream"
+    await eng.close()
+    server.close()
+    await server.wait_closed()
+
+
+async def test_a_clean_close_without_isfinal_is_not_delivery():
+    """The socket closing normally ends the message iterator without raising,
+    which used to be indistinguishable from a finished utterance."""
+    server, url = await _eleven(_stream_handler([_audio_frame()]))
+    events = []
+    eng = SpeakEngine("voice1", "key", url,
+                      lambda t, d: events.append((t, d)),
+                      send_audio=lambda b: None, listening=lambda: True)
+    with pytest.raises(SpeechNotDelivered, match="before isFinal"):
+        await eng.speak("Cut off by the socket, sir.")
+    assert dict(events)["tts.done"].get("interrupted") == \
+        "stream ended before isFinal"
+    await eng.close()
+    server.close()
+    await server.wait_closed()
+
+
+async def test_isfinal_with_zero_audio_is_not_delivery():
+    server, url = await _eleven(_stream_handler([{"isFinal": True}]))
+    events = []
+    eng = SpeakEngine("voice1", "key", url,
+                      lambda t, d: events.append((t, d)),
+                      send_audio=lambda b: None, listening=lambda: True)
+    with pytest.raises(SpeechNotDelivered, match="no audio"):
+        await eng.speak("Silence, sir.")
+    done = dict(events)["tts.done"]
+    assert done["t_first_audio"] is None
+    assert done.get("interrupted") == "no audio in stream"
+    await eng.close()
+    server.close()
+    await server.wait_closed()
+
+
+async def test_sends_are_drained_before_delivery_is_claimed():
+    """app.py's per-console sends are fire-and-forget tasks whose failure
+    discards the dead console from the presence set. The engine must AWAIT
+    what send_audio hands back before judging the room, so a console whose
+    socket died on the very last chunk is seen — not raced past."""
+    server, url = await _eleven(_stream_handler(
+        [_audio_frame(), {"isFinal": True}]))
+    present = {"now": True}
+
+    async def failing_send():
+        # models _safe_send: the write fails, the console is discarded —
+        # but only once the send actually RUNS. A bare coroutine (not a
+        # pre-scheduled task) pins that the engine itself awaits the
+        # fan-out; without the drain the discard never lands before the
+        # verdict and the room reads as occupied.
+        present["now"] = False
+
+    eng = SpeakEngine("voice1", "key", url, lambda t, d: None,
+                      send_audio=lambda b: failing_send(),
+                      listening=lambda: present["now"])
+    with pytest.raises(SpeechNotDelivered, match="no console at completion"):
+        await eng.speak("To a dead socket, sir.")
+    await eng.close()
+    server.close()
+    await server.wait_closed()
+
+
+async def test_a_complete_stream_into_an_occupied_room_is_delivered():
+    """Positive control for the eleven path, presence signal wired."""
+    server, url = await _eleven(_stream_handler(
+        [_audio_frame(b"MP3A"), _audio_frame(b"MP3B"), {"isFinal": True}]))
+    events, handed = [], []
+    eng = SpeakEngine("voice1", "key", url,
+                      lambda t, d: events.append((t, d)),
+                      send_audio=lambda b: handed.append(b),
+                      listening=lambda: True)
+    await eng.speak("All delivered, sir.")         # no raise
+    assert handed == [b"MP3A", b"MP3B"]
+    assert "interrupted" not in dict(events)["tts.done"]
+    await eng.close()
+    server.close()
+    await server.wait_closed()

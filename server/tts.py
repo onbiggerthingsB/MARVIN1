@@ -175,6 +175,10 @@ class SpeakEngine:
                         # frames and break on the old isFinal -- every later
                         # answer plays one turn late and never self-heals.
                         # Discard the socket (best-effort close), then re-raise.
+                        # SpeechNotDelivered lands here too — never retried
+                        # (a replay is the talking-to-an-empty-room defect),
+                        # and for its completed-protocol reasons the discard
+                        # merely costs the next utterance a reconnect.
                         ws, self._ws = self._ws, None
                         if ws is not None:
                             try:
@@ -186,6 +190,9 @@ class SpeakEngine:
 
     async def _speak_eleven(self, text: str) -> None:
         t0 = None
+        got_final = False
+        room_emptied = False
+        sends: list = []
         await self._ws.send(json.dumps({"text": text + " "}))
         await self._ws.send(json.dumps({"text": ""}))  # flush
         async for raw in self._ws:
@@ -193,10 +200,56 @@ class SpeakEngine:
             if msg.get("audio"):
                 if t0 is None:
                     t0 = time.time()
-                self.send_audio(base64.b64decode(msg["audio"]))
+                handed = self.send_audio(base64.b64decode(msg["audio"]))
+                # app.py's send_audio returns a drainable future over the
+                # per-console sends; simple sinks (tests) return None.
+                if inspect.isawaitable(handed):
+                    sends.append(handed)
+                # The set send_audio fans to and the set _listening reads are
+                # the same set, with no await between the two reads — so this
+                # IS "did that chunk go to at least one console". LATCHED: a
+                # console arriving back before isFinal missed the start, so a
+                # room that emptied mid-stream stays a failure even when the
+                # completion read below would pass.
+                if self._listening is not None and not self._listening():
+                    room_emptied = True
             if msg.get("isFinal"):
+                got_final = True
                 break
-        self.publish("tts.done", {"t_first_audio": t0, "engine": "elevenlabs"})
+        # Drain the fan-out BEFORE judging the room. The sends are
+        # fire-and-forget tasks whose failure discards the dead console from
+        # the presence set (app.py's _safe_send -> _audio_gone), so without
+        # this await a console whose socket died on the very last chunk is
+        # raced past and the room still reads as occupied. The app's sends
+        # never raise; anything a different callable raises is honestly a
+        # delivery failure and propagates like one.
+        if sends:
+            await asyncio.gather(*sends)
+        # The success signal, decided from evidence. Everything below used to
+        # return normally — a clean socket close without isFinal ends the
+        # message iterator without raising, isFinal with zero audio is a
+        # protocol-shaped nothing, and a room that emptied made every chunk a
+        # broadcast to zero sockets. interrupt() still deliberately does not
+        # cut this engine (see its docstring); not cutting the stream is a
+        # different fact from claiming it was delivered.
+        if room_emptied:
+            reason = "console disconnected mid-stream"
+        elif self._listening is not None and not self._listening():
+            reason = "no console at completion"
+        elif not got_final:
+            reason = "stream ended before isFinal"
+        elif t0 is None:
+            reason = "no audio in stream"
+        else:
+            reason = ""
+        done = {"t_first_audio": t0, "engine": "elevenlabs"}
+        if reason:
+            # A cut/undelivered reply must not be indistinguishable from a
+            # delivered one — same additive field the `say` path carries.
+            done["interrupted"] = reason
+        self.publish("tts.done", done)
+        if reason:
+            raise SpeechNotDelivered(reason)
 
     async def _speak_say(self, text: str) -> None:
         proc = await asyncio.create_subprocess_exec("say", "-v", "Daniel", text)

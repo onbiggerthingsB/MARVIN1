@@ -135,9 +135,15 @@ def create_app(base_dir: Path) -> FastAPI:
         if not audio_clients:
             app.state.speaker.interrupt("console disconnected")
 
-    def send_audio(chunk: bytes) -> None:
-        for ws_ in list(audio_clients):
-            asyncio.ensure_future(_safe_send(ws_, chunk))
+    def send_audio(chunk: bytes):
+        # Returns the fan-out as ONE drainable future. The sends are still
+        # independent and still never raise (_safe_send swallows its own
+        # failure and discards the dead console), but SpeakEngine now awaits
+        # this before judging whether the room was occupied — otherwise a
+        # send that fails after isFinal leaves the dead console in the
+        # presence set and a stream nobody received reports delivered.
+        return asyncio.gather(*(_safe_send(ws_, chunk)
+                                for ws_ in list(audio_clients)))
 
     async def _safe_send(ws_, chunk):
         try:
