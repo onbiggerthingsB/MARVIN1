@@ -131,7 +131,6 @@ async function startTalking() {
   closeDraining();   // one live relay at a time
   micAborting = false;
   try {
-    window.marvin.playChime("listen");
     $("#ptt").classList.add("live");
     micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     if (micAborting) { teardownMic(); return; } // released during setup
@@ -143,6 +142,15 @@ async function startTalking() {
     src.connect(analyser);
     micNode = new AudioWorkletNode(ctx, "mic-processor");
     src.connect(micNode);
+    // GAP 2 — the chime marks CAPTURE, not the press. It used to fire before
+    // getUserMedia even resolved, so it invited speech into a mic that did not
+    // exist yet; that audio was never captured, so no buffer could recover it
+    // (unlike the pre-socket window, which micbuffer.js covers). Here the
+    // worklet is wired and framing, so everything from this tone onward is
+    // captured — the socket may still be CONNECTING, and that is fine. A
+    // failed activation now reaches the catch below and says so instead of
+    // chiming into a dead mic.
+    window.marvin.playChime("listen");
     // `ws` is captured, not read back off micWS. A release lands during the
     // handshake often enough — it is the last unguarded gap in this setup —
     // and it nulls micWS, so a handler that reached for the global fired
@@ -164,6 +172,10 @@ async function startTalking() {
     // next session.
     const sink = makeFrameSink();
     micNode.port.onmessage = (e) => {
+      // The flush ack (GAP 1). MessagePort delivery is FIFO and the worklet
+      // posts its tail frame BEFORE the ack, so by the time this lands every
+      // frame is already through the sink above it. Resolve the release.
+      if (e.data && e.data.type === "flushed") { resolveFlush(); return; }
       if (micWS !== ws) return;                 // press ended or superseded
       sink.frame(ws.readyState, e.data, (f) => ws.send(f));
     };
@@ -189,8 +201,48 @@ async function startTalking() {
   }
 }
 
-function stopTalking() {
-  micHeld = false;
+// GAP 1 — the tail. The worklet only posts a frame once it has ~60ms, so at
+// release it is still holding a partial, and one more frame may be in flight
+// on the port. Both used to be discarded, clipping the END of every utterance
+// (~<=120ms) — which is how "Start" reached the router as "Star", and the
+// router anchors its commands on that opening verb. So: ask the worklet to
+// flush, wait for the ack, THEN send stop. Bounded, because a worklet that
+// never answers must not wedge the button: losing the tail beats a dead UI.
+let resolveFlush = () => {};
+const FLUSH_MS = 200;
+
+function flushWorklet(node) {
+  if (!node) return Promise.resolve();
+  return new Promise((done) => {
+    let settled = false;
+    const finish = () => { if (!settled) { settled = true; resolveFlush = () => {}; done(); } };
+    resolveFlush = finish;
+    setTimeout(finish, FLUSH_MS);
+    try { node.port.postMessage({ type: "flush" }); } catch { finish(); }
+  });
+}
+
+let micReleasing = false;
+
+async function stopTalking() {
+  // The flush below is the first await this function has ever had, and it
+  // opens a window where micHeld is already false while micWS is still set —
+  // which is exactly the shape endHoldOnLostFocus fires on, so a blur during
+  // the flush re-entered and double-stopped. One release per press.
+  if (micReleasing) return;
+  micReleasing = true;
+  try {
+    micHeld = false;
+    // Drain the worklet BEFORE anything below nulls micWS or disconnects the
+    // node — the tail frames ride the same handler and socket as live audio.
+    if (micWS && micNode) await flushWorklet(micNode);
+    stopTalkingNow();
+  } finally {
+    micReleasing = false;
+  }
+}
+
+function stopTalkingNow() {
   if (!micWS) {
     // Setup still in flight (or already torn down): signal the abort AND stop
     // whatever the in-flight setup may have already opened, so the mic can't
