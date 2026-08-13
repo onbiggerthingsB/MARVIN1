@@ -115,7 +115,25 @@ def create_app(base_dir: Path) -> FastAPI:
 
     from server.tts import SpeakEngine, ELEVEN_BASE
 
+    # The console-presence signal. Every console page opens /audio at script
+    # load (before the setup click, unlike /events), it dies with the tab and
+    # reconnects within about a second across a reload — and for the
+    # ElevenLabs engine it is literally where the reply's audio goes, so "an
+    # /audio socket is open" and "someone can hear this" are the same fact.
+    # Bus subscribers cannot stand in for it: the brain loop holds one
+    # itself, so the bus reads as occupied with every console closed.
     audio_clients: set = set()
+
+    def _audio_gone(ws_) -> None:
+        """Drop a console's audio socket; when the LAST one goes, cut any
+        in-flight `say`. That subprocess plays through the machine's own
+        speakers, entirely independent of the browser — the live defect was
+        Marvin still talking after the tab closed, with the only channel the
+        owner could answer through gone. Two tabs are one owner: nothing is
+        cut while any console remains."""
+        audio_clients.discard(ws_)
+        if not audio_clients:
+            app.state.speaker.interrupt("console disconnected")
 
     def send_audio(chunk: bytes) -> None:
         for ws_ in list(audio_clients):
@@ -125,7 +143,7 @@ def create_app(base_dir: Path) -> FastAPI:
         try:
             await ws_.send_bytes(chunk)
         except Exception:
-            audio_clients.discard(ws_)
+            _audio_gone(ws_)
 
     voice = os.environ.get("MARVIN_VOICE",
                             "elevenlabs" if os.environ.get("ELEVENLABS_API_KEY") else "say")
@@ -135,6 +153,10 @@ def create_app(base_dir: Path) -> FastAPI:
         base_url=os.environ.get("ELEVENLABS_URL", ELEVEN_BASE),
         publish=app.state.bus.publish,
         send_audio=send_audio,
+        # No console, no speech: the gate inside speak() reads this at every
+        # reply (with a short grace for reloads) and refuses — a published
+        # butler.error, never a silent drop — when the room stays empty.
+        listening=lambda: bool(audio_clients),
     )
 
     vault_root = vault_root_from_env()
@@ -459,7 +481,7 @@ def create_app(base_dir: Path) -> FastAPI:
             while True:
                 await ws.receive_text()  # keepalive pings from page
         except WebSocketDisconnect:
-            audio_clients.discard(ws)
+            _audio_gone(ws)
 
     static = base_dir / "static"
     if static.exists():

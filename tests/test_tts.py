@@ -5,7 +5,8 @@ import json
 import pytest
 import websockets
 
-from server.tts import SpeakEngine
+from server import tts as tts_mod
+from server.tts import NobodyListening, SpeakEngine
 
 
 async def start_fake_eleven(chunks=(b"MP3A", b"MP3B"), idle_close_after: float | None = None):
@@ -125,6 +126,118 @@ async def test_cancelled_say_kills_the_subprocess(monkeypatch):
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(eng.speak("too long"), 0.05)
     assert killed, "a cancelled `say` was left talking over the next turn"
+
+
+def _fake_say(monkeypatch, spawned):
+    """Divert `say` so these tests never touch the real speakers."""
+    class P:
+        returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_exec(*argv, **kw):
+        spawned.append(argv)
+        return P()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+
+async def test_no_console_means_no_speech(monkeypatch):
+    """DEFECT 2, first half: `say` runs on the SERVER's speakers, entirely
+    independent of the browser — so with the console closed, Marvin kept
+    talking into a room with no way to answer it. A reply with nobody
+    connected must not start: no subprocess, and no tts.start either (the
+    console must never be told speech began that never did). The refusal is
+    a RAISE, not a silent drop — every speak() caller already surfaces a
+    raise as a published error (the brain's butler.error, social's
+    social.error), so the dropped reply leaves a record."""
+    monkeypatch.setattr(tts_mod, "LISTENER_GRACE_S", 0.1)
+    monkeypatch.setattr(tts_mod, "LISTENER_POLL_S", 0.01)
+    spawned = []
+    _fake_say(monkeypatch, spawned)
+    events = []
+    eng = SpeakEngine("", "", "ws://unused", lambda t, d: events.append((t, d)),
+                      send_audio=lambda b: None, listening=lambda: False)
+    with pytest.raises(NobodyListening):
+        await eng.speak("Sir, the build is green.")
+    assert spawned == [], "spoke into an empty room"
+    assert "tts.start" not in dict(events), "announced speech that never started"
+
+
+async def test_console_back_within_the_grace_is_spoken(monkeypatch):
+    """A page reload drops every console for well under a second (the /audio
+    socket reconnects at script load, before the setup click). The gate WAITS
+    for the room instead of latching mute: a reply that lands during the
+    refresh is delivered normally, and the session is never muted by it."""
+    monkeypatch.setattr(tts_mod, "LISTENER_GRACE_S", 2.0)
+    monkeypatch.setattr(tts_mod, "LISTENER_POLL_S", 0.01)
+    spawned = []
+    _fake_say(monkeypatch, spawned)
+    present = {"now": False}
+    events = []
+    eng = SpeakEngine("", "", "ws://unused", lambda t, d: events.append((t, d)),
+                      send_audio=lambda b: None,
+                      listening=lambda: present["now"])
+
+    async def reload_finishes():
+        await asyncio.sleep(0.05)
+        present["now"] = True
+
+    reconnect = asyncio.create_task(reload_finishes())
+    await eng.speak("Still here, sir.")
+    await reconnect
+    assert spawned and spawned[0][0] == "say"
+    assert dict(events)["tts.done"]["engine"] == "say"
+
+
+async def test_last_console_disconnect_kills_in_flight_say(monkeypatch):
+    """DEFECT 2, second half: "it just started talking to me. I can't even
+    speak back to it." When the last console disconnects mid-sentence, the
+    only channel the owner could answer through is gone — the `say`
+    subprocess dies NOW, and tts.done says the reply was cut rather than
+    delivered (a cut reply must not be indistinguishable from a heard one).
+    """
+    killed = asyncio.Event()
+
+    class TalkingProc:
+        returncode = None
+
+        async def wait(self):
+            await killed.wait()
+            self.returncode = -9
+            return -9
+
+        def kill(self):
+            killed.set()
+
+    async def fake_exec(*argv, **kw):
+        return TalkingProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    events = []
+    present = {"now": True}
+    eng = SpeakEngine("", "", "ws://unused", lambda t, d: events.append((t, d)),
+                      send_audio=lambda b: None,
+                      listening=lambda: present["now"])
+    assert eng.interrupt("nothing in flight") is False   # safe when idle
+
+    task = asyncio.create_task(eng.speak("A very long reply, sir. " * 20))
+    for _ in range(100):                    # until the subprocess is in flight
+        if eng._say_proc is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert eng._say_proc is not None, "speech never started"
+
+    present["now"] = False                  # the tab closes...
+    assert eng.interrupt("console disconnected") is True  # ...the hook fires
+    await asyncio.wait_for(task, 2)         # speak() must come straight back
+    done = dict(events)["tts.done"]
+    assert done.get("interrupted") == "console disconnected", done
 
 
 async def test_say_fallback_when_no_key(monkeypatch):

@@ -10,15 +10,47 @@ import websockets
 
 ELEVEN_BASE = "wss://api.elevenlabs.io"
 
+# How long speak() waits for a console to (re)appear before refusing the
+# reply. A page reload drops every console for well under a second — the
+# /audio socket reconnects at script load, before the setup click — so the
+# grace turns "reply landed during a refresh" into a normally delivered
+# reply. A console that is genuinely gone stays gone past any grace, and the
+# refusal is honest (NobodyListening). Checked at SPEAK time, never latched:
+# a session can lose and regain its consoles any number of times.
+LISTENER_GRACE_S = 5.0
+LISTENER_POLL_S = 0.1
+
+
+class NobodyListening(RuntimeError):
+    """No console is connected to hear this reply, and none arrived within
+    the grace window.
+
+    Raised INSTEAD of speaking, and deliberately not swallowed here: every
+    speak() caller already treats a raise as "not delivered" — the brain's
+    _speak publishes butler.error and returns False (so an approval readback
+    that nobody heard is never marked spoken), and the social digest
+    publishes social.error. The reply is DROPPED with that published record,
+    never queued: a queue replayed at reconnect is the talking-to-an-empty-
+    room defect again, just deferred to a moment nobody asked for.
+    """
+
 
 class SpeakEngine:
     def __init__(self, voice_id: str, api_key: str, base_url: str,
-                 publish, send_audio):
+                 publish, send_audio, listening=None):
         self.voice_id = voice_id
         self.api_key = api_key
         self.base_url = base_url
         self.publish = publish
         self.send_audio = send_audio
+        # `listening` answers "is any console connected right now?" — the app
+        # wires it to the /audio WebSocket client set (see server/app.py for
+        # why that set, and not bus subscribers, is the presence signal).
+        # None means no presence information (direct constructions, tests):
+        # speak unconditionally, the pre-gate behavior.
+        self._listening = listening
+        self._say_proc = None      # the in-flight `say`, if any
+        self._say_cut = ""         # why it was cut mid-speech, if it was
         self._ws = None
         self._lock = asyncio.Lock()
 
@@ -41,8 +73,51 @@ class SpeakEngine:
             except OSError:
                 self._ws = None
 
+    async def _require_listener(self) -> None:
+        """Refuse to start speech into an empty room — but ride out a reload.
+
+        Nothing here is remembered between calls: presence is re-answered for
+        every reply at its own moment, so a refresh (or an hour with the
+        console closed) can never mute the session for the replies that come
+        after a console returns."""
+        if self._listening is None or self._listening():
+            return
+        deadline = time.monotonic() + LISTENER_GRACE_S
+        while not self._listening():
+            if time.monotonic() >= deadline:
+                raise NobodyListening("no console connected")
+            await asyncio.sleep(LISTENER_POLL_S)
+
+    def interrupt(self, reason: str = "console disconnected") -> bool:
+        """Kill an in-flight `say` NOW. The /audio handler calls this when
+        the LAST console disconnects: the only channel the owner could
+        answer through just vanished, so the mouth stops with it.
+
+        `say` only, deliberately. The two engines fail differently here: an
+        in-flight ElevenLabs stream is already inaudible the moment the page
+        dies — its chunks broadcast to zero sockets and the browser-side
+        player died with the tab — while `say` plays through the machine's
+        own speakers and keeps going unless killed. Closing the ElevenLabs
+        socket mid-protocol would also trip speak()'s transparent reconnect
+        into REPLAYING the utterance to the empty room. Returns whether
+        anything was actually cut, and is safe to call when nothing is.
+        """
+        proc = self._say_proc
+        if proc is None or proc.returncode is not None:
+            return False
+        self._say_cut = reason or "interrupted"
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return False
+        return True
+
     async def speak(self, text: str) -> None:
         async with self._lock:
+            # Before tts.start, not after: the console must never be told
+            # speech began that never did (its player tears down the previous
+            # utterance on tts.start).
+            await self._require_listener()
             self.publish("tts.start", {"text": text})
             if self._eleven_enabled:
                 for attempt in (1, 2):  # one transparent reconnect
@@ -88,8 +163,15 @@ class SpeakEngine:
 
     async def _speak_say(self, text: str) -> None:
         proc = await asyncio.create_subprocess_exec("say", "-v", "Daniel", text)
+        self._say_proc, self._say_cut = proc, ""
         t0 = time.time()
         try:
+            # The presence gate ran before this subprocess existed, so a
+            # console that left in that window was told "nothing to cut".
+            # Re-check once now that there IS a process; the disconnect hook
+            # covers every later moment.
+            if self._listening is not None and not self._listening():
+                self.interrupt()
             await proc.wait()
         except asyncio.CancelledError:
             # a speak timeout must not leave `say` talking over the next turn
@@ -98,7 +180,14 @@ class SpeakEngine:
             except ProcessLookupError:
                 pass
             raise
-        self.publish("tts.done", {"t_first_audio": t0, "engine": "say"})
+        finally:
+            self._say_proc = None
+        done = {"t_first_audio": t0, "engine": "say"}
+        if self._say_cut:
+            # A cut reply must not be indistinguishable from a delivered one.
+            # Additive field; the event name is unchanged.
+            done["interrupted"] = self._say_cut
+        self.publish("tts.done", done)
 
     async def close(self) -> None:
         if self._ws is not None:
